@@ -1,0 +1,100 @@
+# Import/Export Preferences
+
+par-term supports importing and exporting terminal configuration for backup, sharing, and team standardization.
+
+## Table of Contents
+- [Overview](#overview)
+- [Exporting Preferences](#exporting-preferences)
+- [Importing Preferences](#importing-preferences)
+  - [Import from File](#import-from-file)
+  - [Import from URL](#import-from-url)
+  - [Import Modes](#import-modes)
+- [Settings UI](#settings-ui)
+- [Related Documentation](#related-documentation)
+
+## Overview
+
+The import/export system reads and writes par-term configuration in YAML format, allowing you to back up settings, share configurations between machines, or distribute team-standard configurations.
+
+```mermaid
+graph TD
+    Config[Current Config]
+    Export[Export to YAML]
+    ImportFile[Import from File]
+    ImportURL[Import from URL]
+    Validate[Validate Config]
+    Apply[Apply Settings]
+
+    Config -->|Export| Export
+    ImportFile --> Validate
+    ImportURL --> Validate
+    Validate -->|Valid| Apply
+    Apply -->|Replace or Merge| Config
+
+    class Config primary
+    class Export active
+    class ImportFile data
+    class ImportURL external
+    class Validate neutral
+    class Apply warning
+
+    classDef primary fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#ffffff
+    classDef active fill:#1b5e20,stroke:#4caf50,stroke-width:2px,color:#ffffff
+    classDef data fill:#0d47a1,stroke:#2196f3,stroke-width:2px,color:#ffffff
+    classDef external fill:#4a148c,stroke:#9c27b0,stroke-width:2px,color:#ffffff
+    classDef neutral fill:#37474f,stroke:#78909c,stroke-width:2px,color:#ffffff
+    classDef warning fill:#ff6f00,stroke:#ffa726,stroke-width:2px,color:#ffffff
+```
+
+## Exporting Preferences
+
+Export the current configuration to a YAML file:
+
+1. Open Settings (`F12` or `Cmd + ,` on macOS)
+2. Navigate to **Advanced** > **Import/Export Preferences**
+3. Click **Export Preferences to File**
+4. Choose a location in the native file dialog
+5. The current configuration saves as a `.yaml` file
+
+The exported file contains all configuration values.
+
+## Importing Preferences
+
+### Import from File
+
+1. Open Settings > **Advanced** > **Import/Export Preferences**
+2. Click **Import & Replace** to completely replace your config, or **Import & Merge** to preserve existing customizations
+3. Select a `.yaml` or `.yml` configuration file in the native file dialog
+4. The configuration loads into the settings panel as unsaved changes (the panel shows "* Unsaved changes")
+5. Click **Save** to persist the configuration to disk and apply it to the running terminal
+
+### Import from URL
+
+1. Open Settings > **Advanced** > **Import/Export Preferences**
+2. Enter the URL of a configuration file. It must use the `https://` scheme (case-insensitive, so `HTTPS://` is accepted) -- there is no HTTP opt-in on this path, and every other scheme (`http:`, `file:`, `ftp:`, `data:`) is rejected with the reason shown in the status line
+   - The response is capped at 1 MB and the request times out after 30 seconds. The fetch runs on the UI thread, so the window is unresponsive while it is in flight
+3. Click **Fetch & Replace** to completely replace your config, or **Fetch & Merge** to preserve existing customizations
+4. The configuration downloads and loads into the settings panel as unsaved changes
+5. Click **Save** to persist the configuration to disk and apply it to the running terminal
+
+### Import Modes
+
+| Mode | Button | Behavior |
+|------|--------|----------|
+| **Replace** | Import & Replace / Fetch & Replace | Completely replaces the current configuration with the imported values |
+| **Merge** | Import & Merge / Fetch & Merge | Only overrides values that differ from defaults, preserving your customizations |
+
+**Merge mode** is recommended when importing partial configurations or when you want to preserve your existing settings while adding specific overrides from the imported file.
+
+**Validation**: All imported configurations are validated before applying. Malformed or invalid YAML files are rejected with an error message displayed in the settings UI.
+
+## Settings UI
+
+All import/export controls are located in **Settings > Advanced > Import/Export Preferences**.
+
+## Related Documentation
+
+- [Configuration Reference](../CONFIG_REFERENCE.md) - Complete configuration options reference
+- [Window Management](WINDOW_MANAGEMENT.md) - Window and display configuration
+- [Profiles](PROFILES.md) - Profile management (separate from main config)
+- [Arrangements](ARRANGEMENTS.md) - Window arrangements (separate from main config)

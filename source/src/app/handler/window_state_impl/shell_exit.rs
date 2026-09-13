@@ -1,0 +1,206 @@
+//! Shell exit action handling for WindowState (called from the RedrawRequested event arm).
+//!
+//! Contains:
+//! - `handle_shell_exit`: dispatches shell exit actions (Keep, Close, Restart variants)
+//!   for all tabs and panes. Returns true if the window should close.
+
+use crate::app::window_state::WindowState;
+
+impl WindowState {
+    /// Handle shell exit based on the configured `shell_exit_action`.
+    ///
+    /// Returns `true` if the window should close (last tab exited and action is Close).
+    pub(crate) fn handle_shell_exit(&mut self) -> bool {
+        use crate::config::ShellExitAction;
+        use crate::pane::RestartState;
+
+        match self.config.load().shell.shell_exit_action {
+            ShellExitAction::Keep => {
+                // Do nothing - keep dead shells showing
+            }
+
+            ShellExitAction::Close => {
+                // Detect exited panes across all tabs.
+                // After R-32, pane_manager is always Some, so we always use the pane path.
+                // The primary pane (single-pane tabs) wraps tab.terminal; when it exits
+                // close_exited_panes() returns tab_should_close=true just as before.
+                let mut tabs_needing_resize: Vec<crate::tab::TabId> = Vec::new();
+
+                // Collect (tab_id, tab_title, exit_notified) for single-pane tabs that exit,
+                // so we can fire the session-ended notification before closing.
+                let mut single_pane_exiting: Vec<(crate::tab::TabId, String, bool)> = Vec::new();
+
+                let tabs_to_close: Vec<crate::tab::TabId> = self
+                    .tab_manager
+                    .tabs_mut()
+                    .iter_mut()
+                    .filter_map(|tab| {
+                        if tab.tmux.tmux_gateway_active || tab.tmux.tmux_pane_id.is_some() {
+                            return None;
+                        }
+                        // pane_manager is always Some after R-32.
+                        let (closed_panes, tab_should_close) = tab.close_exited_panes();
+                        if !closed_panes.is_empty() {
+                            log::info!(
+                                "Tab {}: closed {} exited pane(s)",
+                                tab.id,
+                                closed_panes.len()
+                            );
+                            if !tab_should_close {
+                                tabs_needing_resize.push(tab.id);
+                            }
+                        }
+                        if tab_should_close {
+                            // Record metadata for notification (single-pane exit path).
+                            // Previously this was handled by the legacy pane_manager.is_none()
+                            // check; now we capture it here while the tab is still alive.
+                            if !tab.has_multiple_panes() {
+                                single_pane_exiting.push((
+                                    tab.id,
+                                    tab.title.clone(),
+                                    tab.activity.exit_notified,
+                                ));
+                                tab.activity.exit_notified = true;
+                            }
+                            return Some(tab.id);
+                        }
+                        None
+                    })
+                    .collect();
+
+                // Send session-ended notifications for single-pane tabs before closing them.
+                if self.config.load().notifications.notification_session_ended {
+                    for (_tab_id, tab_title, exit_notified) in &single_pane_exiting {
+                        if !exit_notified {
+                            log::info!("Shell in tab '{}' has exited", tab_title);
+                            let title = format!("Session Ended: {}", tab_title);
+                            let message = "The shell process has exited".to_string();
+                            self.deliver_notification(&title, &message);
+                        }
+                    }
+                }
+
+                if !tabs_needing_resize.is_empty()
+                    && let Some(renderer) = &self.renderer
+                {
+                    let cell_width = renderer.cell_width();
+                    let cell_height = renderer.cell_height();
+                    let title_offset = if self.config.load().panes.show_pane_titles {
+                        self.config.load().panes.pane_title_height
+                    } else {
+                        0.0
+                    };
+                    for tab_id in tabs_needing_resize {
+                        if let Some(tab) = self.tab_manager.get_tab_mut(tab_id)
+                            && let Some(pm) = tab.pane_manager_mut()
+                        {
+                            // Suppress padding for single-pane tabs (no dividers).
+                            // In split mode, add half the divider width as base so content
+                            // doesn't render under the divider, plus the user-configured extra.
+                            let padding = if pm.pane_count() <= 1 {
+                                0.0
+                            } else {
+                                self.config.load().panes.pane_divider_width.unwrap_or(2.0) / 2.0
+                                    + self.config.load().panes.pane_padding
+                            };
+                            pm.resize_all_terminals_with_padding(
+                                cell_width,
+                                cell_height,
+                                padding,
+                                title_offset,
+                            );
+                        }
+                    }
+                }
+
+                for tab_id in &tabs_to_close {
+                    log::info!("Closing tab {} - all panes exited", tab_id);
+                    if self.tab_manager.visible_tab_count() <= 1 {
+                        log::info!("Last tab, closing window");
+                        self.is_shutting_down = true;
+                        for tab in self.tab_manager.tabs_mut() {
+                            tab.stop_refresh_task();
+                        }
+                        return true;
+                    } else {
+                        let _ = self.tab_manager.close_tab(*tab_id);
+                    }
+                }
+            }
+
+            ShellExitAction::RestartImmediately
+            | ShellExitAction::RestartWithPrompt
+            | ShellExitAction::RestartAfterDelay => {
+                // Handle restart variants
+                let config_clone = (**self.config.load()).clone();
+
+                for tab in self.tab_manager.tabs_mut() {
+                    if tab.tmux.tmux_gateway_active || tab.tmux.tmux_pane_id.is_some() {
+                        continue;
+                    }
+
+                    if let Some(pm) = tab.pane_manager_mut() {
+                        for pane in pm.all_panes_mut() {
+                            let is_running = pane.is_running();
+
+                            // Check if pane needs restart action
+                            if !is_running && pane.restart_state.is_none() {
+                                // Shell just exited, handle based on action
+                                match self.config.load().shell.shell_exit_action {
+                                    ShellExitAction::RestartImmediately => {
+                                        log::info!(
+                                            "Pane {} shell exited, restarting immediately",
+                                            pane.id
+                                        );
+                                        if let Err(e) = pane.respawn_shell(&config_clone) {
+                                            log::error!(
+                                                "Failed to respawn shell in pane {}: {}",
+                                                pane.id,
+                                                e
+                                            );
+                                        }
+                                    }
+                                    ShellExitAction::RestartWithPrompt => {
+                                        log::info!(
+                                            "Pane {} shell exited, showing restart prompt",
+                                            pane.id
+                                        );
+                                        pane.write_restart_prompt();
+                                        pane.restart_state = Some(RestartState::AwaitingInput);
+                                    }
+                                    ShellExitAction::RestartAfterDelay => {
+                                        log::info!(
+                                            "Pane {} shell exited, will restart after 1s",
+                                            pane.id
+                                        );
+                                        pane.restart_state = Some(RestartState::AwaitingDelay(
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            // Check if waiting for delay and time has elapsed
+                            if let Some(RestartState::AwaitingDelay(exit_time)) =
+                                &pane.restart_state
+                                && exit_time.elapsed() >= std::time::Duration::from_secs(1)
+                            {
+                                log::info!("Pane {} delay elapsed, restarting shell", pane.id);
+                                if let Err(e) = pane.respawn_shell(&config_clone) {
+                                    log::error!(
+                                        "Failed to respawn shell in pane {}: {}",
+                                        pane.id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false // Window stays open
+    }
+}

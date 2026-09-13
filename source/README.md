@@ -1,0 +1,511 @@
+# par-term
+
+[![CI](https://github.com/paulrobello/par-term/actions/workflows/ci.yml/badge.svg)](https://github.com/paulrobello/par-term/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/par-term)](https://crates.io/crates/par-term)
+![Runs on Linux | MacOS | Windows](https://img.shields.io/badge/runs%20on-Linux%20%7C%20MacOS%20%7C%20Windows-blue)
+![Arch x86-64 | ARM | AppleSilicon](https://img.shields.io/badge/arch-x86--64%20%7C%20ARM%20%7C%20AppleSilicon-blue)
+![Crates.io Downloads](https://img.shields.io/crates/d/par-term)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+A cross-platform, GPU-accelerated terminal emulator frontend built with Rust, powered by [par-term-emu-core-rust](https://github.com/paulrobello/par-term-emu-core-rust). Designed for high performance, modern typography, and rich graphics support.
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/probello3)
+
+![par-term screenshot](https://raw.githubusercontent.com/paulrobello/par-term/main/screenshot.png)
+
+## Table of Contents
+
+- [Getting Started](#getting-started)
+- [What's New](#whats-new)
+- [Features](#features)
+- [Documentation](#documentation)
+- [Installation](#installation)
+  - [Homebrew (macOS)](#homebrew-macos)
+  - [Cargo Install](#cargo-install)
+  - [From Source](#from-source)
+  - [macOS Bundle](#macos-bundle)
+  - [Linux Dependencies](#linux-dependencies)
+- [Installing Shaders](#installing-shaders)
+- [Keyboard Shortcuts](#keyboard-shortcuts)
+- [Configuration](#configuration)
+- [Technology](#technology)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Getting Started
+
+New to par-term? The [Getting Started Guide](docs/guides/GETTING_STARTED.md) walks you through installation, essential keyboard shortcuts, fonts, and split panes — everything you need to be productive in under 10 minutes.
+
+- **[Getting Started Guide](docs/guides/GETTING_STARTED.md)** — Install, launch, and configure par-term
+- **[Installation](#installation)** — Platform-specific install instructions below
+- **[Configuration Reference](docs/CONFIG_REFERENCE.md)** — All 200+ configuration options
+- **[Keyboard Shortcuts](docs/guides/KEYBOARD_SHORTCUTS.md)** — Complete keyboard shortcut reference
+
+## What's New
+### 0.45.0
+
+Kitty graphics placement geometry is now honored end-to-end, and macOS survives monitor plug/unplug without a resize. A minor bump for new renderer capability; `par-term-render` moves 0.10.1 → 0.11.0, `par-term-terminal` 0.5.4 → 0.5.5, and the core engine advances 0.46 → 0.48.
+
+- **Kitty placement geometry is honored** — `c`/`r` cell footprints, `X`/`Y` pixel offsets, and `x`/`y`/`w`/`h` source crops now size and clip inline images as the sending app intended; virtual `U=1` placements are unchanged.
+- **`pt-imgcat --format kitty`** — emits chunked Kitty APCs with PNG validation and auto-conversion, cell-unit `--width`/`--height`, tmux passthrough, and bare `-` for stdin.
+- **macOS recovers surfaces after display changes** — plugging or unplugging a monitor no longer requires a window resize; CAMetalLayer and wgpu surfaces are reconfigured behind coalesced screen notifications.
+- **`make bundle-install` manages the ACP bridge** — installs `@agentclientprotocol/claude-agent-acp`, migrates the deprecated `@zed-industries` package, and reports unmanaged binary conflicts.
+- **Inline-image payload diagnostics** (`par-term-terminal`) — bounded RGBA-sample logging at the upload boundary, behind `log::log_enabled!`.
+
+### 0.44.0
+
+Oh My Pi joins the bundled ACP agents, plus two bug fixes from 0.43.0.
+
+- **Oh My Pi (omp) is a bundled ACP agent** — identity `omp.sh`, connector `omp acp`. Eight bundled agents now (Claude Code, Codex/OpenAI, Copilot, Amp, Auggie, Docker cagent, OpenHands, Oh My Pi). Install omp separately.
+- **Soft-wrapped URL Cmd+click no longer truncates** when URL detection races a lock after cell extraction; wrap-continuation flags travel with the rendered snapshot.
+- **No-op GPU surface configures are skipped** so wgpu 30 no longer tears down the swapchain (and resets the macOS layer colorspace) on unchanged extents.
+- **Claude/Codex ACP connectors moved to `@agentclientprotocol/`** (`claude-agent-acp`, `codex-acp` binary names unchanged; Node >= 22).
+
+### 0.43.0
+
+Rendering stack modernized to **wgpu 30 / egui 0.36**, plus a fix for a crash on very wide windows. No new features.
+
+- **No longer aborts on windows wider than the GPU's maximum texture size** — a full-screen window spanning two 5K displays (10240 px wide) crashed with SIGABRT during resize. The renderer now requests the adapter's real texture limit (16384 on Apple Silicon) and clamps surface extents to it, and wgpu errors are logged instead of panicking.
+- **wgpu 29 → 30, naga 29 → 30, egui 0.35 → 0.36.1** — the GPU stack moves to the current release train; custom shaders needed no changes.
+- **Rust 1.98.0**, with the minimum supported version raised to 1.98, and ~90 further dependencies refreshed (fontdb 0.24, mdns-sd 0.21, base64 0.23, …).
+
+> **Breaking for library consumers only:** the MSRV is now 1.98, and `par-term-render` 0.10's public API sits on wgpu 30 types. Users of the released binaries are unaffected.
+
+### 0.42.0
+
+Universal macOS binaries — one signed/notarized download runs natively on both Apple Silicon and Intel.
+
+- **Universal macOS binary** (`par-term-macos-universal.zip`) — a single build covering both aarch64 and x86_64, so an Apple-Silicon user who grabs the Intel build no longer runs under Rosetta or hits the "Support ending for Intel-based apps" prompt. The self-updater now prefers the Universal asset and falls back to per-arch on older releases; per-arch downloads still work. (#223)
+- **Command-history log is char-boundary-safe** — truncating the rendered line for the history overlay no longer panics on non-ASCII (CJK, emoji) text.
+- **`par-term-emu-core-rust` bumped to 0.46** (latest), with the `pty_session` feature now explicitly enabled.
+
+### 0.41.0
+
+A new **Disk Free** status-bar widget shows free disk space as `DISK  62% (250.0 GB free)`.
+
+- **Disk Free widget** (`status_bar: disk_free`) — free space as percent + bytes, cross-platform via `sysinfo`. Defaults to the disk par-term was launched from at a 60-second poll interval (`status_bar_disk_poll_interval`); enable `status_bar_disk_follow_cwd` to follow the active tab/pane's working directory instead. Adds `system.disk_free`, `system.disk_free_percent`, and `system.disk_total` interpolation variables for custom widgets. Disabled by default.
+
+### 0.40.0
+
+Script restart policies now work for observer scripts. `restart_policy` and `restart_delay_ms` had been parsed and shown in the Settings UI since 0.38.0 but never enforced.
+
+- **Scripts honor `restart_policy` / `restart_delay_ms`** (`never`, `always`, `on_failure`) — a script that exits is restarted per its policy after the configured delay, matching how coprocesses already worked. `on_failure` tells a crash from a clean exit, and a crash-loop guard caps restarts at five within a five-second grace window. Closes #222.
+- **Dead scripts are reaped on exit** instead of lingering with their terminal observer still attached until the tab was closed.
+
+### 0.39.0
+
+A maintenance release. No new features and no behavioural fixes, but it clears two high-severity security advisories and removes 18 crates from the dependency graph.
+
+- **Two `quick-xml` advisories are cleared** (RUSTSEC-2026-0194 and -0195) by updating past the constraint that pinned it. Real exposure was low — the crate reaches par-term only through a build-time proc-macro parsing bundled Wayland protocol XML, on Linux — but `cargo audit` is clean again.
+- **The dead `mermaid` feature is gone**, along with `mermaid-rs-renderer` and `resvg`. Nothing had referenced them since 0.31.0 removed the content prettifier, yet the feature stayed in the default set, so every build compiled and linked an entire SVG rasterization stack. Drops 18 crates.
+- **Rust 1.97.1**, with the minimum supported version raised to 1.97, and 105 dependencies refreshed.
+- **`make package` and `make secret-scan` work again** — the first had been broken since the initial commit, copying a `LICENSE-MIT` file that never existed.
+
+> **Breaking for library consumers only:** the MSRV is now 1.97, and `--features mermaid` no longer exists. Users of the released binaries are unaffected.
+
+Release notes for every earlier version live in [CHANGELOG.md](CHANGELOG.md).
+
+### 0.38.0
+
+The result of a full security, architecture, quality and documentation audit — the largest release so far. Three changes break a working setup; they are listed first.
+
+> **Upgrading from 0.37.1 or earlier:** **Check for Updates** will not install it — download by hand once. Those releases published no per-binary checksums and those builds carry no signing key, so both self-update gates refuse. Self-update works normally from 0.38.0 onward. See the [migration guide](docs/guides/MIGRATION.md#v0380--upgrading-requires-a-manual-download).
+
+**Breaking**
+
+- **Importing preferences from a URL now requires HTTPS** -- an `http://` import URL stops working. The same path also used to abort the process outright on any HTTPS URL, so in practice it only ever worked over plaintext.
+- **A profile's command asks for confirmation before it runs** -- profile matching is driven by the hostname a remote shell reports, so it is remote-controlled input. There is no opt-out.
+- **`Cmd/Ctrl+Shift+P` now toggles the profile drawer**, which is what the settings table always advertised; **Manage Profiles** keeps its menu entry but loses the accelerator.
+
+**Added**
+
+- **Linux has a menu bar** -- New Window, Close Window, Quit and Select All were menu-only actions on a platform with no menu, so there was no way to reach them at all. All four are now bindable on every platform.
+- **The session survives a panic** -- the event loop publishes a pre-serialized capture every few seconds and the panic hook writes it, so a crash no longer costs every tab its working directory.
+- **Duplicate Tab has a default binding** (`Cmd/Ctrl+Shift+J`), and tab reordering appears in the menu.
+- **`XDG_CONFIG_HOME` is honoured on Linux and macOS**, and macOS user data moves under `~/.config/par-term/` with a one-time automatic migration.
+
+**Security and stability**
+
+- **A malicious mDNS hostname could reach a shell** through Quick Connect; every SSH argument is now validated and quoted.
+- **Any emoji, CJK character or accented letter could crash the terminal** -- six sites used a grid column index as a UTF-8 byte offset. They survived 1,965 green tests because every test input in the repository was ASCII.
+- **A failed pane demote destroyed every terminal in the source tab**, silently.
+- **Scripting did nothing unless the Settings window was open** -- the entire script runtime sat behind that branch.
+- **Update downloads are signature-verified** and release assets are signed, notarized and checksummed.
+- **Every pane is submitted to the GPU in one submit instead of one each**, and the full cell grid is no longer deep-cloned on idle frames.
+
+## Features
+
+### Core Terminal Frontend
+- **Cross-platform Support**: Native performance on macOS (Metal), Linux (Vulkan/X11/Wayland), and Windows (DirectX 12).
+- **Multi-Window & Multi-Tab**: Multiple windows with independent tab sessions per window.
+- **GPU-Accelerated Rendering**: Powered by `wgpu` with custom glyph atlas for blazing-fast text rasterization.
+- **Inline Graphics**: Full support for Sixel, iTerm2, and Kitty graphics protocols.
+- **Real PTY Integration**: Full pseudo-terminal support for interactive shell sessions.
+- **Advanced Sequence Support**: VT100/VT220/VT320/VT420/VT520 compatibility via `par-term-emu-core-rust`.
+- **Intelligent Reflow**: Full content reflow on window resize, preserving scrollback and visible state.
+
+### Modern UI & Visuals
+- **Custom GLSL Shaders**: 73 included shaders with hot reload, per-shader config, terminal-aware uniforms, and cubemap support.
+- **Background Images**: Support for PNG/JPEG backgrounds with configurable opacity and scaling modes.
+- **Window Transparency**: True per-pixel alpha with macOS blur support and text clarity options.
+- **Visual Bell**: Flash-based alerts for terminal bell events.
+- **Dynamic Themes**: Support for iTerm2-style color schemes (Dracula, Monokai, Solarized, etc.).
+- **Standalone Settings**: Dedicated settings window (F12) for live configuration editing.
+
+### Typography & Fonts
+- **Styled Font Variants**: Explicit support for separate Bold, Italic, and Bold-Italic font families.
+- **Unicode Range Mapping**: Assign specific fonts to Unicode ranges (perfect for CJK, Emoji, or Symbols).
+- **Text Shaping**: HarfBuzz-powered shaping for ligatures, complex scripts, and emoji sequences.
+- **Grapheme Clusters**: Proper rendering of flag emoji, ZWJ sequences, skin tone modifiers.
+- **Box Drawing**: Geometric rendering for pixel-perfect TUI borders and block characters.
+- **Smart Fallback**: Automatic system font discovery and fallback chain.
+
+### Selection & Clipboard
+- **Advanced Selection**: Block/Rectangular, Line-based, and Word-based selection modes.
+- **Multi-platform Clipboard**: Seamless integration with system clipboards via `arboard`.
+- **Middle-click Paste**: Standard Unix-style middle-click paste support.
+- **Automatic Copy**: Optional "copy on select" behavior.
+
+### Hyperlinks & URL Detection
+- **OSC 8 Support**: Native support for application-provided hyperlinks.
+- **Regex Detection**: Automatic detection of URLs in terminal output.
+- **Interactive Links**: Ctrl+Click to open links in your default browser, with hover highlighting and tooltips.
+
+### Assistant Panel & ACP Agents
+- **Assistant Panel**: DevTools-style side panel for terminal state inspection and ACP agent chat.
+- **Bundled + Custom ACP Agents**: Built-in agent definitions plus custom agents via `config.yaml` or `~/.config/par-term/agents/*.toml`.
+- **Per-Agent Environment Variables**: Configure local/provider-specific env vars (for example Ollama/OpenRouter endpoints) for each agent.
+- **Local Claude via Ollama**: Supports `claude-agent-acp` with Ollama Claude-compatible launch mode (see `docs/ASSISTANT_PANEL.md`).
+
+## Documentation
+
+### Getting Started
+- **[Getting Started Guide](docs/guides/GETTING_STARTED.md)** - Install, launch, and configure par-term in under 10 minutes.
+- **[Quick Start Fonts Guide](docs/guides/QUICK_START_FONTS.md)** - Get up and running with custom fonts.
+- **[Configuration Examples](examples/README.md)** - Annotated YAML configuration examples.
+- **[Environment Variables](docs/guides/ENVIRONMENT_VARIABLES.md)** - All recognized environment variables.
+
+### Features
+- **[Keyboard Shortcuts](docs/guides/KEYBOARD_SHORTCUTS.md)** - Complete keyboard shortcut reference.
+- **[Mouse Features](docs/features/MOUSE_FEATURES.md)** - Text selection, URL handling, and pane interaction.
+- **[Semantic History](docs/features/SEMANTIC_HISTORY.md)** - Click file paths to open in your editor.
+- **[Automation](docs/features/AUTOMATION.md)** - Regex triggers, actions, and coprocesses.
+- **[Profiles](docs/features/PROFILES.md)** - Profile system for saving terminal configurations.
+- **[Session Logging](docs/features/SESSION_LOGGING.md)** - Recording sessions in Plain/HTML/Asciicast formats.
+- **[Search](docs/features/SEARCH.md)** - Terminal search with regex, case-sensitive, and whole-word modes.
+- **[Paste Special](docs/features/PASTE_SPECIAL.md)** - 29 clipboard transformations for pasting.
+- **[Copy Mode](docs/features/COPY_MODE.md)** - Vi-style keyboard-driven text selection and navigation.
+- **[Snippets & Actions](docs/features/SNIPPETS.md)** - Text snippets with variables, custom actions, and keybinding management.
+- **[Progress Bars](docs/features/PROGRESS_BARS.md)** - OSC 9;4 and OSC 934 progress bar rendering and shader integration.
+- **[Accessibility](docs/features/ACCESSIBILITY.md)** - Minimum contrast enforcement and display options.
+- **[Integrations](docs/features/INTEGRATIONS.md)** - Shell integration and shader installation system.
+- **[Window Management](docs/features/WINDOW_MANAGEMENT.md)** - Window types, multi-monitor, and transparency.
+- **[Window Arrangements](docs/features/ARRANGEMENTS.md)** - Save and restore window layouts with auto-restore.
+- **[Command Separators](docs/features/COMMAND_SEPARATORS.md)** - Horizontal lines between shell commands with exit-code coloring.
+- **[SSH Host Management](docs/features/SSH.md)** - SSH quick connect, host discovery, and SSH profiles.
+- **[Status Bar](docs/features/STATUS_BAR.md)** - Configurable status bar with widgets and system monitoring.
+- **[Tabs](docs/features/TABS.md)** - Tab management, duplicate tab, and tab behavior.
+- **[Assistant Panel](docs/ASSISTANT_PANEL.md)** - ACP agent chat, custom agents (UI/TOML/YAML), shader assistant, and Claude+Ollama setup/troubleshooting.
+- **[File Transfers](docs/features/FILE_TRANSFERS.md)** - OSC 1337 file transfers with shell utilities.
+- **[Self-Update](docs/features/SELF_UPDATE.md)** - In-place update capability via CLI and Settings UI.
+- **[Debug Logging](docs/LOGGING.md)** - Configurable log levels and troubleshooting.
+
+### Shaders
+- **[Shader Gallery](https://paulrobello.github.io/par-term/)** - Visual gallery of 73 included shaders with screenshots.
+- **[Shader Reference](docs/features/SHADERS.md)** - Complete list of bundled shaders.
+- **[Custom Shaders Guide](docs/features/CUSTOM_SHADERS.md)** - Create custom GLSL shaders with hot reload and per-shader config.
+- **[Compositor Details](docs/architecture/COMPOSITOR.md)** - Deep dive into the rendering architecture.
+
+### Technical
+- **[Architecture Overview](docs/architecture/ARCHITECTURE.md)** - High-level system architecture and components.
+- **[API Documentation Index](docs/API.md)** - Public types across all workspace crates.
+- **[Environment Variables](docs/guides/ENVIRONMENT_VARIABLES.md)** - Runtime environment variable reference.
+- **[Feature Matrix](MATRIX.md)** - iTerm2 vs par-term feature-by-feature comparison.
+- **[Core Library](https://github.com/paulrobello/par-term-emu-core-rust)** - Documentation for the underlying terminal engine.
+
+## Installation
+
+### Homebrew (macOS)
+
+```bash
+brew install --cask paulrobello/tap/par-term
+```
+
+### Cargo Install
+
+If you have a Rust toolchain installed, install directly from crates.io:
+
+```bash
+cargo install par-term
+```
+
+This builds and installs the binary to `~/.cargo/bin/par-term`.
+
+### From Source
+
+Requires Rust 1.98+ (stable, 2024 edition) and modern graphics drivers:
+
+```bash
+# Clone the repository
+git clone https://github.com/paulrobello/par-term
+cd par-term
+
+# Build with the optimized dev-release profile (~1m20s clean, ~1-2s incremental, ~90-95% of full release performance)
+make build
+
+# Run
+make run
+
+# Or build the full release binary (~3 min, for distribution)
+make build-full
+
+# Install Claude ACP bridge for Assistant Panel (Claude connector)
+make install-acp
+```
+
+> **Note:** The packages `@zed-industries/claude-code-acp` and `@zed-industries/claude-agent-acp` were renamed/deprecated upstream. Use `@agentclientprotocol/claude-agent-acp` (same `claude-agent-acp` binary; requires Node >= 22).
+
+### macOS Bundle
+
+To create a native macOS `.app` bundle with a dock icon:
+
+```bash
+make bundle
+make run-bundle
+```
+
+To build and install the app bundle plus the CLI binary and Claude ACP bridge in one step:
+
+```bash
+make bundle-install
+```
+
+### Linux Dependencies
+
+On Linux, you need GTK3 and X11/Wayland libraries. Install the appropriate packages for your distribution:
+
+**Ubuntu/Debian**:
+```bash
+sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
+```
+
+**Fedora/RHEL**:
+```bash
+sudo dnf install gtk3-devel libxkbcommon-devel wayland-devel libxcb-devel alsa-lib-devel
+```
+
+**Arch Linux**:
+```bash
+sudo pacman -S gtk3 libxkbcommon wayland libxcb alsa-lib
+```
+
+### macOS Gatekeeper Notice
+
+If macOS reports that par-term "is damaged and can't be opened", this is caused by the Gatekeeper quarantine attribute applied to unsigned binaries. Remove it with:
+
+```bash
+# For the release binary
+xattr -cr target/release/par-term
+
+# For the .app bundle
+xattr -cr /Applications/par-term.app
+```
+
+> **Note:** The Homebrew cask install (`brew install --cask paulrobello/tap/par-term`) handles this automatically.
+
+## Installing Shaders
+
+par-term includes 73 custom GLSL shaders for background effects and cursor animations. These need to be installed to your config directory.
+
+### Built-in Installer (Recommended)
+
+Use the built-in CLI command to download and install all shaders from the latest release:
+
+```bash
+# Install shaders (with confirmation prompt)
+par-term install-shaders
+
+# Install without prompts
+par-term install-shaders -y
+
+# Force overwrite existing shaders
+par-term install-shaders --force
+```
+
+### Shell Script
+
+Alternatively, use the shell script installer. The recommended approach is to
+download the script first, inspect it, and then run it:
+
+```bash
+# Recommended: download, inspect, then run
+curl -O https://raw.githubusercontent.com/paulrobello/par-term/main/install_shaders.sh
+# Review the script before executing:
+less install_shaders.sh
+chmod +x install_shaders.sh
+./install_shaders.sh
+```
+
+> **Note**: The one-liner pipe-to-shell pattern executes remote code without
+> review. Use the download-then-inspect workflow above when security matters.
+
+```bash
+# Convenience only — inspect the script first when possible
+curl -sL https://raw.githubusercontent.com/paulrobello/par-term/main/install_shaders.sh | sh
+```
+
+### Manual Install
+
+1. Download `shaders.zip` from the [latest release](https://github.com/paulrobello/par-term/releases/latest)
+2. Extract to your config directory:
+   - **macOS/Linux**: `~/.config/par-term/shaders/`
+   - **Windows**: `%APPDATA%\par-term\shaders\`
+
+### From Source
+
+If building from source, copy the shaders folder manually:
+```bash
+# macOS/Linux
+cp -r shaders ~/.config/par-term/
+
+# Windows (PowerShell)
+Copy-Item -Recurse shaders $env:APPDATA\par-term\
+```
+
+### Using Shaders
+
+Once installed, enable shaders in your `config.yaml`:
+```yaml
+# Background shader
+custom_shader: "starfield.glsl"
+custom_shader_enabled: true
+
+# Cursor shader
+cursor_shader: "cursor_glow.glsl"
+cursor_shader_enabled: true
+```
+
+See the [Shader Gallery](docs/features/SHADERS.md) for previews of all included shaders.
+
+### Linting Shaders
+
+Validate shader metadata, channel references, and control comments from Settings > Effects > Custom Shaders with **Run Lint** (and clear the current output with **Clear Lint**), or from the CLI with:
+
+```bash
+par-term shader-lint ~/.config/par-term/shaders/my-shader.glsl
+```
+
+Add `--readability` to print a readability score plus suggested `custom_shader_brightness` and `custom_shader_text_opacity` defaults. By default, readability mode prompts before writing those suggestions into shader metadata:
+
+```bash
+par-term shader-lint my-shader.glsl --readability
+par-term shader-lint my-shader.glsl --apply       # apply suggestions without prompting
+par-term shader-lint my-shader.glsl --readability --no-prompt
+```
+
+## Keyboard Shortcuts
+
+Essential shortcuts to get started. On macOS, keybindings use `Cmd`; on Linux/Windows, they use `Ctrl+Shift` to avoid conflicts with terminal control codes.
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd/Ctrl + T` | New tab |
+| `Cmd/Ctrl + W` | Close tab (or window if single tab) |
+| `Cmd/Ctrl + N` | New window |
+| `Cmd/Ctrl + C` | Copy selection |
+| `Cmd/Ctrl + V` | Paste from clipboard |
+| `Cmd/Ctrl + F` | Open search |
+| `Cmd/Ctrl + D` | Split pane horizontally |
+| `F5` | Reload configuration |
+| `F11` | Toggle fullscreen |
+| `F12` / `Cmd + ,` | Open Settings |
+
+See the [full keyboard shortcuts reference](docs/guides/KEYBOARD_SHORTCUTS.md) for the complete list, including copy mode, pane management, shader toggles, SSH quick connect, and all customizable keybindings.
+
+## Configuration
+
+Configuration is stored in YAML format:
+- **Unix**: `~/.config/par-term/config.yaml`
+- **Windows**: `%APPDATA%\par-term\config.yaml`
+
+```yaml
+cols: 80
+rows: 24
+font_size: 13.0
+font_family: "JetBrains Mono"
+theme: "dark-background"
+window_opacity: 0.95
+scrollbar_position: "right"
+
+# Tab bar settings
+tab_bar_mode: "always"  # always (default), when_multiple, never
+tab_bar_height: 28.0
+tab_show_close_button: true
+tab_inherit_cwd: true
+dim_inactive_tabs: true
+inactive_tab_opacity: 0.6
+
+# Transparency settings
+keep_text_opaque: true
+transparency_affects_only_default_background: true
+blur_radius: 8  # macOS only
+
+# Power saving
+pause_shaders_on_blur: true
+unfocused_fps: 30
+
+# Cursor lock options (prevent apps from overriding)
+lock_cursor_visibility: false
+lock_cursor_style: false
+lock_cursor_blink: false
+
+# Custom shader settings
+custom_shader: "starfield.glsl"
+custom_shader_enabled: true
+shader_hot_reload: true  # Auto-reload on file changes
+
+# Per-shader overrides (optional)
+shader_configs:
+  starfield.glsl:
+    animation_speed: 0.8
+    brightness: 0.3
+```
+
+See `examples/config-complete.yaml` for a full list of options.
+
+## Technology
+
+- **Terminal Engine**: [par-term-emu-core-rust](https://github.com/paulrobello/par-term-emu-core-rust)
+- **Graphics**: `wgpu` (WebGPU for Rust)
+- **Text**: `swash` + `rustybuzz` (custom glyph atlas)
+- **UI**: `egui` for settings and overlays
+- **Windowing**: `winit`
+- **Async**: `tokio`
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup, build commands, testing workflow, commit message format, and PR process.
+
+Before submitting a pull request:
+
+```bash
+make fmt       # Format code
+make lint      # Run clippy
+make test      # Run test suite
+make checkall  # Run all of the above
+```
+
+For documentation contributions, follow the conventions in [docs/DOCUMENTATION_STYLE_GUIDE.md](docs/DOCUMENTATION_STYLE_GUIDE.md).
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Author
+
+Paul Robello - probello@gmail.com
+
+## Links
+
+- **GitHub**: [https://github.com/paulrobello/par-term](https://github.com/paulrobello/par-term)
+- **Core Library**: [https://github.com/paulrobello/par-term-emu-core-rust](https://github.com/paulrobello/par-term-emu-core-rust)

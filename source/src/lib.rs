@@ -1,0 +1,116 @@
+//! Library exports for testing and potential library use.
+//!
+//! # ARC-011 — Crate Size Note
+//!
+//! The root crate `src/` is ~70,587 lines across ~310 files. This is a compile-time
+//! bottleneck — any change to a single file recompiles the entire crate.
+//!
+//! Planned decomposition (deferred — multi-sprint effort):
+//!
+//!   1. Extract `par-term-ui` crate (~15K lines): egui overlay modules
+//!      - ai_inspector/, clipboard_history_ui, close_confirmation_ui,
+//!        command_history_ui, help_ui, integrations_ui, paste_special_ui,
+//!        profile_drawer_ui, quit_confirmation_ui, remote_shell_install_ui,
+//!        shader_install_ui, ssh_connect_ui, tmux_session_picker_ui
+//!
+//!   2. Extract `par-term-badge` crate (~3K lines): badge.rs + progress_bar.rs
+//!
+//!   3. Extract `par-term-session` crate (~5K lines): session/*, session_logger/
+//!
+//! Tracking: Issue ARC-011 in AUDIT.md.
+//!
+//! # Mutex Usage Policy
+//!
+//! par-term uses three mutex types for different concurrency scenarios.
+//! New code should follow these rules:
+//!
+//! - `tokio::sync::RwLock` — canonical choice for `TerminalManager` and other state
+//!   shared between async tasks and the sync winit event loop. From sync contexts
+//!   use `try_read()` / `try_write()` (non-blocking) or `blocking_read()` /
+//!   `blocking_write()` only for infrequent user-initiated operations. Never call
+//!   the blocking variants from within a Tokio worker thread — it will deadlock.
+//!
+//! - `parking_lot::Mutex` — use for sync-only state where a fast, non-async lock
+//!   is needed (e.g. upload-error field, watcher state). Do NOT call
+//!   `blocking_lock()` on a tokio mutex from within an async context.
+//!
+//! - `std::sync::Mutex` — acceptable for simple, short-lived locks in code that
+//!   cannot depend on parking_lot (e.g. platform FFI modules). Prefer parking_lot
+//!   for new code.
+//!
+//! Canonical Tab-level locking rules are documented on [`tab::Tab`].
+//! See `docs/MUTEX_PATTERNS.md` for detailed patterns, deadlock avoidance rules,
+//! and examples showing correct lock acquisition in each context.
+
+/// Application version (root crate version, for use by sub-crates).
+/// Sub-crates should receive this via parameter rather than using
+/// `env!("CARGO_PKG_VERSION")` which resolves to the sub-crate's version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[macro_use]
+pub mod debug;
+
+pub mod acp_harness;
+pub mod ai_inspector;
+pub mod app;
+pub mod arrangements;
+pub mod atomic_save;
+pub mod audio_bell;
+pub mod badge;
+pub mod cli;
+pub mod clipboard_history_ui;
+pub mod close_confirmation_ui;
+pub mod command_history;
+pub mod command_history_ui;
+pub mod config;
+pub mod config_migration;
+pub mod copy_mode;
+pub mod font_metrics;
+pub mod help_ui;
+pub mod http;
+pub mod integrations_ui;
+pub mod macos_blur; // macOS window blur using private CGS API
+pub mod macos_metal; // macOS-specific CAMetalLayer configuration
+pub mod macos_space; // macOS Space (virtual desktop) targeting using private SLS API
+/// MCP server — whole-crate re-export of `par-term-mcp`.
+pub use par_term_mcp as mcp_server;
+pub mod menu;
+pub mod pane;
+pub mod paste_special_ui;
+pub mod paste_transform;
+pub mod platform;
+pub(crate) mod process_timeout;
+pub mod profile;
+pub mod profile_drawer_ui;
+pub mod progress_bar;
+pub mod quit_confirmation_ui;
+pub mod remote_shell_install_ui;
+pub mod scroll_state;
+pub mod search;
+pub mod selection;
+pub mod session;
+pub mod session_logger;
+/// Settings UI — whole-crate re-export of `par-term-settings-ui`.
+pub use par_term_settings_ui as settings_ui;
+pub mod settings_window;
+pub mod shader_install_ui;
+pub mod shader_installer;
+pub mod shader_lint;
+pub mod shader_watcher;
+pub mod shell_integration_installer;
+pub mod shell_quote;
+pub mod smart_selection;
+pub mod snippets;
+pub mod ssh_connect_ui;
+pub mod status_bar;
+pub mod tab;
+pub mod tab_bar_ui;
+/// tmux integration — whole-crate re-export of `par-term-tmux`.
+pub use par_term_tmux as tmux;
+pub mod tmux_session_picker_ui;
+pub mod tmux_status_bar_ui;
+pub mod traits;
+pub mod traits_impl;
+pub mod ui_constants;
+pub mod update_dialog;
+pub mod url_detection;

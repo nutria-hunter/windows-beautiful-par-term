@@ -1,0 +1,9 @@
+identity = "claude.com"
+name = "Claude Code"
+short_name = "claude"
+protocol = "acp"
+type = "coding"
+install_command = "npm install -g @agentclientprotocol/claude-agent-acp"
+
+[run_command]
+"*" = "claude-agent-acp"

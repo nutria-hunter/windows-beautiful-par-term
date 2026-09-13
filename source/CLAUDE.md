@@ -1,0 +1,325 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+par-term is a cross-platform GPU-accelerated terminal emulator frontend built in Rust. It uses the [par-term-emu-core-rust](https://github.com/paulrobello/par-term-emu-core-rust) library for VT sequence processing, PTY management, and inline graphics protocols (Sixel, iTerm2, Kitty). The frontend provides GPU-accelerated rendering via wgpu with custom WGSL shaders, including support for custom post-processing shaders (Ghostty/Shadertoy-compatible GLSL).
+
+**Language**: Rust (Edition 2024)
+**Platform**: Cross-platform (macOS, Linux, Windows)
+**Graphics**: wgpu (Vulkan/Metal/DirectX 12)
+
+## Development Commands
+
+### Build & Run
+
+**IMPORTANT**: Use `make build` / `make run` for day-to-day development. These use the `dev-release` profile (opt-level 2, no LTO, incremental) which rebuilds in ~1-2s after code changes (~1m20s clean build) with ~90-95% of full release performance. Only use `make build-debug` when you need debug symbols for stepping through code, and `make build-full` / `make release` for distribution builds.
+
+```bash
+make build          # Dev-release build (optimized, incremental — ~1-2s rebuild, preferred)
+make build-full     # Full release build (LTO, single codegen unit — ~3min, for distribution)
+make build-debug    # Debug build (unoptimized, for stepping through code)
+make run            # Run in dev-release mode (preferred)
+make run-release    # Run in full release mode
+```
+
+### Testing & Code Quality
+```bash
+make test           # Run all tests
+make test-one TEST=test_name  # Run specific test
+make all            # Format, lint, test, and build
+make pre-commit     # Run pre-commit checks (secret-scan, fmt-check, lint, test)
+make ci             # Full CI checks (fmt-check, lint-all, test, check-all, check-line-counts)
+make fmt            # Format code with rustfmt
+make lint           # Run clippy
+make typecheck      # Type-check entire workspace (cargo check --workspace)
+make checkall       # fmt-check, lint, typecheck, test — verification only, never rewrites files
+make doc-check      # Validate markdown links and anchors (needs lychee)
+make check-line-counts  # Fail on production .rs files over 800 lines (warn over 500)
+cargo test -- --include-ignored  # Run all tests including PTY-dependent ones
+```
+
+### Debugging
+
+**IMPORTANT**: When stopping a debug instance, NEVER use `killall par-term` — this will kill ALL par-term processes including the terminal you're working in. Use `pkill -f "target/debug/par-term"` or kill by PID.
+
+```bash
+make run-debug      # Run with DEBUG_LEVEL=3 (logs to $TMPDIR/par_term_debug.log, /tmp on Linux)
+make run-trace      # Run with DEBUG_LEVEL=4 (most verbose)
+make tail-log       # Monitor debug log in real-time
+```
+
+The project runs **two logging systems, and both write to the same debug log file**. This is deliberate — see the module documentation at the top of `src/debug.rs`.
+
+**1. Custom debug macros** — root crate only, gated by the `DEBUG_LEVEL` env var (default `0`, i.e. off):
+```rust
+crate::debug_error!("CATEGORY", "message");          // DEBUG_LEVEL=1+
+crate::debug_info!("CATEGORY", "message {}", var);   // DEBUG_LEVEL=2+
+crate::debug_log!("CATEGORY", "message");            // DEBUG_LEVEL=3+
+crate::debug_trace!("CATEGORY", "message");          // DEBUG_LEVEL=4
+```
+Use these for high-frequency render/input logging: they cost nothing at the default `DEBUG_LEVEL=0`, and the category tag makes the output filterable.
+
+**2. The standard `log` crate** — `log::info!()`, `log::warn!()`, etc. **These do reach the debug log.** `src/debug.rs` defines `LogCrateBridge` (an `impl log::Log`) and `src/main.rs` installs it via `init_log_bridge()`. Level precedence is CLI/config override → `RUST_LOG` → `Info` default. Setting `RUST_LOG` additionally mirrors output to stderr — but note it is parsed as a single token, so per-module syntax such as `RUST_LOG=par_term=debug` silently falls back to `Info`. Third-party crates (wgpu, tokio, egui) emit through this path too, and noisy targets are level-capped in `LogCrateBridge::new()`.
+
+**Sub-crates must use `log::`.** `crate::debug_info!` resolves against the *calling* crate's root, so it does not exist anywhere under `par-term-*/src/`. In a sub-crate, `log::` is the only option — and it works.
+
+Common debug-macro categories: `TAB`, `TAB_ACTION`, `MOUSE`, `RENDER`, `SHADER`, `SCRIPT`, `TERMINAL`, `APP`
+
+**When testing, use the debug build window** (started via `cargo run`), not the app bundle. The app bundle won't have your code changes.
+
+See `docs/LOGGING.md` for full logging documentation.
+
+### ACP Agent Debugging (Assistant Panel / Claude+Ollama)
+
+When debugging ACP agent behavior (tool-call failures, prompt stalls, malformed XML-style tool output, Claude/Ollama wrapper issues), use the ACP harness before relying on the GUI alone:
+
+- `make acp-harness ARGS="--list-agents"` to confirm agent discovery and custom agent config loading
+- `make acp-smoke` to run the reproducible shader prompt smoke test and save a transcript
+
+See `docs/ACP_HARNESS.md` for usage, transcript capture, and troubleshooting.
+
+### Other Commands
+```bash
+make test-graphics     # Test graphics with debug logging
+make test-fonts        # Run comprehensive text shaping test suite
+make profile           # CPU profiling with flamegraph
+make clean             # Clean build artifacts
+make doc-open          # Generate and open documentation
+make bundle            # Create macOS .app bundle (macOS only)
+```
+
+## Task Tracking Requirements
+
+**IMPORTANT**: Always use the task system (TaskCreate/TaskUpdate) for ALL work, even small jobs. This enables external monitoring of progress.
+
+1. **Create tasks** at the start of any request using `TaskCreate`
+2. **Mark in_progress** when starting work using `TaskUpdate`
+3. **Mark completed** when done
+4. Break multi-step work into individual tasks for visibility
+
+## Architecture Overview
+
+See `docs/architecture/ARCHITECTURE.md` for detailed architecture documentation.
+
+**Key layers**: App (`src/app/`) → Terminal (`par-term-terminal/src/terminal/`) → Renderer (`par-term-render/src/cell_renderer/`) → GPU Shaders (`par-term-render/src/shaders/`)
+
+**Data flow**: Window Events → Input Handler → PTY → VT Parser → Styled Segments → GPU Renderer (three passes: cells → graphics → egui overlay)
+
+**Key patterns**:
+- Tokio runtime for async PTY I/O, sync wrappers for the event loop
+- Glyph atlas with instanced rendering for text
+- RGBA texture caching for inline graphics (Sixel/iTerm2/Kitty)
+- Scrollback buffer with viewport offset rendering
+
+## Key File Map (Navigation Guide)
+
+| Area | Primary Files | Sub-crate |
+|------|--------------|-----------|
+| **Rendering (pane path)** | `par-term-render/src/cell_renderer/pane_render/mod.rs`, `par-term-render/src/cell_renderer/render.rs`, `src/app/render_pipeline/gpu_submit.rs` | `par-term-render` |
+| **Rendering (search highlights overlay)** | `src/app/window_state/search_highlight.rs` | main |
+| **Cursor rendering** | `par-term-render/src/cell_renderer/bg_instance_builder.rs`, `cursor.rs` | `par-term-render` |
+| **Block characters (▄▀ etc.)** | `par-term-render/src/cell_renderer/block_chars/` | `par-term-render` |
+| **Input handling** | `src/app/input_events/` (window-event dispatch), `par-term-input/src/lib.rs` (`InputHandler`), `par-term-input/src/key_encoding.rs` (escape-sequence generation) | `par-term-input` |
+| **Tab management** | `src/tab/manager.rs`, `src/app/tab_ops/` | main |
+| **Tab bar UI** | `src/tab_bar_ui/` (9 files, no subdirectories) | main |
+| **Settings UI** | `src/settings_window/`, `par-term-settings-ui/` | `par-term-settings-ui` |
+| **Configuration** | `par-term-config/src/lib.rs` | `par-term-config` |
+| **Session save/restore** | `src/session/capture.rs`, `src/app/window_manager/window_session.rs` | main |
+| **Keybindings** | `par-term-keybindings/` | `par-term-keybindings` |
+| **Snippets/Actions** | `src/snippets/`, `src/app/input_events/` | main |
+| **Custom shaders** | `src/shader_installer.rs`, `shaders/` dir, `par-term-render/src/` | `par-term-render` |
+| **SSH** | `par-term-ssh/src/` (all implementation), `src/ssh_connect_ui.rs` | `par-term-ssh` |
+| **Tmux integration** | `src/app/tmux_handler/`, `src/pane/manager/tmux_layout.rs`, `src/tmux_session_picker_ui.rs`, `par-term-tmux/` | `par-term-tmux` |
+| **ACP / AI panel** | `src/acp_harness/`, `src/ai_inspector/`, `par-term-acp/` | `par-term-acp` |
+| **Font/text shaping** | `par-term-fonts/` | `par-term-fonts` |
+
+> **Watch for re-export shims.** A few modules in `src/` exist only to `pub use` from a sub-crate and contain no implementation: `src/config/mod.rs` and `src/atomic_save.rs`, plus the whole-crate re-export aliases in `src/lib.rs` (`mcp_server` → `par-term-mcp`, `settings_ui` → `par-term-settings-ui`, `tmux` → `par-term-tmux`). Edit the sub-crate named in the third column, not the shim.
+
+## Code Organization Guidelines
+
+- **Target**: Keep files under 500 lines; refactor files exceeding 800 lines
+- Extract modules when logical groupings emerge (see existing patterns: `src/app/`, `src/app/render_pipeline/`, `par-term-render/src/cell_renderer/`)
+- Centralize constants, prefer composition over duplication, create helper traits for shared functionality
+
+## Platform-Specific Notes
+
+- **macOS**: Metal backend, platform code in `src/macos_metal.rs`, bundle via `make bundle`
+- **Linux**: Vulkan backend, requires X11/Wayland libs (`libxcb-render0-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`)
+- **Windows**: DirectX 12 backend
+
+## Configuration
+
+Location (XDG-compliant): `~/.config/par-term/config.yaml` (Linux/macOS), `%APPDATA%\par-term\config.yaml` (Windows)
+
+See `par-term-config/src/config/config_struct/mod.rs` for all available settings and defaults.
+
+## Sub-Crate Dependency Graph (for version bumps)
+
+When bumping sub-crate versions for crates.io publishing, bump in dependency order. Update both the crate's own `version` field and any `version = "..."` in dependents' `Cargo.toml` references.
+
+```
+Layer 0 — No internal deps (bump in any order):
+  par-term-acp
+  par-term-ssh
+  par-term-mcp
+
+Layer 1 — Foundation (bump before anything that depends on it):
+  par-term-config
+    └── depends on: (none — pure-data crate; Unicode types defined locally in src/types/)
+
+Layer 2 — Depend on par-term-config (bump after Layer 1):
+  par-term-fonts        → par-term-config
+  par-term-input        → par-term-config
+  par-term-keybindings  → par-term-config
+  par-term-scripting    → par-term-config  [+ emu-core]
+  par-term-settings-ui  → par-term-config
+  par-term-terminal     → par-term-config  [+ emu-core]
+  par-term-tmux         → par-term-config  [+ emu-core]
+  par-term-update       → par-term-config
+
+Layer 3 — Depend on Layer 2 crates (bump after Layer 2):
+  par-term-render       → par-term-config, par-term-fonts  [+ emu-core]
+
+Layer 4 — Root crate (bump last):
+  par-term              → all of the above  [+ emu-core]
+```
+
+`[+ emu-core]` marks a dependency on **`par-term-emu-core-rust`**, the *external* crates.io library, declared once in the root `[workspace.dependencies]` and consumed as `par-term-emu-core-rust.workspace = true`. It lives in a separate repository, so it never participates in this bump order — it is shown only so that a publish-order or version-bump decision made from this diagram does not miss the coupling.
+
+**Quick bump checklist:**
+1. Bump `par-term-config` version + update refs in all Layer 2/3 crates
+2. Bump Layer 0 crate versions
+3. Bump Layer 2 crate versions
+4. Bump `par-term-render` version + update its `par-term-fonts` ref
+5. Update all version refs in root `Cargo.toml`
+6. Run `cargo check --workspace` to verify
+
+## Common Development Workflows
+
+### Adding a New Configuration Option
+1. Add the field to the **sub-config for its area** — `par-term-config/src/config/config_struct/<area>_config.rs` (`TabConfig`, `PaneConfig`, `ShellConfig`, `TmuxConfig`, `BadgeConfig`, … ~40 of them) — with `#[serde(default = "default_my_option")]`. Do **not** add it to `Config` in `config_struct/mod.rs`; that root struct is deliberately drained and adding to it is what grew it to 1,529 lines. The sub-config is already a `#[serde(flatten)]` member of `Config`, so the YAML key stays top-level and the access path is `config.<member>.<field>`.
+2. Update that sub-config's `Default` impl with the **same expression** the `#[serde(default = "…")]` names. Never swap a hand-written `Default` for `#[derive(Default)]` to add a field — most of these fields do not default to their type's default, and deriving resets them while compiling cleanly. `par-term-config/tests/config_yaml_compat.rs` fails if the two disagree.
+3. Use config value in relevant component
+4. **REQUIRED**: Add UI controls in the appropriate `par-term-settings-ui/src/<name>_tab/` module (most tabs are directories, not single files — scripts settings, for example, live in `scripts_tab/editor.rs`, rendered from `automation_tab/mod.rs`)
+   - Set `settings.has_changes = true` and `*changes_this_frame = true` on change
+5. **REQUIRED**: Add search keywords to that tab module's own `keywords()` function. `tab_search_keywords()` lives in `par-term-settings-ui/src/search_keywords.rs` and only dispatches to them; `sidebar.rs` just calls it.
+6. If the field is on a struct with exhaustive literal construction sites (`ScriptConfig` has one — `par-term-settings-ui/src/scripts_tab/editor.rs` — and it does not use `..Default::default()`), every one is a compile error until updated — `#[serde(default)]` covers deserialization only.
+
+### Adding a New Keyboard Shortcut
+1. Add key handling in `src/app/input_events/` (directory — `mod.rs` + `keybinding_actions.rs`)
+2. If needed, add sequence generation in `par-term-input/src/key_encoding.rs`; `InputHandler` itself is defined in `par-term-input/src/lib.rs`.
+
+### Adding Snippet or Action Keybindings
+See `docs/features/SNIPPETS.md` for full documentation. Key points:
+- Snippets use `snippet:<id>`, actions use `action:<id>` as keybinding action names
+- Auto-generated during config load via `generate_snippet_action_keybindings()` in `par-term-config/src/config/keybindings_methods.rs`
+- `execute_keybinding_action()` in `src/app/input_events/keybinding_actions.rs` handles execution
+
+### Custom Shaders
+
+**IMPORTANT**: par-term has TWO separate shader systems — **background shaders** (`custom_shader`) and **cursor shaders** (`cursor_shader`). Do not confuse them when debugging.
+
+See `docs/features/CUSTOM_SHADERS.md` for full shader documentation including uniforms, creation, and debugging.
+
+**Key rules**:
+- Develop shaders in `~/.config/par-term/shaders/` first; only move to repo `shaders/` when ready for distribution
+- Transpiled WGSL and wrapped GLSL are written to the **system temp directory** for debugging — `par_term_<name>_shader.wgsl` and `par_term_debug_wrapped.glsl`. That is `$TMPDIR` (a `/var/folders/...` path) on macOS, `/tmp` on Linux, `%TEMP%` on Windows. Never hardcode `/tmp`; resolve through `par_term_render::shader_debug`, which every writer and reporter shares. Call the `shader_diagnostics` MCP tool to print the actual paths.
+- **Both dumps are `#[cfg(debug_assertions)]`-gated.** `dev-release` inherits from `release`, so `make build` / `make run` produce neither file — use `make build-debug`. `shader_diagnostics` reports the path unconditionally, so it can name a file that does not exist.
+- When debugging one shader type, temporarily disable the other
+
+### Modifying Rendering
+- Cell backgrounds: `par-term-render/src/cell_renderer/` + `par-term-render/src/shaders/cell_bg.wgsl`
+- Text rendering: `par-term-render/src/cell_renderer/` + `par-term-render/src/shaders/cell_text.wgsl`
+- Scrollbar: `par-term-render/src/scrollbar.rs` + `par-term-render/src/shaders/scrollbar.wgsl`
+
+### Debugging PTY Issues
+- Enable logging: `RUST_LOG=debug cargo run`
+- Check `TerminalManager::write()` for I/O errors; the PTY read loop lives in `par-term-emu-core-rust`'s reader thread
+
+## Testing Considerations
+
+- Some tests require active PTY sessions and are marked `#[ignore]`
+- Tests use `tempfile` for temporary configuration files
+- Integration tests in `tests/` cover scripting, shaders, tabs, profiles, config, copy mode, automation, terminal, and input, grouped into per-area subdirectories
+
+## Critical Gotchas
+
+- `tab.terminal` and `pane.terminal` are `Arc<tokio::sync::RwLock<TerminalManager>>` — **not** a `Mutex`. From the sync event loop use `try_read()` / `try_write()`; for user-initiated operations that must not be dropped (start/stop coprocess) use `blocking_read()` / `blocking_write()`. Prefer a **read** lock: most mutating methods (`write`, `paste`, `encode_mouse_event`) take `&self` and serialize internally. `try_lock()` and `blocking_lock()` do not exist on `tokio::sync::RwLock` and will not compile. See `docs/architecture/MUTEX_PATTERNS.md`.
+- **Both logging systems reach the debug log** — `log::info!()` etc. are routed to `<temp_dir>/par_term_debug.log` by `LogCrateBridge` (`src/debug.rs`, installed from `src/main.rs`, default level `Info`). They are not stdout-only. Prefer `crate::debug_info!()` for high-frequency root-crate logging because it is gated on `DEBUG_LEVEL` (default off); in sub-crates `log::` is the *only* option, since `crate::debug_info!` resolves to the sub-crate's own root
+- The core library (`par-term-emu-core-rust`) has a `CoprocessManager` wired into the PTY reader thread; don't create separate managers in the frontend
+- **Single rendering path (pane)**: All *live* rendering goes through `render_split_panes_with_data()` → `CellRenderer::build_pane_instance_buffers()` in `pane_render/mod.rs` — including when a custom or cursor shader is active. Per-cell overlays (search highlights, URL detection) are applied to `pane_data[].cells` AFTER `gather_pane_render_data()` in `gpu_submit.rs`. The **offscreen screenshot** chain — `Renderer::take_screenshot()` → `composite_panes_offscreen()` → the same `composite_panes()` in `par-term-render/src/renderer/rendering.rs` that `render_split_panes()` drives — is the only other consumer of that path: it renders to an offscreen texture instead of the surface, ignores the `dirty` flag, and the egui overlay is absent from captures. Do not treat it as a second live path.
+- **Render 3-phase ordering**: Cursor overlays MUST render in phase 3 (after text), otherwise beam/underline cursors are hidden under text glyphs. All three callers use `emit_three_phase_draw_calls()` in `render.rs` — the single source of truth for draw call sequencing.
+
+## Docs Reference
+
+Everything below lives under `docs/` except where the path says otherwise.
+
+| Topic | File |
+|-------|------|
+| Architecture overview | `docs/architecture/ARCHITECTURE.md` |
+| Crate dependency structure | `docs/architecture/CRATE_STRUCTURE.md` |
+| Concurrency / locking | `docs/architecture/CONCURRENCY.md` |
+| Mutex patterns reference | `docs/architecture/MUTEX_PATTERNS.md` |
+| State lifecycle | `docs/architecture/STATE_LIFECYCLE.md` |
+| Custom shaders (background + cursor) | `docs/features/CUSTOM_SHADERS.md` |
+| Included shader gallery | `docs/features/SHADERS.md` |
+| GPU compositor / render layers | `docs/architecture/COMPOSITOR.md` |
+| Session save/restore | `docs/features/SESSION_MANAGEMENT.md` |
+| Session logging | `docs/features/SESSION_LOGGING.md` |
+| Snippets & actions | `docs/features/SNIPPETS.md` |
+| Keyboard shortcuts | `docs/guides/KEYBOARD_SHORTCUTS.md` |
+| Logging & debug | `docs/LOGGING.md` |
+| SSH support | `docs/features/SSH.md` |
+| Config reference | `docs/CONFIG_REFERENCE.md` |
+| Migration / upgrade notes | `docs/guides/MIGRATION.md` |
+| ACP harness | `docs/ACP_HARNESS.md` |
+| Troubleshooting | `docs/guides/TROUBLESHOOTING.md` |
+| Getting started guide | `docs/guides/GETTING_STARTED.md` |
+| Quick start: fonts | `docs/guides/QUICK_START_FONTS.md` |
+| Public API index | `docs/API.md` |
+| Environment variables | `docs/guides/ENVIRONMENT_VARIABLES.md` |
+| Enterprise deployment | `docs/ENTERPRISE_DEPLOYMENT.md` |
+| Automation (triggers, coprocesses) | `docs/features/AUTOMATION.md` |
+| Assistant panel / ACP agents | `docs/ASSISTANT_PANEL.md` |
+| Split tabs | `docs/features/TABS.md` |
+| Window management | `docs/features/WINDOW_MANAGEMENT.md` |
+| Window arrangements | `docs/features/ARRANGEMENTS.md` |
+| Profiles | `docs/features/PROFILES.md` |
+| Accessibility | `docs/features/ACCESSIBILITY.md` |
+| Self-update | `docs/features/SELF_UPDATE.md` |
+| Mouse features | `docs/features/MOUSE_FEATURES.md` |
+| Notifications (OSC 9/777/99) | `docs/features/NOTIFICATIONS.md` |
+| Copy mode | `docs/features/COPY_MODE.md` |
+| Search | `docs/features/SEARCH.md` |
+| Status bar | `docs/features/STATUS_BAR.md` |
+| Badges | `docs/features/BADGES.md` |
+| Integrations | `docs/features/INTEGRATIONS.md` |
+| Command history | `docs/features/COMMAND_HISTORY.md` |
+| Command separators | `docs/features/COMMAND_SEPARATORS.md` |
+| File transfers | `docs/features/FILE_TRANSFERS.md` |
+| Paste special | `docs/features/PASTE_SPECIAL.md` |
+| Preferences import/export | `docs/features/PREFERENCES_IMPORT_EXPORT.md` |
+| Progress bars | `docs/features/PROGRESS_BARS.md` |
+| Scrollback buffer | `docs/features/SCROLLBACK.md` |
+| Semantic history | `docs/features/SEMANTIC_HISTORY.md` |
+| iTerm2 feature-comparison matrix | `MATRIX.md` (repo root) |
+
+## Quick Debugging Checklist by Category
+
+**Rendering issue (wrong color, invisible element, cursor problem):**
+1. All rendering goes through `pane_render/mod.rs` → `emit_three_phase_draw_calls()` in `render.rs`
+2. Check 3-phase ordering: bgs → text → cursor overlays
+3. For per-cell overlays: modify `pane_data[].cells` in `gpu_submit.rs` after `gather_pane_render_data()`
+4. Use `make run-debug` and `make tail-log` with `crate::debug_info!("RENDER", ...)`
+
+**Session restore issue (shell dies, wrong CWD):**
+1. Single-pane tabs must NOT call `restore_pane_layout()` — check `src/session/capture.rs`
+2. `pane_layout = None` for Leaf nodes, `Some(...)` only for Split roots
+
+**Tab bar context menu inline mode (dismisses immediately):**
+1. Add `*_activated_frame: u64` field to `TabBarUI`
+2. Store `ui.ctx().cumulative_frame_nr()` on activation
+3. Guard click-outside with `&& current_frame > self.*_activated_frame`
+4. If opening an egui Popup: also add `&& !self.*_picking` to click-outside guard

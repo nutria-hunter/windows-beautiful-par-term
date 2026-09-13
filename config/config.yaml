@@ -1,0 +1,639 @@
+cols: 150
+rows: 39
+font_size: 13.0
+font_family: Maple Mono NF KR
+font_family_bold: Maple Mono NF KR
+font_family_italic: Maple Mono NF KR
+font_family_bold_italic: Maple Mono NF KR
+font_ranges: []
+line_spacing: 1.0
+char_spacing: 1.0
+enable_text_shaping: true
+enable_ligatures: true
+enable_kerning: true
+font_antialias: true
+font_hinting: true
+font_thin_strokes: retina_only
+minimum_contrast: 0.0
+window_title: par-term
+allow_title_change: true
+max_fps: 60
+vsync_mode: fifo
+power_preference: none
+reduce_flicker: true
+reduce_flicker_delay_ms: 16
+maximize_throughput: false
+throughput_render_interval_ms: 100
+window_opacity: 1.0
+window_always_on_top: false
+window_decorations: false
+blur_enabled: false
+blur_radius: 8
+window_padding: 6.0
+hide_window_padding_on_split: true
+snap_window_to_grid: false
+window_type: normal
+target_monitor: null
+target_space: null
+lock_window_size: false
+show_window_number: false
+transparency_affects_only_default_background: true
+keep_text_opaque: true
+background_image: null
+background_image_enabled: false
+background_image_mode: stretch
+background_image_opacity: 1.0
+image_scaling_mode: linear
+image_preserve_aspect_ratio: true
+background_mode: default
+pane_backgrounds: []
+background_color:
+- 30
+- 30
+- 30
+download_save_location: downloads
+custom_shader: tilted-spiral.glsl
+custom_shader_enabled: true
+custom_shader_animation: true
+custom_shader_animation_speed: 1.0
+custom_shader_text_opacity: 1.0
+custom_shader_full_content: false
+custom_shader_brightness: 1.0
+custom_shader_channel0: null
+custom_shader_channel1: null
+custom_shader_channel2: null
+custom_shader_channel3: null
+custom_shader_cubemap: null
+custom_shader_cubemap_enabled: true
+custom_shader_use_background_as_channel0: false
+custom_shader_background_channel0_blend_mode: replace
+custom_shader_auto_dim_under_text: false
+custom_shader_auto_dim_strength: 0.35
+custom_shader_readability_mode: false
+custom_shader_readability_brightness: 0.35
+cursor_shader: null
+cursor_shader_enabled: false
+cursor_shader_animation: true
+cursor_shader_animation_speed: 1.0
+cursor_shader_color:
+- 255
+- 255
+- 255
+cursor_shader_trail_duration: 0.5
+cursor_shader_glow_radius: 80.0
+cursor_shader_glow_intensity: 0.3
+cursor_shader_hides_cursor: false
+cursor_shader_disable_in_alt_screen: true
+left_option_key_mode: esc
+right_option_key_mode: esc
+modifier_remapping:
+  left_ctrl: none
+  right_ctrl: none
+  left_alt: none
+  right_alt: none
+  left_super: none
+  right_super: none
+use_physical_keys: false
+auto_copy_selection: true
+copy_trailing_newline: false
+middle_click_paste: true
+paste_delay_ms: 0
+warn_paste_control_chars: true
+dropped_file_quote_style: single_quotes
+mouse_scroll_speed: 3.0
+mouse_double_click_threshold: 500
+mouse_triple_click_threshold: 500
+option_click_moves_cursor: true
+focus_follows_mouse: false
+report_horizontal_scroll: true
+word_characters: /-+\~_.
+smart_selection_enabled: true
+smart_selection_rules:
+- name: HTTP URL
+  regex: https?://[^\s<>\[\]{}|\\^`\x00-\x1f]+
+  precision: very_high
+  enabled: true
+- name: SSH URL
+  regex: \bssh://([a-zA-Z0-9_]+@)?([a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+(/[^\s]*)?
+  precision: very_high
+  enabled: true
+- name: Git URL
+  regex: \bgit://([a-zA-Z0-9_]+@)?([a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+(/[^\s]*)?
+  precision: very_high
+  enabled: true
+- name: File URL
+  regex: file://[^\s]+
+  precision: very_high
+  enabled: true
+- name: Email address
+  regex: \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b
+  precision: high
+  enabled: true
+- name: IPv4 address
+  regex: \b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b
+  precision: high
+  enabled: true
+- name: File path
+  regex: ~?/?(?:[a-zA-Z0-9._-]+/)+[a-zA-Z0-9._-]+/?
+  precision: normal
+  enabled: true
+- name: Java/Python import
+  regex: (?:[a-zA-Z_][a-zA-Z0-9_]*\.){2,}[a-zA-Z_][a-zA-Z0-9_]*
+  precision: normal
+  enabled: true
+- name: C++ namespace
+  regex: (?:[a-zA-Z_][a-zA-Z0-9_]*::)+[a-zA-Z_][a-zA-Z0-9_]*
+  precision: normal
+  enabled: true
+- name: Quoted string
+  regex: '"(?:[^"\\]|\\.)*"'
+  precision: normal
+  enabled: true
+- name: UUID
+  regex: \b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b
+  precision: normal
+  enabled: true
+copy_mode_enabled: true
+copy_mode_auto_exit_on_yank: true
+copy_mode_show_status: true
+scrollback_lines: 10000
+unicode_version: auto
+ambiguous_width: narrow
+normalization_form: NFC
+cursor_blink: false
+cursor_blink_interval: 500
+cursor_style: block
+cursor_color:
+- 255
+- 255
+- 255
+cursor_text_color: null
+lock_cursor_visibility: false
+lock_cursor_style: false
+lock_cursor_blink: false
+cursor_guide_enabled: false
+cursor_guide_color:
+- 255
+- 255
+- 255
+- 20
+cursor_shadow_enabled: false
+cursor_shadow_color:
+- 0
+- 0
+- 0
+- 128
+cursor_shadow_offset:
+- 2.0
+- 2.0
+cursor_shadow_blur: 3.0
+cursor_boost: 0.0
+cursor_boost_color:
+- 255
+- 255
+- 255
+unfocused_cursor_style: hollow
+scrollbar_autohide_delay: 0
+scrollbar_position: right
+scrollbar_width: 10.0
+scrollbar_thumb_color:
+- 0.62
+- 0.60
+- 0.71
+- 0.90
+scrollbar_track_color:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+scrollbar_command_marks: true
+scrollbar_mark_tooltips: false
+theme: kanagawa-wave
+auto_dark_mode: false
+light_theme: light-background
+dark_theme: kanagawa-wave
+screenshot_format: png
+shell_exit_action: close
+custom_shell: null
+shell_args: null
+working_directory: null
+startup_directory_mode: home
+startup_directory: null
+last_working_directory: null
+shell_env: null
+login_shell: true
+initial_text: ''
+initial_text_delay_ms: 100
+initial_text_send_newline: true
+answerback_string: ''
+prompt_on_quit: false
+confirm_close_running_jobs: false
+jobs_to_ignore:
+- bash
+- zsh
+- fish
+- sh
+- dash
+- ksh
+- tcsh
+- csh
+- less
+- more
+- man
+- cat
+- sleep
+semantic_history_enabled: true
+semantic_history_editor_mode: environment_variable
+semantic_history_editor: ''
+link_highlight_color:
+- 79
+- 195
+- 247
+link_highlight_color_enabled: true
+link_highlight_underline: true
+link_underline_style: stipple
+link_handler_command: ''
+allow_file_scheme_urls: false
+command_separator_enabled: false
+command_separator_thickness: 1.0
+command_separator_opacity: 0.4
+command_separator_exit_color: true
+command_separator_color:
+- 128
+- 128
+- 128
+clipboard_max_sync_events: 64
+clipboard_max_event_bytes: 2048
+osc52_clipboard: true
+max_osc_data_length: 134217728
+command_history_max_entries: 1000
+notification_bell_desktop: false
+notification_bell_sound: 50
+notification_bell_visual: true
+notification_visual_bell_color:
+- 255
+- 255
+- 255
+notification_activity_enabled: false
+notification_activity_threshold: 10
+anti_idle_enabled: false
+anti_idle_seconds: 60
+anti_idle_code: 0
+notification_silence_enabled: false
+notification_silence_threshold: 300
+notification_session_ended: false
+suppress_notifications_when_focused: true
+notification_max_buffer: 64
+alert_sounds: {}
+enable_mdns_discovery: false
+mdns_scan_timeout_secs: 3
+ssh_auto_profile_switch: true
+ssh_revert_profile_on_disconnect: true
+tab_style: minimal
+light_tab_style: light
+dark_tab_style: dark
+tab_bar_mode: always
+tab_title_mode: auto
+remote_tab_title_format: user_at_host
+remote_tab_title_osc_priority: true
+tab_bar_height: 36.0
+tab_pill_inset_y: 5.0
+tab_bar_position: top
+tab_bar_width: 160.0
+tab_show_close_button: true
+tab_show_index: false
+tab_inherit_cwd: true
+max_tabs: 0
+show_profile_drawer_button: false
+new_tab_shortcut_shows_profiles: false
+new_tab_position: end
+tab_bar_background:
+- 22
+- 22
+- 29
+tab_active_background:
+- 42
+- 42
+- 55
+tab_inactive_background:
+- 22
+- 22
+- 29
+tab_hover_background:
+- 54
+- 54
+- 70
+tab_active_text:
+- 220
+- 215
+- 186
+tab_inactive_text:
+- 114
+- 113
+- 105
+tab_active_indicator:
+- 126
+- 156
+- 216
+tab_activity_indicator:
+- 106
+- 149
+- 137
+tab_bell_indicator:
+- 195
+- 64
+- 67
+tab_close_button:
+- 84
+- 84
+- 109
+tab_close_button_hover:
+- 195
+- 64
+- 67
+dim_inactive_tabs: false
+inactive_tab_opacity: 0.6
+tab_min_width: 130.0
+tab_stretch_to_fill: true
+tab_html_titles: false
+tab_border_color:
+- 84
+- 84
+- 109
+tab_border_width: 1.0
+tab_inactive_outline_only: true
+pane_divider_width: 2.0
+pane_divider_hit_width: 5.0
+pane_padding: 1.0
+pane_min_size: 10
+pane_background_opacity: 1.0
+pane_divider_color:
+- 80
+- 80
+- 80
+pane_divider_hover_color:
+- 120
+- 150
+- 200
+dim_inactive_panes: false
+inactive_pane_opacity: 0.7
+show_pane_titles: false
+pane_title_height: 20.0
+pane_title_position: top
+pane_title_color:
+- 200
+- 200
+- 200
+pane_title_bg_color:
+- 40
+- 40
+- 50
+pane_title_font: ''
+pane_divider_style: solid
+max_panes: 16
+pane_focus_indicator: true
+pane_focus_color:
+- 100
+- 150
+- 255
+pane_focus_width: 1.0
+tmux_enabled: false
+tmux_path: tmux
+tmux_default_session: null
+tmux_auto_attach: false
+tmux_auto_attach_session: null
+tmux_clipboard_sync: true
+tmux_hide_gateway_tab: false
+tmux_profile: null
+tmux_show_status_bar: false
+tmux_status_bar_refresh_ms: 1000
+tmux_prefix_key: C-b
+tmux_status_bar_use_native_format: false
+tmux_status_bar_left: '[{session}] {windows}'
+tmux_status_bar_right: '{pane} | {time:%H:%M}'
+pause_shaders_on_blur: false
+pause_refresh_on_blur: false
+unfocused_fps: 60
+inactive_tab_fps: 30
+shader_hot_reload: false
+shader_hot_reload_delay: 100
+shader_configs: {}
+cursor_shader_configs: {}
+keybindings:
+- key: Ctrl+Shift+B
+  action: toggle_background_shader
+- key: Ctrl+Shift+U
+  action: toggle_cursor_shader
+- key: Ctrl+Alt+V
+  action: paste_special
+- key: Ctrl+Shift+R
+  action: toggle_session_logging
+- key: Ctrl+Shift+D
+  action: split_horizontal
+- key: Ctrl+Shift+E
+  action: split_vertical
+- key: Ctrl+Shift+X
+  action: close_pane
+- key: Ctrl+Alt+Left
+  action: navigate_pane_left
+- key: Ctrl+Alt+Right
+  action: navigate_pane_right
+- key: Ctrl+Alt+Up
+  action: navigate_pane_up
+- key: Ctrl+Alt+Down
+  action: navigate_pane_down
+- key: Ctrl+Alt+Shift+Left
+  action: resize_pane_left
+- key: Ctrl+Alt+Shift+Right
+  action: resize_pane_right
+- key: Ctrl+Alt+Shift+Up
+  action: resize_pane_up
+- key: Ctrl+Alt+Shift+Down
+  action: resize_pane_down
+- key: Ctrl+Alt+I
+  action: toggle_broadcast_input
+- key: Ctrl+Shift+M
+  action: toggle_throughput_mode
+- key: Ctrl+Alt+T
+  action: toggle_tmux_session_picker
+- key: Ctrl+Shift+Space
+  action: toggle_copy_mode
+- key: Ctrl+Alt+R
+  action: toggle_command_history
+- key: Ctrl+Shift+Z
+  action: reopen_closed_tab
+- key: Ctrl+Shift+S
+  action: ssh_quick_connect
+- key: Ctrl+Shift+J
+  action: duplicate_tab
+- key: Ctrl+Shift+P
+  action: toggle_profile_drawer
+custom_action_prefix_key: ''
+shader_install_prompt: never
+shell_integration_state: never
+integration_versions:
+  shaders_installed_version: 0.45.0
+  shaders_prompted_version: 0.45.0
+  shell_integration_installed_version: null
+  shell_integration_prompted_version: null
+update_check_frequency: daily
+last_update_check: 2026-09-12T01:19:32.124477+00:00
+skipped_version: null
+last_notified_version: null
+restore_session: false
+session_undo_timeout_secs: 5
+session_undo_max_entries: 10
+session_undo_preserve_shell: false
+search_highlight_color:
+- 255
+- 200
+- 0
+- 180
+search_current_highlight_color:
+- 255
+- 100
+- 0
+- 220
+search_case_sensitive: false
+search_regex: false
+search_wrap_around: true
+auto_log_sessions: false
+session_log_format: asciicast
+session_log_directory: C:\Users\jky72\.local\share\par-term\logs
+archive_on_close: true
+session_log_redact_passwords: true
+log_level: off
+badge_enabled: false
+badge_format: \(session.username)@\(session.hostname)
+badge_color:
+- 255
+- 0
+- 0
+badge_color_alpha: 0.5
+badge_font: Helvetica
+badge_font_bold: true
+badge_top_margin: 0.0
+badge_right_margin: 16.0
+badge_max_width: 0.5
+badge_max_height: 0.2
+status_bar_enabled: false
+status_bar_position: bottom
+status_bar_height: 22.0
+status_bar_bg_color:
+- 12
+- 12
+- 12
+status_bar_bg_alpha: 1.0
+status_bar_fg_color:
+- 190
+- 190
+- 190
+status_bar_font: ''
+status_bar_font_size: 12.0
+status_bar_separator: ' │ '
+status_bar_auto_hide_fullscreen: true
+status_bar_auto_hide_mouse_inactive: false
+status_bar_mouse_inactive_timeout: 3.0
+status_bar_system_poll_interval: 2.0
+status_bar_git_poll_interval: 5.0
+status_bar_disk_poll_interval: 60.0
+status_bar_disk_follow_cwd: false
+status_bar_time_format: '%H:%M:%S'
+status_bar_git_show_status: true
+status_bar_widgets:
+- id: username_hostname
+  enabled: true
+  section: left
+  order: 0
+- id: current_directory
+  enabled: true
+  section: left
+  order: 1
+- id: git_branch
+  enabled: true
+  section: left
+  order: 2
+- id: current_command
+  enabled: true
+  section: center
+  order: 0
+- id: cpu_usage
+  enabled: false
+  section: right
+  order: 0
+- id: memory_usage
+  enabled: false
+  section: right
+  order: 1
+- id: network_status
+  enabled: false
+  section: right
+  order: 2
+- id: disk_free
+  enabled: false
+  section: right
+  order: 3
+- id: bell_indicator
+  enabled: true
+  section: right
+  order: 4
+- id: clock
+  enabled: true
+  section: right
+  order: 5
+- id: update_available
+  enabled: true
+  section: right
+  order: 6
+progress_bar_enabled: true
+progress_bar_style: bar
+progress_bar_position: top
+progress_bar_height: 4.0
+progress_bar_opacity: 0.8
+progress_bar_normal_color:
+- 80
+- 180
+- 255
+progress_bar_warning_color:
+- 255
+- 200
+- 50
+progress_bar_error_color:
+- 255
+- 80
+- 80
+progress_bar_indeterminate_color:
+- 150
+- 150
+- 150
+triggers: []
+coprocesses: []
+scripts: []
+snippets: []
+actions: []
+allow_all_env_vars: false
+allow_http_profiles: false
+ai_inspector_enabled: true
+ai_inspector_open_on_startup: false
+ai_inspector_width: 300.0
+ai_inspector_default_scope: visible
+ai_inspector_view_mode: tree
+ai_inspector_live_update: false
+ai_inspector_show_zones: true
+ai_inspector_agent: claude.com
+ai_inspector_auto_launch: false
+ai_inspector_auto_context: false
+ai_inspector_context_max_lines: 200
+ai_inspector_auto_approve: false
+ai_inspector_agent_terminal_access: false
+ai_inspector_agent_screenshot_access: true
+ai_inspector_chat_font_size: 14.0
+ai_inspector_input_history_mode: session
+tab_bar_bg_alpha: 0.85
+window_rounded_corners: true
+window_border_enabled: true
+window_border_color:
+- 84
+- 84
+- 109
+tab_text_bold: true

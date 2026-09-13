@@ -1,0 +1,57 @@
+//! GPU-accelerated rendering engine for par-term terminal emulator.
+//!
+//! This crate provides the rendering pipeline for the terminal emulator,
+//! including:
+//!
+//! - Cell-based GPU rendering with glyph atlas
+//! - Sixel/iTerm2/Kitty inline graphics rendering
+//! - Custom GLSL shader post-processing (Shadertoy/Ghostty compatible)
+//! - Scrollbar rendering with mark overlays
+//! - Background image rendering
+//! - GPU utility functions
+//!
+//! # Logging Convention (ARC-004)
+//!
+//! This crate has two logging systems: `log::debug!()` / `log::trace!()` calls
+//! and the root crate's `crate::debug_info!()` / `crate::debug_log!()` macros.
+//!
+//! For **rendering hot paths** (functions called every frame during
+//! `render_split_panes`, `build_instance_buffers`, shader compilation), prefer
+//! `log::debug!()` / `log::trace!()` since these are controlled by `RUST_LOG`
+//! and have near-zero overhead when disabled. The root crate's custom debug
+//! macros (`debug_info!`) are not available in this sub-crate.
+//!
+//! For **non-hot-path diagnostics** (startup, resource loading, error paths),
+//! either system is acceptable.
+//!
+//! A future migration (deferred — see AUDIT.md ARC-004) will unify both systems
+//! under `tracing`. Until then, do NOT add new `log::debug!()` calls inside
+//! per-frame loops without guarding them behind a level check or making them
+//! conditional on `cfg!(debug_assertions)`.
+
+pub mod cell_renderer;
+pub mod custom_shader_renderer;
+pub mod error;
+pub mod gpu_utils;
+pub mod graphics_renderer;
+pub mod renderer;
+pub mod scrollbar;
+pub mod shader_debug;
+pub mod wgpu_conversions;
+
+// Re-export main public types
+pub use cell_renderer::surface::{
+    clamp_surface_extent, install_nonfatal_error_handler, texture_limits,
+};
+pub use cell_renderer::{Cell, CellRenderer, PaneViewport};
+pub use custom_shader_renderer::CustomShaderRenderer;
+pub use error::RenderError;
+pub use graphics_renderer::{GraphicRenderInfo, GraphicsRenderer};
+pub use renderer::{
+    DividerRenderInfo, PaneCaptureParams, PaneDividerSettings, PaneRenderInfo, PaneTitleInfo,
+    Renderer, RendererParams, compute_visible_separator_marks,
+};
+pub use scrollbar::Scrollbar;
+
+// Re-export shared types from dependencies for convenience
+pub use par_term_config::{ScrollbackMark, SeparatorMark};

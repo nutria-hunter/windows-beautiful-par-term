@@ -1,0 +1,463 @@
+//! Assistant prompt-library storage.
+//!
+//! Prompts are Markdown files stored under the par-term config directory.
+//! YAML frontmatter contains metadata; the Markdown body is the prompt text.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::Config;
+
+const PROMPT_DIR_NAME: &str = "assistant-prompts";
+
+/// A parsed assistant prompt loaded from a Markdown file in the prompt library.
+///
+/// Each prompt is stored as a `.md` file with YAML frontmatter containing
+/// the title and auto-submit flag, followed by the prompt body text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantPrompt {
+    /// Filesystem path to the Markdown source file.
+    pub path: PathBuf,
+    /// Display title parsed from YAML frontmatter.
+    pub title: String,
+    /// Whether to send the prompt immediately on selection (no editing step).
+    pub auto_submit: bool,
+    /// The prompt body text (Markdown content below the frontmatter).
+    pub prompt: String,
+}
+
+/// An unsaved assistant prompt being created or edited.
+///
+/// Used by the settings UI prompt editor before the prompt is serialized
+/// to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantPromptDraft {
+    /// Display title for the prompt.
+    pub title: String,
+    /// Whether to send the prompt immediately on selection.
+    pub auto_submit: bool,
+    /// The prompt body text.
+    pub prompt: String,
+}
+
+/// Internal YAML frontmatter structure for prompt file serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssistantPromptMetadata {
+    title: String,
+    auto_submit: bool,
+}
+
+pub fn assistant_prompts_dir() -> PathBuf {
+    Config::config_dir().join(PROMPT_DIR_NAME)
+}
+
+/// List every saved Assistant prompt from the default prompts directory,
+/// sorted case-insensitively by title.
+///
+/// # Errors
+///
+/// Returns an error if the prompts directory cannot be created or read. See
+/// [`list_prompts_in_dir`] — individual unreadable or malformed `.md` files are
+/// logged and skipped rather than failing the call.
+pub fn list_prompts() -> Result<Vec<AssistantPrompt>, String> {
+    list_prompts_in_dir(&assistant_prompts_dir())
+}
+
+/// List saved Assistant prompts from `dir`, sorted case-insensitively by title.
+///
+/// Only `.md` regular files are considered. Entries that are unreadable, are
+/// not regular files, or fail to parse are logged and skipped.
+///
+/// # Errors
+///
+/// Returns an error if `dir` cannot be created, if it cannot be enumerated, or
+/// if reading a directory entry fails.
+pub fn list_prompts_in_dir(dir: &Path) -> Result<Vec<AssistantPrompt>, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("create prompt directory: {e}"))?;
+    let mut prompts = Vec::new();
+
+    for entry in fs::read_dir(dir).map_err(|e| format!("read prompt directory: {e}"))? {
+        let entry = entry.map_err(|e| format!("read prompt entry: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            log::warn!(
+                "Skipping assistant prompt with unreadable file type {}",
+                path.display()
+            );
+            continue;
+        };
+        if !file_type.is_file() {
+            log::warn!("Skipping non-regular assistant prompt {}", path.display());
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                log::warn!(
+                    "Skipping unreadable assistant prompt {}: {e}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match parse_prompt_markdown(&content) {
+            Ok(draft) => prompts.push(AssistantPrompt {
+                path,
+                title: draft.title,
+                auto_submit: draft.auto_submit,
+                prompt: draft.prompt,
+            }),
+            Err(e) => log::warn!("Skipping invalid assistant prompt {}: {e}", path.display()),
+        }
+    }
+
+    prompts.sort_by_key(|a| a.title.to_lowercase());
+    Ok(prompts)
+}
+
+/// Save `draft` into the default prompts directory.
+///
+/// When `existing_path` is `Some`, that file is overwritten; otherwise a new
+/// file is created from a slug of the title, suffixed to avoid collisions.
+///
+/// # Errors
+///
+/// Returns an error if the draft's title or body is blank, if the prompts
+/// directory cannot be created, if the frontmatter cannot be serialized, or if
+/// writing the file fails.
+pub fn save_prompt(
+    existing_path: Option<&Path>,
+    draft: &AssistantPromptDraft,
+) -> Result<AssistantPrompt, String> {
+    save_prompt_in_dir(&assistant_prompts_dir(), existing_path, draft)
+}
+
+/// Save `draft` into `dir`, returning the stored prompt with its final path.
+///
+/// SEC-021: the prompt file is replaced atomically at mode `0o600`. The prompt
+/// store lives in par-term's own config directory and its contents are user
+/// text that regularly quotes source code and credentials, so it must not be
+/// readable by other users; and an overwrite that truncates would destroy a
+/// prompt the user cannot recover.
+///
+/// # Errors
+///
+/// Returns an error if the draft's title or body is blank, if `dir` cannot be
+/// created, if the frontmatter cannot be serialized, or if writing or renaming
+/// the file fails.
+pub fn save_prompt_in_dir(
+    dir: &Path,
+    existing_path: Option<&Path>,
+    draft: &AssistantPromptDraft,
+) -> Result<AssistantPrompt, String> {
+    validate_draft(draft)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create prompt directory: {e}"))?;
+
+    let target_path = existing_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| unique_prompt_path(dir, &draft.title));
+    let markdown = serialize_prompt_markdown(draft)?;
+    crate::atomic_save::save_string_atomic(&target_path, &markdown)
+        .map_err(|e| format!("write prompt file {}: {e:#}", target_path.display()))?;
+
+    Ok(AssistantPrompt {
+        path: target_path,
+        title: draft.title.clone(),
+        auto_submit: draft.auto_submit,
+        prompt: draft.prompt.clone(),
+    })
+}
+
+/// Delete the prompt file at `path`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be removed — most commonly because it
+/// does not exist or the process lacks permission.
+pub fn delete_prompt(path: &Path) -> Result<(), String> {
+    fs::remove_file(path).map_err(|e| format!("delete prompt file {}: {e}", path.display()))
+}
+
+/// Parse a prompt file's markdown into a draft.
+///
+/// Expects a leading YAML frontmatter block delimited by `---` lines (a UTF-8
+/// BOM and CRLF line endings are both tolerated), followed by the prompt body.
+///
+/// # Errors
+///
+/// Returns an error if the opening or closing `---` delimiter is missing, if
+/// the frontmatter is not valid YAML with exactly the `title` and `auto_submit`
+/// keys, or if the resulting title or body is blank.
+pub fn parse_prompt_markdown(input: &str) -> Result<AssistantPromptDraft, String> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let rest = input
+        .strip_prefix("---\r\n")
+        .or_else(|| input.strip_prefix("---\n"))
+        .ok_or_else(|| "missing YAML frontmatter".to_string())?;
+    let Some((frontmatter, body)) = rest
+        .split_once("\r\n---\r\n")
+        .or_else(|| rest.split_once("\n---\n"))
+    else {
+        return Err("missing closing YAML frontmatter delimiter".to_string());
+    };
+    let body = body.trim_start_matches(['\r', '\n']);
+    let metadata: AssistantPromptMetadata = serde_yaml_ng::from_str(frontmatter)
+        .map_err(|e| format!("parse prompt frontmatter: {e}"))?;
+    let draft = AssistantPromptDraft {
+        title: metadata.title,
+        auto_submit: metadata.auto_submit,
+        prompt: body.trim_end_matches(['\r', '\n']).to_string(),
+    };
+    validate_draft(&draft)?;
+    Ok(draft)
+}
+
+/// Render `draft` as a prompt file: YAML frontmatter followed by the body.
+///
+/// # Errors
+///
+/// Returns an error if the draft's title or body is blank. Serialization of the
+/// frontmatter is also checked, but a `title`/`auto_submit` pair has no YAML
+/// representation that can fail.
+pub fn serialize_prompt_markdown(draft: &AssistantPromptDraft) -> Result<String, String> {
+    validate_draft(draft)?;
+    let metadata = AssistantPromptMetadata {
+        title: draft.title.clone(),
+        auto_submit: draft.auto_submit,
+    };
+    let frontmatter = serde_yaml_ng::to_string(&metadata)
+        .map_err(|e| format!("serialize prompt frontmatter: {e}"))?;
+    Ok(format!(
+        "---\n{}---\n\n{}\n",
+        frontmatter,
+        draft.prompt.trim_end()
+    ))
+}
+
+pub fn safe_prompt_filename(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in title.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("prompt");
+    }
+    format!("{slug}.md")
+}
+
+fn unique_prompt_path(dir: &Path, title: &str) -> PathBuf {
+    let filename = safe_prompt_filename(title);
+    let stem = filename.trim_end_matches(".md");
+    let mut path = dir.join(&filename);
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{n}.md"));
+        n += 1;
+    }
+    path
+}
+
+fn validate_draft(draft: &AssistantPromptDraft) -> Result<(), String> {
+    if draft.title.trim().is_empty() {
+        return Err("prompt title is required".to_string());
+    }
+    if draft.prompt.trim().is_empty() {
+        return Err("prompt body is required".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parses_prompt_with_frontmatter() {
+        let input = "---\ntitle: Debug build\nauto_submit: true\n---\n\nFix the build.";
+        let parsed = parse_prompt_markdown(input).expect("parse prompt");
+        assert_eq!(parsed.title, "Debug build");
+        assert!(parsed.auto_submit);
+        assert_eq!(parsed.prompt, "Fix the build.");
+    }
+
+    #[test]
+    fn parses_prompt_with_crlf_line_endings() {
+        let input = "---\r\ntitle: Debug build\r\nauto_submit: true\r\n---\r\n\r\nFix the build.\r\nSecond line.";
+        let parsed = parse_prompt_markdown(input).expect("parse CRLF prompt");
+
+        assert_eq!(parsed.title, "Debug build");
+        assert!(parsed.auto_submit);
+        assert_eq!(parsed.prompt, "Fix the build.\r\nSecond line.");
+    }
+
+    #[test]
+    fn parses_prompt_with_utf8_bom_before_frontmatter() {
+        let input = "\u{feff}---\ntitle: Debug build\nauto_submit: false\n---\n\nFix the build.";
+        let parsed = parse_prompt_markdown(input).expect("parse BOM prompt");
+
+        assert_eq!(parsed.title, "Debug build");
+        assert!(!parsed.auto_submit);
+        assert_eq!(parsed.prompt, "Fix the build.");
+    }
+
+    #[test]
+    fn rejects_missing_frontmatter() {
+        let err = parse_prompt_markdown("Fix the build.").expect_err("missing frontmatter fails");
+        assert!(err.contains("frontmatter"));
+    }
+
+    #[test]
+    fn rejects_malformed_closing_frontmatter_delimiter() {
+        let input = "---\ntitle: Debug build\nauto_submit: false\n----\n\nFix the build.";
+        let err = parse_prompt_markdown(input).expect_err("malformed closing delimiter fails");
+        assert!(err.contains("closing YAML frontmatter delimiter"));
+    }
+
+    #[test]
+    fn serializes_prompt_with_frontmatter() {
+        let draft = AssistantPromptDraft {
+            title: "Debug build".to_string(),
+            auto_submit: false,
+            prompt: "Fix the build.".to_string(),
+        };
+        let output = serialize_prompt_markdown(&draft).expect("serialize prompt");
+        assert!(output.starts_with("---\n"));
+        assert!(output.contains("title: Debug build\n"));
+        assert!(output.contains("auto_submit: false\n"));
+        assert!(output.ends_with("Fix the build.\n"));
+    }
+
+    #[test]
+    fn safe_filename_is_slugified() {
+        assert_eq!(
+            safe_prompt_filename(" Debug: build/fix! "),
+            "debug-build-fix.md"
+        );
+        assert_eq!(safe_prompt_filename("!!!"), "prompt.md");
+    }
+
+    #[test]
+    fn lists_only_markdown_prompts_sorted_by_title() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("z.md"),
+            "---\ntitle: Zed\nauto_submit: false\n---\n\nZ prompt",
+        )
+        .expect("write z");
+        fs::write(
+            temp.path().join("a.md"),
+            "---\ntitle: Alpha\nauto_submit: true\n---\n\nA prompt",
+        )
+        .expect("write a");
+        fs::write(temp.path().join("ignored.txt"), "nope").expect("write txt");
+
+        let prompts = list_prompts_in_dir(temp.path()).expect("list prompts");
+
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].title, "Alpha");
+        assert_eq!(prompts[1].title, "Zed");
+    }
+
+    #[test]
+    fn skips_non_regular_invalid_markdown_entries_while_listing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("valid.md"),
+            "---\ntitle: Valid\nauto_submit: false\n---\n\nValid prompt",
+        )
+        .expect("write valid");
+        fs::create_dir(temp.path().join("invalid.md")).expect("create invalid md directory");
+
+        let prompts = list_prompts_in_dir(temp.path()).expect("list prompts");
+
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].title, "Valid");
+    }
+
+    #[test]
+    fn saves_new_prompt_in_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let draft = AssistantPromptDraft {
+            title: "Debug build".to_string(),
+            auto_submit: true,
+            prompt: "Fix the build.".to_string(),
+        };
+
+        let saved = save_prompt_in_dir(temp.path(), None, &draft).expect("save prompt");
+
+        assert_eq!(saved.path, temp.path().join("debug-build.md"));
+        assert_eq!(saved.title, draft.title);
+        assert!(saved.auto_submit);
+        assert_eq!(saved.prompt, draft.prompt);
+        let content = fs::read_to_string(&saved.path).expect("read saved prompt");
+        assert_eq!(
+            parse_prompt_markdown(&content).expect("parse saved prompt"),
+            draft
+        );
+    }
+
+    #[test]
+    fn saves_new_prompt_with_unique_filename_when_slug_collides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("debug-build.md"), "existing").expect("write collision");
+        fs::write(temp.path().join("debug-build-2.md"), "existing")
+            .expect("write second collision");
+        let draft = AssistantPromptDraft {
+            title: "Debug build".to_string(),
+            auto_submit: false,
+            prompt: "Try the next filename.".to_string(),
+        };
+
+        let saved = save_prompt_in_dir(temp.path(), None, &draft).expect("save prompt");
+
+        assert_eq!(saved.path, temp.path().join("debug-build-3.md"));
+        assert!(saved.path.exists());
+    }
+
+    #[test]
+    fn updates_existing_prompt_path_in_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let existing_path = temp.path().join("custom-name.md");
+        fs::write(&existing_path, "old content").expect("write existing");
+        let draft = AssistantPromptDraft {
+            title: "Renamed prompt".to_string(),
+            auto_submit: true,
+            prompt: "Updated content.".to_string(),
+        };
+
+        let saved =
+            save_prompt_in_dir(temp.path(), Some(&existing_path), &draft).expect("update prompt");
+
+        assert_eq!(saved.path, existing_path);
+        let content = fs::read_to_string(&saved.path).expect("read updated prompt");
+        let parsed = parse_prompt_markdown(&content).expect("parse updated prompt");
+        assert_eq!(parsed, draft);
+    }
+
+    #[test]
+    fn deletes_prompt_file_in_temp_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("debug-build.md");
+        fs::write(&path, "prompt").expect("write prompt");
+
+        delete_prompt(&path).expect("delete prompt");
+
+        assert!(!path.exists());
+    }
+}

@@ -1,0 +1,276 @@
+//! Terminal-state snapshot for one render frame.
+//!
+//! `gather_render_data` is the first substantive step of every render cycle.
+//! It assembles a `FrameRenderData` by coordinating helpers from three
+//! focused sub-modules:
+//!
+//! - `viewport`: `gather_viewport_sizing`, `resolve_cursor_shader_hide`
+//! - `tab_snapshot`: `extract_tab_cells` / `TabCellsSnapshot`
+//! - (this module): URL detection, search highlights, scrollback marks,
+//!   window title update, cursor blink
+//!
+use super::FrameRenderData;
+use super::tab_snapshot;
+use crate::app::window_state::WindowState;
+impl WindowState {
+    /// Gather all data needed for this render frame.
+    /// Returns None if rendering should be skipped (no renderer, no active tab, terminal locked, etc.)
+    pub(super) fn gather_render_data(&mut self) -> Option<FrameRenderData> {
+        let (_renderer_size, visible_lines, _grid_cols) = self.gather_viewport_sizing()?;
+
+        // Get active tab's terminal and immediate state snapshots (avoid long borrows)
+        let (
+            terminal,
+            scroll_offset,
+            mouse_selection,
+            cache_cells,
+            cache_wrap_flags,
+            cache_generation,
+            cache_scroll_offset,
+            cache_cursor_pos,
+            cache_selection,
+            cached_scrollback_len,
+            cache_grid_dims,
+            cached_terminal_title,
+            hovered_url,
+        ) = {
+            let t = self.tab_manager.active_tab()?;
+            (
+                // Use the focused pane's terminal for cache invalidation.
+                // In single-pane mode this is the same Arc as tab.terminal.
+                // In split-pane mode, using the primary pane's terminal means changes
+                // to a secondary focused pane never trigger a cache miss, so URL
+                // detection never re-runs and stale underlines persist after content
+                // changes or terminal clears in the focused pane.
+                t.pane_manager
+                    .as_ref()
+                    .and_then(|pm| pm.focused_pane())
+                    .map(|p| p.terminal.clone())
+                    .unwrap_or_else(|| t.terminal.clone()),
+                t.active_scroll_state().offset,
+                t.selection_mouse().selection,
+                t.active_cache().cells.clone(),
+                t.active_cache().pane_cells_wrap_flags.clone(),
+                t.active_cache().generation,
+                t.active_cache().scroll_offset,
+                t.active_cache().cursor_pos,
+                t.active_cache().selection,
+                t.active_cache().scrollback_len,
+                t.active_cache().grid_dims,
+                t.active_cache().terminal_title.clone(),
+                t.active_mouse().hovered_url.clone(),
+            )
+        };
+
+        // Check if shell has exited
+        let _is_running = if let Ok(term) = terminal.try_read() {
+            term.is_running()
+        } else {
+            true // Assume running if locked
+        };
+
+        // Extract terminal cells using the focused tab_snapshot helper.
+        let was_alt_screen = self
+            .tab_manager
+            .active_tab()
+            .map(|t| t.was_alt_screen)
+            .unwrap_or(false);
+        let snap = self.extract_tab_cells(tab_snapshot::TabCellsParams {
+            scroll_offset,
+            mouse_selection,
+            cache_cells,
+            cache_wrap_flags,
+            cache_generation,
+            cache_scroll_offset,
+            cache_cursor_pos,
+            cache_selection,
+            cache_grid_dims,
+            terminal: terminal.clone(),
+            was_alt_screen,
+        })?;
+
+        let cells = snap.cells;
+        let wrap_flags = snap.wrap_flags;
+        let current_cursor_pos = snap.cursor_pos;
+        let cursor_style = snap.cursor_style;
+        let shader_cursor_pos = snap.shader_cursor_pos;
+        let shader_cursor_style = snap.shader_cursor_style;
+        let is_alt_screen = snap.is_alt_screen;
+        let current_generation = snap.current_generation;
+        let cell_grid_dims = snap.grid_dims;
+
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            // A TUI reads its geometry when it starts, so that is when a size pulse has
+            // to land. Unix gets one from the emulator core (a real SIGWINCH);
+            // Windows/ConPTY has no out-of-band channel, so it is queued here and
+            // re-applied through the PTY by `sync_resize_pulses`.
+            //
+            // Two start signals are watched, because they cover different apps:
+            // full-screen TUIs switch to the alternate screen, while inline ones
+            // (the pi agent) never do and instead enable modifyOtherKeys. Without the
+            // second signal such an app waits forever for a size event that a
+            // Windows terminal never sends on its own.
+            if cfg!(target_os = "windows") {
+                let (modify_other_keys, _cursor, _alt) = tab.read_or_cached_modes();
+                let modify_other_keys_on = modify_other_keys > 0;
+                if modify_other_keys_on && !tab.was_modify_other_keys {
+                    tab.pending_resize_pulse = true;
+                }
+                tab.was_modify_other_keys = modify_other_keys_on;
+
+                if is_alt_screen && !tab.was_alt_screen {
+                    tab.pending_resize_pulse = true;
+                }
+
+                // Chat-style TUIs (the pi agent) never switch screens; they reveal
+                // themselves by grabbing the mouse for scrolling instead.
+                let mouse_tracking = tab
+                    .terminal
+                    .try_read()
+                    .is_ok_and(|term| term.is_mouse_tracking_enabled());
+                if mouse_tracking && !tab.was_mouse_tracking {
+                    tab.pending_resize_pulse = true;
+                }
+                tab.was_mouse_tracking = mouse_tracking;
+            }
+            tab.was_alt_screen = is_alt_screen;
+        }
+
+        // Ensure cursor visibility flag for cell renderer reflects current config every frame
+        // (so toggling "Hide default cursor" takes effect immediately even if no other changes).
+        // Use the focused viewport helper to resolve hide-cursor state.
+        let hide_cursor_for_shader = self.resolve_cursor_shader_hide(is_alt_screen);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_cursor_hidden_for_shader(hide_cursor_for_shader);
+        }
+
+        // Flush regenerated cells into the render cache (no-op on cache hit).
+        // Pass the generation the cells were gathered at so the cache is never
+        // stamped ahead of its content (see `flush_cell_cache`).
+        self.flush_cell_cache(
+            &cells,
+            current_cursor_pos,
+            cell_grid_dims,
+            current_generation,
+        );
+
+        // Pre-populate the focused pane's cell cache so that gather_pane_render_data
+        // uses the SAME cells that URL detection saw.  Only on cache-miss frames
+        // (fresh cells generated) — a cache hit means the content is unchanged
+        // since the last store, so re-storing it would be pure overhead.
+        if !self.frame.cache_hit
+            && let Some(tab) = self.tab_manager.active_tab_mut()
+            && let Some(ref mut pm) = tab.pane_manager
+            && let Some(pane) = pm.focused_pane_mut()
+        {
+            pane.cache.pane_cells = Some(std::sync::Arc::clone(&cells));
+            pane.cache.pane_cells_wrap_flags = wrap_flags.clone();
+            pane.cache.pane_cells_generation = current_generation;
+            pane.cache.pane_cells_scroll_offset = scroll_offset;
+            pane.cache.pane_cells_selection = mouse_selection;
+            pane.cache.pane_cells_grid_dims = cell_grid_dims;
+        }
+
+        let mut show_scrollbar = self.should_show_scrollbar();
+
+        let (scrollback_len, terminal_title, shell_lifecycle_events) = self
+            .collect_scrollback_state(
+                &terminal,
+                current_cursor_pos,
+                cached_scrollback_len,
+                &cached_terminal_title,
+            );
+
+        // Fire CommandComplete alert sound for any finished commands.
+        if shell_lifecycle_events.iter().any(|e| {
+            matches!(
+                e,
+                par_term_terminal::ShellLifecycleEvent::CommandFinished { .. }
+            )
+        }) {
+            self.play_alert_sound(crate::config::AlertEvent::CommandComplete);
+        }
+
+        // Update cache scrollback and clamp scroll state.
+        //
+        // In pane mode the focused pane's own terminal holds the scrollback, not
+        // `tab.terminal`.  Clamping here with `tab.terminal.scrollback_len()` would
+        // incorrectly cap (or zero-out) the scroll offset every frame.  The correct
+        // clamp happens later in the pane render path once we know the focused pane's
+        // actual scrollback length.
+        let has_multiple_panes = self
+            .tab_manager
+            .active_tab()
+            .map(|t| t.has_multiple_panes())
+            .unwrap_or(false);
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            // In multi-pane mode, tab.terminal may differ from the focused pane's
+            // terminal (e.g. after a split, the new pane has its own terminal).
+            // Writing tab.terminal's scrollback_len into the focused pane's cache
+            // would incorrectly show the original pane's scrollbar on the new pane.
+            // The correct per-pane scrollback_len is written later from
+            // gather_pane_render_data in gpu_submit.rs.
+            if !has_multiple_panes {
+                tab.active_cache_mut().scrollback_len = scrollback_len;
+                let sb_len = tab.active_cache().scrollback_len;
+                tab.active_scroll_state_mut().clamp_to_scrollback(sb_len);
+            }
+        }
+
+        // Keep copy mode dimensions in sync with terminal
+        if self.copy_mode.active
+            && let Ok(term) = terminal.try_read()
+        {
+            let (cols, rows) = term.dimensions();
+            self.copy_mode.update_dimensions(cols, rows, scrollback_len);
+        }
+
+        // Total lines = visible lines + actual scrollback content
+        let total_lines = visible_lines + scrollback_len;
+        let (scrollback_marks, marks_override_scrollbar) = self.collect_scrollback_marks(&terminal);
+
+        // Keep scrollbar visible when mark indicators exist AND there is scrollback
+        // to navigate. Without scrollback there is nothing to scroll to, and showing
+        // a scrollbar (with marks from the current prompt line) would be misleading
+        // and visually indistinguishable from marks that belong to a different tab.
+        // In multi-pane mode, `scrollback_len` comes from tab.terminal which may
+        // differ from the focused pane's terminal; skip this override and let the
+        // per-pane scrollbar logic (should_show_scrollbar) handle it.
+        if marks_override_scrollbar && scrollback_len > 0 && !has_multiple_panes {
+            show_scrollbar = true;
+        }
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.active_cache_mut().pane_cells_wrap_flags = wrap_flags.clone();
+        }
+
+        // Update window title if terminal has set one via OSC sequences.
+        self.update_window_title_if_changed(&terminal_title, &cached_terminal_title, &hovered_url);
+
+        let debug_url_detect_time = self.apply_url_and_search_highlights(
+            &cells,
+            &wrap_flags,
+            cell_grid_dims,
+            scroll_offset,
+            scrollback_len,
+            visible_lines,
+        );
+
+        // Update cursor blink state
+        self.update_cursor_blink();
+
+        Some(FrameRenderData {
+            cells,
+            cursor_pos: current_cursor_pos,
+            cursor_style,
+            shader_cursor_pos,
+            shader_cursor_style,
+            is_alt_screen,
+            scrollback_len,
+            show_scrollbar,
+            visible_lines,
+            scrollback_marks,
+            total_lines,
+            debug_url_detect_time,
+        })
+    }
+}

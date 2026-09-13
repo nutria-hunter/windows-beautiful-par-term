@@ -1,0 +1,317 @@
+//! Pipeline and bind group creation for custom shader renderer.
+//!
+//! This module contains helpers for creating wgpu bind groups, bind group layouts,
+//! and render pipelines for custom shaders.
+
+use wgpu::*;
+
+use super::cubemap::CubemapTexture;
+use super::textures::ChannelTexture;
+
+/// Create the bind group layout for custom shaders with all 14 entries.
+///
+/// Layout:
+/// - 0: Uniform buffer
+/// - 1: iChannel0 texture (user texture, Shadertoy compatible)
+/// - 2: iChannel0 sampler
+/// - 3: iChannel1 texture (user texture)
+/// - 4: iChannel1 sampler
+/// - 5: iChannel2 texture (user texture)
+/// - 6: iChannel2 sampler
+/// - 7: iChannel3 texture (user texture)
+/// - 8: iChannel3 sampler
+/// - 9: iChannel4 texture (terminal content)
+/// - 10: iChannel4 sampler
+/// - 11: iCubemap texture (cubemap for environment mapping)
+/// - 12: iCubemap sampler
+/// - 13: Custom shader controls uniform buffer
+pub fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Custom Shader Bind Group Layout"),
+        entries: &[
+            // Uniform buffer (binding 0)
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // iChannel0 texture (binding 1) - user texture, Shadertoy compatible
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iChannel0 sampler (binding 2)
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // iChannel1 texture (binding 3) - user texture
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iChannel1 sampler (binding 4)
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // iChannel2 texture (binding 5) - user texture
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iChannel2 sampler (binding 6)
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // iChannel3 texture (binding 7) - user texture
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iChannel3 sampler (binding 8)
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // iChannel4 texture (binding 9) - terminal content
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iChannel4 sampler (binding 10)
+            BindGroupLayoutEntry {
+                binding: 10,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // iCubemap texture (binding 11) - cubemap for environment mapping
+            BindGroupLayoutEntry {
+                binding: 11,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::Cube,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // iCubemap sampler (binding 12)
+            BindGroupLayoutEntry {
+                binding: 12,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            // Custom shader controls uniform buffer (binding 13)
+            BindGroupLayoutEntry {
+                binding: 13,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Inputs used to create a custom shader bind group.
+pub struct BindGroupInputs<'a> {
+    /// The bind group layout.
+    pub layout: &'a BindGroupLayout,
+    /// Uniform buffer for shader parameters.
+    pub uniform_buffer: &'a Buffer,
+    /// Terminal content texture view (iChannel4).
+    pub intermediate_texture_view: &'a TextureView,
+    /// Uniform buffer for custom shader controls.
+    pub custom_uniform_buffer: &'a Buffer,
+    /// Sampler for the intermediate texture.
+    pub sampler: &'a Sampler,
+    /// Array of 4 channel textures (iChannel0-3, Shadertoy compatible).
+    pub channel_textures: &'a [ChannelTexture; 4],
+    /// Cubemap texture for environment mapping (iCubemap).
+    pub cubemap: &'a CubemapTexture,
+}
+
+/// Create a bind group for the custom shader with all textures and uniforms.
+pub fn create_bind_group(device: &Device, inputs: BindGroupInputs<'_>) -> BindGroup {
+    let BindGroupInputs {
+        layout,
+        uniform_buffer,
+        intermediate_texture_view,
+        custom_uniform_buffer,
+        sampler,
+        channel_textures,
+        cubemap,
+    } = inputs;
+
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Custom Shader Bind Group"),
+        layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            // iChannel0 (user texture, Shadertoy compatible)
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(&channel_textures[0].view),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Sampler(&channel_textures[0].sampler),
+            },
+            // iChannel1 (user texture)
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&channel_textures[1].view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: BindingResource::Sampler(&channel_textures[1].sampler),
+            },
+            // iChannel2 (user texture)
+            BindGroupEntry {
+                binding: 5,
+                resource: BindingResource::TextureView(&channel_textures[2].view),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: BindingResource::Sampler(&channel_textures[2].sampler),
+            },
+            // iChannel3 (user texture)
+            BindGroupEntry {
+                binding: 7,
+                resource: BindingResource::TextureView(&channel_textures[3].view),
+            },
+            BindGroupEntry {
+                binding: 8,
+                resource: BindingResource::Sampler(&channel_textures[3].sampler),
+            },
+            // iChannel4 (terminal content)
+            BindGroupEntry {
+                binding: 9,
+                resource: BindingResource::TextureView(intermediate_texture_view),
+            },
+            BindGroupEntry {
+                binding: 10,
+                resource: BindingResource::Sampler(sampler),
+            },
+            // iCubemap (cubemap for environment mapping)
+            BindGroupEntry {
+                binding: 11,
+                resource: BindingResource::TextureView(&cubemap.view),
+            },
+            BindGroupEntry {
+                binding: 12,
+                resource: BindingResource::Sampler(&cubemap.sampler),
+            },
+            // Custom shader controls
+            BindGroupEntry {
+                binding: 13,
+                resource: custom_uniform_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+/// Create the render pipeline for custom shaders.
+///
+/// # Arguments
+/// * `device` - The wgpu device
+/// * `shader_module` - Compiled shader module
+/// * `bind_group_layout` - Bind group layout for the pipeline
+/// * `surface_format` - Target surface texture format
+/// * `label` - Optional label for the pipeline
+pub fn create_render_pipeline(
+    device: &Device,
+    shader_module: &ShaderModule,
+    bind_group_layout: &BindGroupLayout,
+    surface_format: TextureFormat,
+    label: Option<&str>,
+) -> RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some(label.unwrap_or("Custom Shader Pipeline Layout")),
+        bind_group_layouts: &[Some(bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some(label.unwrap_or("Custom Shader Pipeline")),
+        layout: Some(&pipeline_layout),
+        vertex: VertexState {
+            module: shader_module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: surface_format,
+                // Use premultiplied alpha blending since shader outputs premultiplied colors
+                blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        cache: None,
+        multiview_mask: None,
+    })
+}

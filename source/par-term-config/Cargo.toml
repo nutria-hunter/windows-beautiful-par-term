@@ -1,0 +1,65 @@
+[package]
+name = "par-term-config"
+version = "0.14.3"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "Configuration system for par-term terminal emulator"
+license = "MIT"
+repository = "https://github.com/paulrobello/par-term"
+homepage = "https://github.com/paulrobello/par-term"
+keywords = ["terminal", "config", "configuration"]
+categories = ["config"]
+# `doc_config_values.rs` reads `../docs/CONFIG_REFERENCE.md` at run time. That
+# file is outside the package, so the test panics in an extracted `.crate` even
+# though the crate itself builds. It is a repository gate, not a consumer test.
+exclude = ["tests/doc_config_values.rs"]
+
+[dependencies]
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+toml.workspace = true
+
+# UUID for profile identifiers
+uuid.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+log.workspace = true
+
+# Platform-specific directories
+dirs.workspace = true
+
+# Regex for variable substitution
+regex.workspace = true
+
+# Shell-safe tokenization of ssh_extra_args (SEC-002)
+shell-words.workspace = true
+
+# Correct local date/time arithmetic for snippet built-in variables (QA-001)
+chrono.workspace = true
+
+# File watching for config hot reload
+notify = { workspace = true, optional = true }
+
+# Mutex for watcher
+parking_lot.workspace = true
+
+# Hostname detection for snippet variables
+hostname.workspace = true
+
+# NOTE(ARC-003): The optional `wgpu` dependency and `wgpu-types` feature were
+# removed — wgpu conversion helpers now live in `par-term-render` where they
+# belong. A pure-data Layer-1 crate must not carry Layer-3 GPU types.
+
+[features]
+default = ["watcher"]
+watcher = ["notify"]
+
+[dev-dependencies]
+tempfile.workspace = true

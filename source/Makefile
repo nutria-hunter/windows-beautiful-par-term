@@ -1,0 +1,606 @@
+# Makefile for par-term
+# Cross-platform terminal emulator frontend
+
+.PHONY: help build build-debug run run-release run-error run-warn run-info run-debug run-trace release test check typecheck clean fmt lint checkall secret-scan install install-shell-integration install-acp acp-harness acp-smoke doc doc-open doc-check check-line-counts coverage test-fonts benchmark-shaping test-text-shaping bundle bundle-install run-bundle deploy
+
+ACP_AGENT ?= claude-ollama.local
+ACP_TIMEOUT ?= 45
+ACP_IDLE_TIMEOUT ?= 6
+ACP_TRANSCRIPT ?= /tmp/par-term-acp-harness.log
+ACP_SMOKE_PROMPT ?= create a new background only shader that uses a procedural checker patern and has an effect that looks like its being pulled into some kind of vortex, then set that shader as the active shader
+
+# Debug log path used by run-debug / run-trace targets.
+# The app writes to std::env::temp_dir(), which is $TMPDIR when set — a
+# /var/folders/... path on macOS — and /tmp otherwise. Hardcoding /tmp made
+# `make tail-log` watch a file that never appears on macOS.
+DEBUG_LOG := $(patsubst %/,%,$(if $(TMPDIR),$(TMPDIR),/tmp))/par_term_debug.log
+
+# Base cargo run invocation — override LOG_LEVEL and DEBUG_LEVEL per target
+# Usage: $(RUN_WITH_LOG) where callers set RUST_LOG / DEBUG_LEVEL before calling
+RUN_BASE := cargo run
+
+# Default target
+.DEFAULT_GOAL := help
+
+# Help target - display available commands
+help:
+	@echo "par-term - Cross-platform Terminal Emulator"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  make build        - Build the project (fast-release: optimized, no LTO)"
+	@echo "  make build-full   - Build with full release optimizations (LTO, slow)"
+	@echo "  make build-debug  - Build the project in debug mode"
+	@echo "  make run          - Run the application (fast-release mode)"
+	@echo "  make run-debug    - Run with debug logging"
+	@echo ""
+	@echo "Run with logging:"
+	@echo "  make run-error   - Run with error level logs"
+	@echo "  make run-warn    - Run with warning level logs"
+	@echo "  make run-info    - Run with info level logs"
+	@echo "  make run-perf    - Run with performance logging to /tmp/par-term-perf.log"
+	@echo "  make run-debug   - Run with DEBUG_LEVEL=3 (logs to $(DEBUG_LOG))"
+	@echo "  make run-trace   - Run with DEBUG_LEVEL=4 (most verbose)"
+	@echo ""
+	@echo "Text Shaping Testing:"
+	@echo "  make test-fonts        - Run comprehensive text shaping test suite"
+	@echo "  make benchmark-shaping - Run text shaping performance benchmark"
+	@echo "  make test-text-shaping - Run both font tests and benchmark"
+	@echo ""
+	@echo "Graphics Testing:"
+	@echo "  make test-graphics     - Test graphics with debug logging"
+	@echo "  make test-animations   - Test Kitty animations"
+	@echo "  make tail-log          - Monitor debug log in real-time"
+	@echo "  make watch-graphics    - Monitor graphics-related logs only"
+	@echo "  make show-graphics-logs - Show recent graphics logs"
+	@echo "  make clean-logs        - Clean debug logs"
+	@echo ""
+	@echo "Testing & Quality:"
+	@echo "  make test        - Run all tests"
+	@echo "  make check       - Check code without building"
+	@echo "  make typecheck   - Type-check entire workspace (cargo check --workspace)"
+	@echo "  make fmt         - Format code using rustfmt"
+	@echo "  make lint        - Run clippy linter"
+	@echo "  make checkall    - Format, lint, typecheck, and test"
+	@echo "  make secret-scan - Scan for secrets (gitleaks, detect-private-key)"
+	@echo "  make all         - Format, lint, test, and build"
+	@echo ""
+	@echo "macOS Bundle:"
+	@echo "  make bundle         - Create macOS .app bundle (release mode)"
+	@echo "  make bundle-install - Install .app bundle, binary, and ACP bridge"
+	@echo "  make run-bundle     - Run as macOS .app (shows dock icon)"
+	@echo ""
+	@echo "Other:"
+	@echo "  make clean       - Clean build artifacts"
+	@echo "  make install     - Install the binary"
+	@echo "  make install-acp - Install Claude ACP bridge (@agentclientprotocol/claude-agent-acp)"
+	@echo "  make acp-harness - Run ACP harness (set ARGS='...')"
+	@echo "  make acp-smoke   - Run Claude+Ollama ACP smoke test with transcript"
+	@echo "  make doc         - Generate rustdoc documentation (no-deps)"
+	@echo "  make doc-open    - Generate and open rustdoc in the browser"
+	@echo "  make doc-check   - Validate Markdown links and anchors (requires lychee)"
+	@echo "  make check-line-counts - Enforce the 800-line production file limit"
+	@echo "  make coverage    - Generate test coverage report"
+	@echo "  make deploy      - Trigger Release and Deploy GitHub Action"
+	@echo ""
+
+# Build in dev-release mode (optimized, no full LTO — ~30-40s)
+build:
+	@echo "Building par-term (dev-release: optimized, thin LTO)..."
+	cargo build --profile dev-release
+
+# Build in full release mode (LTO + codegen-units=1 — ~3min, for distribution)
+build-full:
+	@echo "Building par-term (full release: LTO, single codegen unit)..."
+	cargo build --release
+
+# Build in debug mode
+build-debug:
+	@echo "Building par-term (debug mode)..."
+	cargo build
+
+# Alias for full release build (for distribution)
+release: build-full
+	@echo "Release binary: target/release/par-term"
+
+# Run the application (dev-release for fast optimized builds)
+run:
+	@echo "Running par-term (dev-release mode)..."
+	cargo run --profile dev-release
+
+# Run the application in full release mode
+run-release:
+	@echo "Running par-term (full release mode)..."
+	cargo run --release
+
+# Run with error level logging
+run-error:
+	@echo "Running par-term (error level logs)..."
+	RUST_LOG=error $(RUN_BASE)
+
+# Run with warning level logging
+run-warn:
+	@echo "Running par-term (warn level logs)..."
+	RUST_LOG=warn $(RUN_BASE)
+
+# Run with info level logging (default)
+run-info:
+	@echo "Running par-term (info level logs)..."
+	RUST_LOG=info $(RUN_BASE)
+
+# Run with performance logging to file
+run-perf:
+	@echo "Running par-term with performance logging..."
+	@echo "Logs will be written to: /tmp/par-term-perf.log"
+	@echo ""
+	@echo "💡 In another terminal, run:"
+	@echo "   tail -f /tmp/par-term-perf.log | grep PERF"
+	@echo ""
+	RUST_LOG=info cargo run --release 2>&1 | tee /tmp/par-term-perf.log
+
+# Run with debug level logging (uses custom DEBUG_LEVEL for file logging)
+run-debug:
+	@echo "Running par-term with DEBUG_LEVEL=3..."
+	@echo "Debug log: $(DEBUG_LOG)"
+	@echo ""
+	@echo "In another terminal, run: make tail-log"
+	@echo ""
+	RUST_LOG=debug DEBUG_LEVEL=3 $(RUN_BASE) -- --log-level debug 2>&1 | tee $(DEBUG_LOG)
+
+# Run with trace level logging (most verbose, uses custom DEBUG_LEVEL)
+run-trace:
+	@echo "Running par-term with DEBUG_LEVEL=4 (trace)..."
+	@echo "Debug log: $(DEBUG_LOG)"
+	@echo ""
+	@echo "In another terminal, run: make tail-log"
+	@echo ""
+	RUST_LOG=trace DEBUG_LEVEL=4 $(RUN_BASE) -- --log-level trace 2>&1 | tee $(DEBUG_LOG)
+
+# Run release build with debug logging
+run-release-debug: release
+	@echo "Running release build with DEBUG_LEVEL=3..."
+	@echo "Debug log: $(DEBUG_LOG)"
+	@echo ""
+	@echo "In another terminal, run: make tail-log"
+	@echo ""
+	RUST_LOG=debug DEBUG_LEVEL=3 ./target/release/par-term 2>&1 | tee $(DEBUG_LOG)
+
+# Run all tests (workspace-wide)
+test:
+	@echo "Running tests..."
+	cargo test --workspace
+
+# Run tests with output
+test-verbose:
+	@echo "Running tests (verbose)..."
+	cargo test -- --nocapture
+
+# Run specific test
+test-one:
+	@echo "Running specific test..."
+	@echo "Usage: make test-one TEST=test_name"
+	cargo test $(TEST)
+
+# Check code without building
+check:
+	@echo "Checking code..."
+	cargo check
+
+# Check all targets
+check-all:
+	@echo "Checking all targets..."
+	cargo check --all-targets
+
+# Type-check the entire workspace (alias for cargo check --workspace)
+typecheck:
+	@echo "Type-checking workspace..."
+	cargo check --workspace
+
+# Format code
+fmt:
+	@echo "Formatting code..."
+	cargo fmt
+
+# Check formatting without modifying files
+fmt-check:
+	@echo "Checking code formatting..."
+	cargo fmt -- --check
+
+# Run clippy linter
+lint:
+	@echo "Running clippy..."
+	cargo clippy -- -D warnings
+
+# Run clippy on all targets
+lint-all:
+	@echo "Running clippy on all targets..."
+	cargo clippy --all-targets --all-features -- -D warnings
+
+# Run all quality checks (format-check, lint, typecheck, test) — does NOT mutate files
+checkall: fmt-check lint typecheck test
+	@echo "All quality checks passed!"
+
+# Clean build artifacts and project-root log files
+clean:
+	@echo "Cleaning build artifacts..."
+	cargo clean
+	@echo "Removing project-root log files..."
+	@rm -f *.log
+
+# Install the binary (reuses release build)
+install: release
+	@echo "Installing par-term to ~/.cargo/bin/..."
+	@cp target/release/par-term "$${HOME}/.cargo/bin/par-term"
+	@echo "Installed to ~/.cargo/bin/par-term"
+
+# Install shell integration scripts to ~/.config/par-term/
+install-shell-integration:
+	@echo "Installing shell integration scripts to ~/.config/par-term/..."
+	@mkdir -p "$${HOME}/.config/par-term"
+	@cp shell_integration/par_term_shell_integration.bash "$${HOME}/.config/par-term/shell_integration.bash"
+	@cp shell_integration/par_term_shell_integration.zsh "$${HOME}/.config/par-term/shell_integration.zsh"
+	@cp shell_integration/par_term_shell_integration.fish "$${HOME}/.config/par-term/shell_integration.fish"
+	@echo "✅ Shell integration installed. Re-source your shell or open a new tab to activate."
+
+# Install ACP bridge used by Claude custom agents
+install-acp:
+	@command -v npm >/dev/null 2>&1 || { echo "❌ npm is required to install ACP bridge."; exit 1; }
+	@if npm list -g --depth=0 @agentclientprotocol/claude-agent-acp >/dev/null 2>&1; then \
+		echo "✅ ACP bridge already installed: $$(command -v claude-agent-acp || echo 'not found in PATH')"; \
+	elif npm list -g --depth=0 @zed-industries/claude-agent-acp >/dev/null 2>&1; then \
+		echo "Migrating deprecated @zed-industries/claude-agent-acp package..."; \
+		npm uninstall -g @zed-industries/claude-agent-acp && \
+		npm install -g @agentclientprotocol/claude-agent-acp; \
+	elif command -v claude-agent-acp >/dev/null 2>&1; then \
+		echo "❌ claude-agent-acp already exists but is not owned by an ACP npm package: $$(command -v claude-agent-acp)"; \
+		echo "Remove or relocate that binary, then rerun make bundle-install."; \
+		exit 1; \
+	else \
+		npm install -g @agentclientprotocol/claude-agent-acp; \
+		echo "✅ ACP bridge installed: $$(command -v claude-agent-acp || echo 'not found in PATH')"; \
+	fi
+
+# Run the ACP harness (pass additional args via ARGS)
+acp-harness:
+	@echo "Running ACP harness..."
+	cargo run --bin par-term-acp-harness -- $(ARGS)
+
+# Reproducible Claude+Ollama smoke test for Assistant Panel ACP debugging
+acp-smoke:
+	@echo "Running ACP smoke test (agent=$(ACP_AGENT))..."
+	@echo "Transcript: $(ACP_TRANSCRIPT)"
+	cargo run --bin par-term-acp-harness -- \
+		--agent "$(ACP_AGENT)" \
+		--timeout-seconds $(ACP_TIMEOUT) \
+		--idle-timeout-seconds $(ACP_IDLE_TIMEOUT) \
+		--transcript-file "$(ACP_TRANSCRIPT)" \
+		--prompt "$(ACP_SMOKE_PROMPT)"
+
+# Generate documentation
+doc:
+	@echo "Generating documentation..."
+	cargo doc --no-deps
+
+# Generate and open documentation
+doc-open:
+	@echo "Generating and opening documentation..."
+	cargo doc --no-deps --open
+
+# Validate documentation links. Flags live in lychee.toml so this and the CI
+# `docs` job cannot drift apart.
+doc-check:
+	@command -v lychee >/dev/null 2>&1 || { \
+		echo "lychee not found. Install it with: cargo install lychee --locked"; \
+		exit 1; \
+	}
+	@echo "Checking documentation links..."
+	lychee './**/*.md'
+
+# Enforce the file-size policy from CLAUDE.md: warn over 500 production lines,
+# fail over 800. Counts production lines only -- `#[cfg(test)]` items are
+# subtracted wherever they appear -- so test-heavy files are not false
+# positives. Exemptions with reasons live in .line-count-exempt.
+check-line-counts:
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "python3 not found; it is required by scripts/check_line_counts.py"; \
+		exit 1; \
+	}
+	@echo "Checking production file line counts..."
+	python3 scripts/check_line_counts.py
+
+# Run all checks (format, lint, test)
+all: fmt lint test build
+	@echo "All checks passed!"
+
+# Secret scanning (gitleaks + detect-private-key), configured in
+# .pre-commit-config.yaml. That config holds scanning hooks only, so this never
+# rewrites a file. Note the gitleaks hook inspects the *staged* diff, so it is a
+# no-op here when nothing is staged — the enforcing copy is the git hook that
+# `pre-commit install` puts in place, which runs with the diff staged.
+secret-scan:
+	@command -v pre-commit >/dev/null 2>&1 || { \
+		echo "pre-commit not found. Install it with: pipx install pre-commit"; \
+		echo "Then enable the commit-time gate with: pre-commit install"; \
+		exit 1; \
+	}
+	pre-commit run --all-files
+
+# Pre-commit checks. secret-scan runs first: it is the cheapest gate and the
+# one whose failure must not be buried under a full test run.
+pre-commit: secret-scan fmt-check lint test
+	@echo "Pre-commit checks passed!"
+
+# CI checks (what CI would run)
+ci: fmt-check lint-all test check-all check-line-counts
+	@echo "CI checks passed!"
+
+# Update dependencies
+update:
+	@echo "Updating dependencies..."
+	cargo update
+
+# Generate test coverage (requires tarpaulin)
+coverage:
+	@echo "Generating test coverage..."
+	@command -v cargo-tarpaulin >/dev/null 2>&1 || { echo "cargo-tarpaulin not installed. Install with: cargo install cargo-tarpaulin"; exit 1; }
+	cargo tarpaulin --out Html --output-dir coverage
+
+# Benchmark (when benchmarks are added)
+bench:
+	@echo "Running benchmarks..."
+	cargo bench
+
+# Watch for changes and rebuild
+watch:
+	@echo "Watching for changes..."
+	@command -v cargo-watch >/dev/null 2>&1 || { echo "cargo-watch not installed. Install with: cargo install cargo-watch"; exit 1; }
+	cargo watch -x check -x test
+
+# Watch and run
+watch-run:
+	@echo "Watching and running..."
+	@command -v cargo-watch >/dev/null 2>&1 || { echo "cargo-watch not installed. Install with: cargo install cargo-watch"; exit 1; }
+	cargo watch -x run
+
+# Audit dependencies for security vulnerabilities
+audit:
+	@echo "Auditing dependencies..."
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not installed. Install with: cargo install cargo-audit"; exit 1; }
+	cargo audit
+
+# Run cargo-deny for license/vulnerability/ban checking (deny.toml)
+deny:
+	@echo "Running cargo-deny checks..."
+	@command -v cargo-deny >/dev/null 2>&1 || { echo "cargo-deny not installed. Install with: cargo install cargo-deny"; exit 1; }
+	cargo deny check
+
+# Show package info
+info:
+	@echo "Package information:"
+	@cargo metadata --no-deps --format-version 1 | grep -E '"name"|"version"|"authors"|"description"'
+
+# Create release build and package
+package: release
+	@echo "Creating release package..."
+	@mkdir -p dist
+	@cp target/release/par-term dist/
+	@cp README.md LICENSE dist/
+	@echo "Package created in dist/"
+
+# macOS app bundle
+bundle: release
+ifeq ($(shell uname),Darwin)
+	@echo "Creating macOS app bundle..."
+	$(eval VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'))
+	@mkdir -p target/release/bundle/par-term.app/Contents/MacOS
+	@mkdir -p target/release/bundle/par-term.app/Contents/Resources
+	@cp target/release/par-term target/release/bundle/par-term.app/Contents/MacOS/
+	@cp assets/par-term.icns target/release/bundle/par-term.app/Contents/Resources/
+	@sed 's/{{VERSION}}/$(VERSION)/g' assets/Info.plist.template > target/release/bundle/par-term.app/Contents/Info.plist
+	@echo "Bundle created at: target/release/bundle/par-term.app (version $(VERSION))"
+else
+	@echo "App bundle creation is only supported on macOS"
+endif
+
+# Run macOS app bundle (shows proper dock icon)
+run-bundle: bundle
+ifeq ($(shell uname),Darwin)
+	@echo "Running par-term.app..."
+	@open target/release/bundle/par-term.app
+else
+	@echo "App bundle is only supported on macOS"
+	@echo "Running regular binary instead..."
+	cargo run --release
+endif
+
+# Install macOS app bundle to /Applications, binary to PATH, and ACP bridge
+bundle-install: bundle install install-acp
+ifeq ($(shell uname),Darwin)
+	@echo "Installing par-term.app to /Applications..."
+	@if [ -d "/Applications/par-term.app" ]; then \
+		echo "Removing existing /Applications/par-term.app..."; \
+		rm -rf /Applications/par-term.app; \
+	fi
+	@cp -R target/release/bundle/par-term.app /Applications/
+	@echo "✅ Installed to /Applications/par-term.app"
+else
+	@echo "App bundle installation is only supported on macOS"
+endif
+
+# Generate config file example
+config-example:
+	@echo "# par-term configuration example" > config.yaml.example
+	@echo "cols: 80" >> config.yaml.example
+	@echo "rows: 24" >> config.yaml.example
+	@echo "font_size: 14.0" >> config.yaml.example
+	@echo "font_family: \"JetBrains Mono\"" >> config.yaml.example
+	@echo "scrollback_size: 10000" >> config.yaml.example
+	@echo "window_title: \"par-term\"" >> config.yaml.example
+	@echo "theme: \"dark-background\"" >> config.yaml.example
+	@echo "auto_copy_selection: false" >> config.yaml.example
+	@echo "middle_click_paste: true" >> config.yaml.example
+	@echo "screenshot_format: \"png\"" >> config.yaml.example
+	@echo "Example config written to config.yaml.example"
+
+# === Text Shaping Testing Targets ===
+
+# Run comprehensive text shaping test suite
+test-fonts:
+	@echo "🔤 Running comprehensive font and text shaping tests..."
+	@echo ""
+	@echo "This test suite covers:"
+	@echo "  ✓ Emoji with skin tones"
+	@echo "  ✓ Flag emoji (Regional Indicators)"
+	@echo "  ✓ ZWJ sequences"
+	@echo "  ✓ Complex scripts (Arabic, Devanagari, Thai)"
+	@echo "  ✓ BiDi text (LTR + RTL)"
+	@echo "  ✓ Combining diacritics"
+	@echo "  ✓ Programming ligatures"
+	@echo "  ✓ Wide character rendering"
+	@echo ""
+	@./scripts/test_fonts.sh
+
+# Run text shaping performance benchmark
+benchmark-shaping:
+	@echo "⚡ Running text shaping performance benchmark..."
+	@echo ""
+	@echo "This will benchmark:"
+	@echo "  - ASCII baseline"
+	@echo "  - CJK characters"
+	@echo "  - Simple and complex emoji"
+	@echo "  - Complex scripts (Arabic, Devanagari, Thai)"
+	@echo "  - Mixed content stress test"
+	@echo ""
+	@echo "💡 Run this twice to compare:"
+	@echo "   1. With enable_text_shaping: true (default)"
+	@echo "   2. With enable_text_shaping: false"
+	@echo ""
+	@./scripts/benchmark_text_shaping.sh
+
+# Run both font tests and benchmark
+test-text-shaping: test-fonts benchmark-shaping
+	@echo ""
+	@echo "✅ Text shaping tests and benchmarks complete!"
+
+# === Graphics Testing Targets ===
+
+# Monitor the debug log
+tail-log:
+	@if [ ! -f $(DEBUG_LOG) ]; then \
+		echo "Debug log not found."; \
+		echo ""; \
+		echo "Start par-term with: make run-debug"; \
+		exit 1; \
+	fi
+	@echo "Monitoring $(DEBUG_LOG)..."
+	@echo "Press Ctrl+C to stop"
+	@echo ""
+	tail -f $(DEBUG_LOG)
+
+# Watch log with graphics filtering
+watch-graphics:
+	@if [ ! -f $(DEBUG_LOG) ]; then \
+		echo "Debug log not found."; \
+		echo ""; \
+		echo "Start par-term with: make run-debug"; \
+		exit 1; \
+	fi
+	@echo "Monitoring $(DEBUG_LOG) (graphics only)..."
+	@echo "Press Ctrl+C to stop"
+	@echo ""
+	tail -f $(DEBUG_LOG) | grep -i --line-buffered "graphics\|terminal\|animation\|sixel\|kitty"
+
+# Test graphics with debug logging
+test-graphics:
+	@echo "Graphics Testing Mode"
+	@echo ""
+	@echo "Starting par-term with DEBUG_LEVEL=4..."
+	@echo ""
+	@echo "Debug log: $(DEBUG_LOG)"
+	@echo ""
+	@echo "In another terminal, run:"
+	@echo "   make tail-log         (all logs)"
+	@echo "   make watch-graphics   (graphics only)"
+	@echo ""
+	@echo "In par-term, run test:"
+	@echo "   bash scripts/test_sixel.sh"
+	@echo ""
+	DEBUG_LEVEL=4 $(RUN_BASE)
+
+# Clean debug logs
+clean-logs:
+	@echo "Cleaning debug logs..."
+	@rm -f $(DEBUG_LOG)
+	@echo "Debug logs cleaned"
+
+# Show recent graphics-related logs
+show-graphics-logs:
+	@if [ ! -f $(DEBUG_LOG) ]; then \
+		echo "Debug log not found."; \
+		echo ""; \
+		echo "Start par-term with: make run-debug"; \
+		exit 1; \
+	fi
+	@echo "Recent graphics-related logs:"
+	@echo ""
+	@grep -i "graphics\|terminal\|animation\|sixel" $(DEBUG_LOG) | tail -30
+
+# Test animations specifically
+test-animations:
+	@echo "Animation Testing Mode"
+	@echo ""
+	@echo "Starting par-term with DEBUG_LEVEL=4..."
+	@echo ""
+	@echo "Debug log: $(DEBUG_LOG)"
+	@echo ""
+	@echo "In another terminal, run: make watch-graphics"
+	@echo ""
+	@echo "In par-term, run:"
+	@echo "   uv run python ../par-term-emu-core-rust/scripts/test_kitty_animation.py"
+	@echo ""
+	DEBUG_LEVEL=4 $(RUN_BASE)
+
+# === Profiling Targets ===
+
+# Profile with flamegraph (CPU profiling)
+profile:
+	@echo "🔥 Profiling with flamegraph..."
+	@command -v cargo-flamegraph >/dev/null 2>&1 || { echo "❌ cargo-flamegraph not installed."; echo "Install with: cargo install flamegraph"; exit 1; }
+	@echo ""
+	@echo "This will:"
+	@echo "  1. Build in release mode with debug symbols"
+	@echo "  2. Run par-term and collect CPU samples"
+	@echo "  3. Generate flamegraph.svg when you quit"
+	@echo ""
+	@echo "💡 Use the terminal normally, then quit to generate the flamegraph"
+	@echo ""
+	cargo flamegraph --release --output flamegraph.svg
+
+# Profile with perf (Linux only)
+profile-perf:
+	@echo "📊 Profiling with perf..."
+	@command -v perf >/dev/null 2>&1 || { echo "❌ perf not installed (Linux only)"; exit 1; }
+	@echo "Recording 30 seconds of perf data..."
+	@echo "Use the terminal normally during this time"
+	cargo build --release
+	perf record -F 99 -g --call-graph=dwarf -- target/release/par-term
+	@echo ""
+	@echo "Generating report..."
+	perf report
+
+# Profile with Instruments (macOS only)
+profile-instruments:
+	@echo "🎯 Profiling with Instruments (macOS)..."
+	@command -v instruments >/dev/null 2>&1 || { echo "❌ Instruments not found (macOS only)"; exit 1; }
+	cargo build --release
+	@echo "Starting Instruments Time Profiler..."
+	@echo "Use the terminal normally, then stop recording in Instruments"
+	instruments -t "Time Profiler" target/release/par-term
+
+# === Deployment Targets ===
+
+# Trigger the Release and Deploy GitHub Action
+deploy:
+	@echo "🚀 Triggering Release and Deploy GitHub Action..."
+	@command -v gh >/dev/null 2>&1 || { echo "❌ gh CLI not installed."; echo "Install with: brew install gh"; exit 1; }
+	gh workflow run "Release and Deploy"
+	@echo "✅ Workflow triggered. View progress at: https://github.com/paulrobello/par-term/actions"

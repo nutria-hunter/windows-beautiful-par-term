@@ -1,0 +1,353 @@
+//! File I/O for session persistence
+//!
+//! Sessions are stored in `~/.config/par-term/last_session.yaml`
+
+use super::SessionState;
+use anyhow::{Context, Result};
+use par_term_config::Config;
+use std::path::PathBuf;
+
+/// Get the path to the session state file
+pub fn session_path() -> PathBuf {
+    Config::config_dir().join("last_session.yaml")
+}
+
+/// Save session state to the default location
+pub fn save_session(state: &SessionState) -> Result<()> {
+    save_session_to(state, session_path())
+}
+
+/// Save session state to a specific file
+pub fn save_session_to(state: &SessionState, path: PathBuf) -> Result<()> {
+    // QA-010/SEC-016/SEC-021: `save_yaml_atomic` stages the write in a sibling
+    // temp file created with mode 0600 (the session file records working
+    // directories, which reveal filesystem layout), fsyncs it, then renames it
+    // over the target. Session save runs at shutdown, when an abrupt kill is
+    // most likely, and a truncated file reads back as "no saved session".
+    crate::atomic_save::save_yaml_atomic(&path, state)
+        .with_context(|| format!("Failed to write session state to {:?}", path))?;
+
+    log::info!(
+        "Saved session state ({} windows) to {:?}",
+        state.windows.len(),
+        path
+    );
+    Ok(())
+}
+
+/// Load session state from the default location
+///
+/// Returns `None` if the file doesn't exist or is empty.
+/// Returns an error if the file exists but is corrupt.
+pub fn load_session() -> Result<Option<SessionState>> {
+    load_session_from(session_path())
+}
+
+/// Load session state from a specific file
+pub fn load_session_from(path: PathBuf) -> Result<Option<SessionState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read session state from {:?}", path))?;
+
+    if contents.trim().is_empty() {
+        return Ok(None);
+    }
+
+    // SEC-011: Trust boundary note — this file is loaded from the user's own config
+    // directory (~/.config/par-term/last_session.yaml) with 0o600 permissions.
+    // The trust boundary is the user themselves: only the user (and root) can write
+    // this file, so the deserialization is equivalent to loading any other user config.
+    // `serde_yaml_ng` does not support arbitrary code execution during deserialization,
+    // so there is no remote-code-execution risk from crafted YAML. The worst a modified
+    // file can do is cause a deserialization error (caught above) or produce unexpected
+    // session state.
+    //
+    // Schema validation: serde_yaml_ng validates field types at deserialization time.
+    // Any field with an unexpected type or value outside the Rust type constraints will
+    // return an Err, which is propagated as an anyhow error above.
+    let state: SessionState = serde_yaml_ng::from_str(&contents)
+        .with_context(|| format!("Failed to parse session state from {:?}", path))?;
+
+    log::info!(
+        "Loaded session state ({} windows) from {:?}",
+        state.windows.len(),
+        path
+    );
+    Ok(Some(state))
+}
+
+/// Remove the session state file (e.g., after successful restore)
+pub fn clear_session() -> Result<()> {
+    let path = session_path();
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove session state file {:?}", path))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionState, SessionTab, SessionWindow};
+    use par_term_config::snapshot_types::TabSnapshot;
+    use tempfile::tempdir;
+
+    fn sample_session() -> SessionState {
+        SessionState {
+            saved_at: "2025-01-01T00:00:00Z".to_string(),
+            windows: vec![SessionWindow {
+                position: (100, 200),
+                size: (800, 600),
+                tabs: vec![SessionTab {
+                    snapshot: TabSnapshot {
+                        cwd: Some("/home/user/work".to_string()),
+                        title: "work".to_string(),
+                        custom_color: None,
+                        user_title: None,
+                        custom_icon: None,
+                    },
+                    pane_layout: None,
+                }],
+                active_tab_index: 0,
+                tmux_session_name: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("nonexistent.yaml");
+        let result = load_session_from(path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_empty_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("empty.yaml");
+        std::fs::write(&path, "").unwrap();
+        let result = load_session_from(path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_corrupt_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("corrupt.yaml");
+        std::fs::write(&path, "not: valid: yaml: [[[").unwrap();
+        let result = load_session_from(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("session.yaml");
+
+        let state = sample_session();
+        save_session_to(&state, path.clone()).unwrap();
+
+        let loaded = load_session_from(path).unwrap().unwrap();
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows[0].position, (100, 200));
+        assert_eq!(loaded.windows[0].size, (800, 600));
+        assert_eq!(loaded.windows[0].tabs.len(), 1);
+        assert_eq!(
+            loaded.windows[0].tabs[0].snapshot.cwd,
+            Some("/home/user/work".to_string())
+        );
+        assert_eq!(loaded.windows[0].tabs[0].snapshot.title, "work");
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_custom_tab_properties() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("session.yaml");
+
+        let state = SessionState {
+            saved_at: "2025-01-01T00:00:00Z".to_string(),
+            windows: vec![SessionWindow {
+                position: (0, 0),
+                size: (1920, 1080),
+                tabs: vec![
+                    SessionTab {
+                        snapshot: TabSnapshot {
+                            cwd: Some("/home/user".to_string()),
+                            title: "My Custom Tab".to_string(),
+                            custom_color: Some([255, 128, 0]),
+                            user_title: Some("My Custom Tab".to_string()),
+                            custom_icon: Some("🔥".to_string()),
+                        },
+                        pane_layout: None,
+                    },
+                    SessionTab {
+                        snapshot: TabSnapshot {
+                            cwd: Some("/tmp".to_string()),
+                            title: "Tab 2".to_string(),
+                            custom_color: None,
+                            user_title: None,
+                            custom_icon: Some("📁".to_string()),
+                        },
+                        pane_layout: None,
+                    },
+                    SessionTab {
+                        snapshot: TabSnapshot {
+                            cwd: None,
+                            title: "Colored Only".to_string(),
+                            custom_color: Some([0, 200, 100]),
+                            user_title: None,
+                            custom_icon: None,
+                        },
+                        pane_layout: None,
+                    },
+                ],
+                active_tab_index: 1,
+                tmux_session_name: None,
+            }],
+        };
+
+        save_session_to(&state, path.clone()).unwrap();
+        let loaded = load_session_from(path).unwrap().unwrap();
+        let tabs = &loaded.windows[0].tabs;
+
+        // Tab 0: all custom properties set
+        assert_eq!(tabs[0].snapshot.custom_color, Some([255, 128, 0]));
+        assert_eq!(
+            tabs[0].snapshot.user_title,
+            Some("My Custom Tab".to_string())
+        );
+        assert_eq!(tabs[0].snapshot.custom_icon, Some("🔥".to_string()));
+
+        // Tab 1: only custom icon
+        assert_eq!(tabs[1].snapshot.custom_color, None);
+        assert_eq!(tabs[1].snapshot.user_title, None);
+        assert_eq!(tabs[1].snapshot.custom_icon, Some("📁".to_string()));
+
+        // Tab 2: only custom color
+        assert_eq!(tabs[2].snapshot.custom_color, Some([0, 200, 100]));
+        assert_eq!(tabs[2].snapshot.user_title, None);
+        assert_eq!(tabs[2].snapshot.custom_icon, None);
+    }
+
+    #[test]
+    fn test_save_creates_parent_directory() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("nested").join("dir").join("session.yaml");
+
+        let state = sample_session();
+        save_session_to(&state, path.clone()).unwrap();
+        assert!(path.exists());
+    }
+
+    /// SEC-016/SEC-021: the session file records working directories, so it must
+    /// land at mode 0600 whatever the process umask is.
+    #[cfg(unix)]
+    #[test]
+    fn test_saved_session_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("session.yaml");
+
+        save_session_to(&sample_session(), path.clone()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn test_serialization_with_pane_layout() {
+        use crate::pane::SplitDirection;
+        use crate::session::SessionPaneNode;
+
+        let state = SessionState {
+            saved_at: "2025-01-01T00:00:00Z".to_string(),
+            windows: vec![SessionWindow {
+                position: (0, 0),
+                size: (1920, 1080),
+                tabs: vec![SessionTab {
+                    snapshot: TabSnapshot {
+                        cwd: Some("/home/user".to_string()),
+                        title: "dev".to_string(),
+                        custom_color: None,
+                        user_title: None,
+                        custom_icon: None,
+                    },
+                    pane_layout: Some(SessionPaneNode::Split {
+                        direction: SplitDirection::Vertical,
+                        ratio: 0.5,
+                        first: Box::new(SessionPaneNode::Leaf {
+                            cwd: Some("/home/user/code".to_string()),
+                        }),
+                        second: Box::new(SessionPaneNode::Split {
+                            direction: SplitDirection::Horizontal,
+                            ratio: 0.6,
+                            first: Box::new(SessionPaneNode::Leaf {
+                                cwd: Some("/home/user/logs".to_string()),
+                            }),
+                            second: Box::new(SessionPaneNode::Leaf {
+                                cwd: Some("/home/user/tests".to_string()),
+                            }),
+                        }),
+                    }),
+                }],
+                active_tab_index: 0,
+                tmux_session_name: None,
+            }],
+        };
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pane_session.yaml");
+
+        save_session_to(&state, path.clone()).unwrap();
+        let loaded = load_session_from(path).unwrap().unwrap();
+
+        // Verify the nested pane layout survived roundtrip
+        let tab = &loaded.windows[0].tabs[0];
+        assert!(tab.pane_layout.is_some());
+        match tab.pane_layout.as_ref().unwrap() {
+            SessionPaneNode::Split {
+                direction, ratio, ..
+            } => {
+                assert_eq!(*direction, SplitDirection::Vertical);
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected Split at root"),
+        }
+    }
+
+    #[test]
+    fn test_split_direction_serde() {
+        use crate::pane::SplitDirection;
+
+        let h = SplitDirection::Horizontal;
+        let v = SplitDirection::Vertical;
+
+        let h_yaml = serde_yaml_ng::to_string(&h).unwrap();
+        let v_yaml = serde_yaml_ng::to_string(&v).unwrap();
+
+        let h_back: SplitDirection = serde_yaml_ng::from_str(&h_yaml).unwrap();
+        let v_back: SplitDirection = serde_yaml_ng::from_str(&v_yaml).unwrap();
+
+        assert_eq!(h, h_back);
+        assert_eq!(v, v_back);
+    }
+
+    #[test]
+    fn test_clear_session() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("to_clear.yaml");
+        std::fs::write(&path, "test").unwrap();
+        assert!(path.exists());
+
+        // We can't easily test clear_session() since it uses fixed path,
+        // but we can test the file removal logic
+        std::fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+    }
+}

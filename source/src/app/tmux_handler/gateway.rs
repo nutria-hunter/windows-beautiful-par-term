@@ -1,0 +1,547 @@
+//! tmux gateway session management and I/O routing.
+//!
+//! Covers:
+//! - Session lifecycle: initiate, attach, disconnect, status queries
+//! - Input routing: send_input_via_tmux, paste_via_tmux, prefix key handling
+//! - Pane operations: split_pane_via_tmux, close_pane_via_tmux
+//! - Clipboard + resize synchronization
+//!
+//! Profile auto-application on session connect lives in `gateway_profile`.
+
+use crate::app::window_state::WindowState;
+use crate::tmux::{SessionState, TmuxSession};
+
+impl WindowState {
+    // =========================================================================
+    // Gateway Mode Session Management
+    // =========================================================================
+
+    /// Initiate a new tmux session via gateway mode.
+    ///
+    /// This writes `tmux -CC new-session` to the active tab's PTY and enables
+    /// tmux control mode parsing. The session will be fully connected once we
+    /// receive the `%session-changed` notification.
+    ///
+    /// # Arguments
+    /// * `session_name` - Optional session name. If None, tmux will auto-generate one.
+    pub fn initiate_tmux_gateway(&mut self, session_name: Option<&str>) -> anyhow::Result<()> {
+        if !self.config.load().tmux.tmux_enabled {
+            anyhow::bail!("tmux integration is disabled");
+        }
+
+        if self.tmux_state.tmux_session.is_some() && self.is_tmux_connected() {
+            anyhow::bail!("Already connected to a tmux session");
+        }
+
+        crate::debug_info!(
+            "TMUX",
+            "Initiating gateway mode session: {:?}",
+            session_name.unwrap_or("(auto)")
+        );
+
+        // Generate the command
+        let cmd = match session_name {
+            Some(name) => TmuxSession::create_or_attach_command(name),
+            None => TmuxSession::create_new_command(None),
+        };
+
+        // Get the active tab ID and write the command to its PTY
+        let gateway_tab_id = self
+            .tab_manager
+            .active_tab_id()
+            .ok_or_else(|| anyhow::anyhow!("No active tab available for tmux gateway"))?;
+
+        let tab = self
+            .tab_manager
+            .active_tab_mut()
+            .ok_or_else(|| anyhow::anyhow!("No active tab available for tmux gateway"))?;
+
+        // Write the command to the PTY
+        // try_lock: intentional — initiate_tmux_gateway is user-initiated but called from
+        // the sync event loop context. If the terminal is locked by the async PTY reader
+        // the command cannot be sent. On miss: bails with an error so the caller can retry.
+        if let Ok(term) = tab.terminal.try_read() {
+            crate::debug_info!(
+                "TMUX",
+                "Writing gateway command to tab {}: {}",
+                gateway_tab_id,
+                cmd.trim()
+            );
+            term.write(cmd.as_bytes())?;
+            // Enable tmux control mode parsing AFTER writing the command
+            term.set_tmux_control_mode(true);
+            crate::debug_info!(
+                "TMUX",
+                "Enabled tmux control mode parsing on tab {}",
+                gateway_tab_id
+            );
+        } else {
+            anyhow::bail!("Could not acquire terminal lock");
+        }
+
+        // Mark this tab as the gateway
+        tab.tmux.tmux_gateway_active = true;
+
+        // Store the gateway tab ID so we know where to send commands
+        self.tmux_state.tmux_gateway_tab_id = Some(gateway_tab_id);
+        crate::debug_info!(
+            "TMUX",
+            "Gateway tab set to {}, state: Initiating",
+            gateway_tab_id
+        );
+
+        // Create session and set gateway state
+        let mut session = TmuxSession::new();
+        session.set_gateway_initiating();
+        self.tmux_state.tmux_session = Some(session);
+
+        // Show toast
+        self.show_toast("tmux: Connecting...");
+
+        Ok(())
+    }
+
+    /// Attach to an existing tmux session via gateway mode.
+    ///
+    /// This writes `tmux -CC attach -t session` to the active tab's PTY.
+    pub fn attach_tmux_gateway(&mut self, session_name: &str) -> anyhow::Result<()> {
+        if !self.config.load().tmux.tmux_enabled {
+            anyhow::bail!("tmux integration is disabled");
+        }
+
+        if self.tmux_state.tmux_session.is_some() && self.is_tmux_connected() {
+            anyhow::bail!("Already connected to a tmux session");
+        }
+
+        crate::debug_info!("TMUX", "Attaching to session via gateway: {}", session_name);
+
+        // Generate the attach command
+        let cmd = TmuxSession::create_attach_command(session_name);
+
+        // Get the active tab ID and write the command to its PTY
+        let gateway_tab_id = self
+            .tab_manager
+            .active_tab_id()
+            .ok_or_else(|| anyhow::anyhow!("No active tab available for tmux gateway"))?;
+
+        let tab = self
+            .tab_manager
+            .active_tab_mut()
+            .ok_or_else(|| anyhow::anyhow!("No active tab available for tmux gateway"))?;
+
+        // Write the command to the PTY
+        // try_lock: intentional — same rationale as initiate_tmux_gateway. On miss: bails
+        // so the user can retry the attach operation explicitly.
+        if let Ok(term) = tab.terminal.try_read() {
+            crate::debug_info!(
+                "TMUX",
+                "Writing attach command to tab {}: {}",
+                gateway_tab_id,
+                cmd.trim()
+            );
+            term.write(cmd.as_bytes())?;
+            term.set_tmux_control_mode(true);
+            crate::debug_info!(
+                "TMUX",
+                "Enabled tmux control mode parsing on tab {}",
+                gateway_tab_id
+            );
+        } else {
+            anyhow::bail!("Could not acquire terminal lock");
+        }
+
+        // Mark this tab as the gateway
+        tab.tmux.tmux_gateway_active = true;
+
+        // Store the gateway tab ID so we know where to send commands
+        self.tmux_state.tmux_gateway_tab_id = Some(gateway_tab_id);
+        crate::debug_info!(
+            "TMUX",
+            "Gateway tab set to {}, state: Initiating",
+            gateway_tab_id
+        );
+
+        // Create session and set gateway state
+        let mut session = TmuxSession::new();
+        session.set_gateway_initiating();
+        self.tmux_state.tmux_session = Some(session);
+
+        // Show toast
+        self.show_toast(format!("tmux: Attaching to '{}'...", session_name));
+
+        Ok(())
+    }
+
+    /// Disconnect from the current tmux session
+    pub fn disconnect_tmux_session(&mut self) {
+        // Restore gateway tab visibility before clearing state
+        self.show_gateway_tab();
+
+        // Clear the gateway tab ID
+        self.tmux_state.tmux_gateway_tab_id = None;
+
+        // First, disable tmux control mode on any gateway tabs
+        for tab in self.tab_manager.tabs_mut() {
+            if tab.tmux.tmux_gateway_active {
+                tab.tmux.tmux_gateway_active = false;
+                // try_lock: intentional — disconnect is called from the sync event loop.
+                // On miss: control mode stays on the terminal until the next frame; benign
+                // since the session is already being torn down and no further output arrives.
+                if let Ok(term) = tab.terminal.try_read() {
+                    term.set_tmux_control_mode(false);
+                }
+            }
+        }
+
+        if let Some(mut session) = self.tmux_state.tmux_session.take() {
+            crate::debug_info!("TMUX", "Disconnecting from tmux session");
+            session.disconnect();
+        }
+
+        // Clear session name
+        self.tmux_state.tmux_session_name = None;
+
+        // Reset sync state
+        self.tmux_state.tmux_sync = crate::tmux::TmuxSync::new();
+
+        // Reset window title (now without tmux info)
+        self.update_window_title_with_tmux();
+    }
+
+    /// Check if tmux session is active
+    pub fn is_tmux_connected(&self) -> bool {
+        self.tmux_state
+            .tmux_session
+            .as_ref()
+            .is_some_and(|s| s.state() == SessionState::Connected)
+    }
+
+    /// Return true when a `tmux*` process is running under the active tab's
+    /// shell. Used by the input path to decide whether to encode Shift+Enter
+    /// as raw LF (iTerm2 convention) or as a CSI-u extended-keys sequence
+    /// that tmux's `extended-keys on` parser can relay to the inner app in
+    /// whatever keyboard protocol that app has negotiated (kitty/modifyOtherKeys).
+    pub fn shell_has_tmux_child(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let tab = match self.tab_manager.active_tab() {
+            Some(t) => t,
+            None => return false,
+        };
+        // Cache fallback: on `try_read` contention (frequent in release/LTO
+        // builds because the renderer holds the write lock briefly on every
+        // frame), fall back to the last-known result rather than reporting
+        // "no tmux". Returning `false` here was causing the Shift+Enter
+        // handler to send raw LF in shell context, which tmux mangles into
+        // Ctrl+J. See cached_has_tmux_child docs in src/tab/mod.rs.
+        match tab.terminal.try_read() {
+            Ok(term) => {
+                let has = term
+                    .get_running_child_processes(&[])
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("tmux") || name.starts_with("tmux"));
+                tab.cached_has_tmux_child.store(has, Ordering::Relaxed);
+                has
+            }
+            Err(_) => tab.cached_has_tmux_child.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Check if gateway mode is active (connected or connecting)
+    pub fn is_gateway_active(&self) -> bool {
+        self.tmux_state
+            .tmux_session
+            .as_ref()
+            .is_some_and(|s| s.is_gateway_active())
+    }
+
+    /// Update the tmux focused pane when a native pane is focused
+    ///
+    /// This should be called when the user clicks on a pane to ensure
+    /// input is routed to the correct tmux pane.
+    pub fn set_tmux_focused_pane_from_native(&mut self, native_pane_id: crate::pane::PaneId) {
+        if let Some(tmux_pane_id) = self
+            .tmux_state
+            .native_pane_to_tmux_pane
+            .get(&native_pane_id)
+            && let Some(session) = &mut self.tmux_state.tmux_session
+        {
+            crate::debug_info!(
+                "TMUX",
+                "Setting focused pane: native {} -> tmux %{}",
+                native_pane_id,
+                tmux_pane_id
+            );
+            session.set_focused_pane(Some(*tmux_pane_id));
+        }
+    }
+
+    // =========================================================================
+    // Gateway Mode Input Routing
+    // =========================================================================
+
+    /// Write a command to the gateway tab's terminal.
+    ///
+    /// The gateway tab is where the tmux control mode connection lives.
+    /// All tmux commands must be written to this tab, not the active tab.
+    pub(crate) fn write_to_gateway(&self, cmd: &str) -> bool {
+        let gateway_tab_id = match self.tmux_state.tmux_gateway_tab_id {
+            Some(id) => id,
+            None => {
+                crate::debug_trace!("TMUX", "No gateway tab ID set");
+                return false;
+            }
+        };
+
+        // try_lock: intentional — write_to_gateway is called from the sync event loop and
+        // from input handlers. Blocking would stall the GUI or create deadlock risk.
+        // On miss: the tmux command is silently dropped. For input this means a keypress
+        // is lost; for control commands (resize, split) the caller should retry as needed.
+        if let Some(tab) = self.tab_manager.get_tab(gateway_tab_id)
+            && tab.tmux.tmux_gateway_active
+            && let Ok(term) = tab.terminal.try_read()
+        {
+            match term.write(cmd.as_bytes()) {
+                Ok(()) => return true,
+                Err(e) => {
+                    crate::debug_error!("TMUX", "PTY write failed (gateway command): {e}");
+                    return false;
+                }
+            }
+        }
+
+        crate::debug_trace!("TMUX", "Failed to write to gateway tab");
+        false
+    }
+
+    /// Split the current pane via tmux control mode.
+    ///
+    /// Writes split-window command to the gateway PTY.
+    ///
+    /// # Arguments
+    /// * `vertical` - true for vertical split (side by side), false for horizontal (stacked)
+    ///
+    /// Returns true if the command was sent successfully.
+    pub fn split_pane_via_tmux(&self, vertical: bool) -> bool {
+        if !self.config.load().tmux.tmux_enabled || !self.is_tmux_connected() {
+            return false;
+        }
+
+        let session = match &self.tmux_state.tmux_session {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Get the focused pane ID
+        let pane_id = session.focused_pane();
+
+        // Format the split command
+        let cmd = if vertical {
+            match pane_id {
+                Some(id) => format!("split-window -h -t %{}\n", id),
+                None => "split-window -h\n".to_string(),
+            }
+        } else {
+            match pane_id {
+                Some(id) => format!("split-window -v -t %{}\n", id),
+                None => "split-window -v\n".to_string(),
+            }
+        };
+
+        // Write to gateway tab
+        if self.write_to_gateway(&cmd) {
+            crate::debug_info!(
+                "TMUX",
+                "Sent {} split command via gateway",
+                if vertical { "vertical" } else { "horizontal" }
+            );
+            return true;
+        }
+
+        false
+    }
+
+    /// Close the focused pane via tmux control mode.
+    ///
+    /// Writes kill-pane command to the gateway PTY.
+    ///
+    /// Returns true if the command was sent successfully.
+    pub fn close_pane_via_tmux(&self) -> bool {
+        if !self.config.load().tmux.tmux_enabled || !self.is_tmux_connected() {
+            return false;
+        }
+
+        let session = match &self.tmux_state.tmux_session {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Get the focused pane ID
+        let pane_id = match session.focused_pane() {
+            Some(id) => id,
+            None => {
+                crate::debug_info!("TMUX", "No focused pane to close");
+                return false;
+            }
+        };
+
+        let cmd = format!("kill-pane -t %{}\n", pane_id);
+
+        // Write to gateway tab
+        if self.write_to_gateway(&cmd) {
+            crate::debug_info!("TMUX", "Sent kill-pane command for pane %{}", pane_id);
+            return true;
+        }
+
+        false
+    }
+
+    /// Sync clipboard content to tmux paste buffer.
+    ///
+    /// Writes set-buffer command to the gateway PTY.
+    ///
+    /// Returns true if the command was sent successfully.
+    pub fn sync_clipboard_to_tmux(&self, content: &str) -> bool {
+        // Check if clipboard sync is enabled
+        if !self.config.load().tmux.tmux_clipboard_sync {
+            return false;
+        }
+
+        if !self.config.load().tmux.tmux_enabled || !self.is_tmux_connected() {
+            return false;
+        }
+
+        // Don't sync empty content
+        if content.is_empty() {
+            return false;
+        }
+
+        // Format the set-buffer command
+        let escaped = content.replace('\'', "'\\''");
+        let cmd = format!("set-buffer '{}'\n", escaped);
+
+        // Write to gateway tab
+        if self.write_to_gateway(&cmd) {
+            crate::debug_trace!(
+                "TMUX",
+                "Synced {} chars to tmux paste buffer",
+                content.len()
+            );
+            return true;
+        }
+
+        false
+    }
+
+    // =========================================================================
+    // Pane Resize Sync
+    // =========================================================================
+
+    /// Sync pane resize to tmux after a divider drag.
+    ///
+    /// When the user resizes panes by dragging a divider in par-term, this
+    /// sends the new pane sizes to tmux so external clients see the same layout.
+    ///
+    /// # Arguments
+    /// * `is_horizontal_divider` - true if dragging a horizontal divider (changes heights),
+    ///   false if dragging a vertical divider (changes widths)
+    pub fn sync_pane_resize_to_tmux(&self, is_horizontal_divider: bool) {
+        // Only sync if tmux gateway is active
+        if !self.is_gateway_active() {
+            return;
+        }
+
+        // Get cell dimensions from renderer
+        let (cell_width, cell_height) = match &self.renderer {
+            Some(r) => (r.cell_width(), r.cell_height()),
+            None => return,
+        };
+
+        // Get pane sizes from active tab's pane manager
+        let pane_sizes: Vec<(crate::tmux::TmuxPaneId, usize, usize)> = if let Some(tab) =
+            self.tab_manager.active_tab()
+            && let Some(pm) = tab.pane_manager()
+        {
+            pm.all_panes()
+                .iter()
+                .filter_map(|pane| {
+                    // Get the tmux pane ID for this native pane
+                    let tmux_pane_id = self.tmux_state.native_pane_to_tmux_pane.get(&pane.id)?;
+                    // Calculate size in columns/rows
+                    let cols = (pane.bounds.width / cell_width).floor() as usize;
+                    let rows = (pane.bounds.height / cell_height).floor() as usize;
+                    Some((*tmux_pane_id, cols.max(1), rows.max(1)))
+                })
+                .collect()
+        } else {
+            return;
+        };
+
+        // Send resize commands for each pane, but only for the dimension that changed
+        // Horizontal divider: changes height (rows) - use -y
+        // Vertical divider: changes width (cols) - use -x
+        for (tmux_pane_id, cols, rows) in pane_sizes {
+            let cmd = if is_horizontal_divider {
+                format!("resize-pane -t %{} -y {}\n", tmux_pane_id, rows)
+            } else {
+                format!("resize-pane -t %{} -x {}\n", tmux_pane_id, cols)
+            };
+            if self.write_to_gateway(&cmd) {
+                crate::debug_info!(
+                    "TMUX",
+                    "Synced pane %{} {} resize to {}",
+                    tmux_pane_id,
+                    if is_horizontal_divider {
+                        "height"
+                    } else {
+                        "width"
+                    },
+                    if is_horizontal_divider { rows } else { cols }
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Gateway Tab Visibility
+    // =========================================================================
+
+    /// Hide the gateway tab from the tab bar once tmux windows are active.
+    ///
+    /// Called after the first tmux window tab is created so the control-mode
+    /// connection tab no longer clutters the tab bar. The tab still exists and
+    /// all PTY I/O continues to flow through it; it is simply excluded from the
+    /// visible tab list. The tab is restored when the session ends.
+    ///
+    /// No-op when `config.tmux_hide_gateway_tab` is false.
+    pub(crate) fn hide_gateway_tab(&mut self) {
+        if !self.config.load().tmux.tmux_hide_gateway_tab {
+            return;
+        }
+        if let Some(gateway_tab_id) = self.tmux_state.tmux_gateway_tab_id
+            && let Some(tab) = self.tab_manager.get_tab_mut(gateway_tab_id)
+            && !tab.is_hidden
+        {
+            tab.is_hidden = true;
+            crate::debug_info!(
+                "TMUX",
+                "Gateway tab {} hidden (tmux windows active)",
+                gateway_tab_id
+            );
+        }
+    }
+
+    /// Restore the gateway tab to the tab bar when no tmux windows are active.
+    pub(crate) fn show_gateway_tab(&mut self) {
+        if let Some(gateway_tab_id) = self.tmux_state.tmux_gateway_tab_id
+            && let Some(tab) = self.tab_manager.get_tab_mut(gateway_tab_id)
+            && tab.is_hidden
+        {
+            tab.is_hidden = false;
+            crate::debug_info!("TMUX", "Gateway tab {} restored to tab bar", gateway_tab_id);
+        }
+    }
+
+    // =========================================================================
+    // Prefix Key Handling
+    // =========================================================================
+}

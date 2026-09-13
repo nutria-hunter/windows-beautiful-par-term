@@ -1,0 +1,29 @@
+[package]
+name = "par-term-ssh"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "SSH host management and discovery for par-term terminal emulator"
+license = "MIT"
+repository = "https://github.com/paulrobello/par-term"
+homepage = "https://github.com/paulrobello/par-term"
+keywords = ["terminal", "ssh", "mdns", "discovery"]
+categories = ["network-programming"]
+
+[features]
+default = ["mdns"]
+mdns = ["dep:mdns-sd"]
+
+[dependencies]
+# Serialization
+serde.workspace = true
+
+# mDNS/Bonjour service discovery for SSH host auto-detection (feature-gated: `mdns`)
+mdns-sd = { workspace = true, optional = true }
+
+# Platform-specific directories (home dir for ~/.ssh)
+dirs.workspace = true
+
+# Logging
+log.workspace = true

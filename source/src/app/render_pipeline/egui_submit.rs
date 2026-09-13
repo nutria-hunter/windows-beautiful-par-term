@@ -1,0 +1,667 @@
+//! egui frame rendering for the GPU submit pipeline.
+//!
+//! `render_egui_frame` runs all egui dialogs and overlay panels for the current
+//! frame (phase 3 of the render cycle). It is split from `gpu_submit.rs` to keep
+//! that module within the 500-line target while grouping the egui-specific logic
+//! in one place.
+
+use super::egui_overlays;
+use super::types::PostRenderActions;
+use crate::app::window_state::WindowState;
+use crate::badge::{BadgeInsets, render_badge};
+use crate::progress_bar::{ProgressBarSnapshot, render_progress_bars};
+
+/// Parameters for [`WindowState::render_egui_frame`], bundled to stay within
+/// the clippy `too_many_arguments` limit.
+pub(super) struct RenderEguiParams<'a> {
+    pub(super) actions: &'a mut PostRenderActions,
+    pub(super) hovered_mark: &'a Option<crate::config::ScrollbackMark>,
+    pub(super) window_size_for_badge: Option<&'a winit::dpi::PhysicalSize<u32>>,
+    pub(super) progress_snapshot: &'a Option<ProgressBarSnapshot>,
+    pub(super) visible_lines: usize,
+    pub(super) scrollback_len: usize,
+    pub(super) any_modal_visible: bool,
+    pub(super) show_scrollbar: bool,
+}
+
+impl WindowState {
+    /// Run all egui dialogs and overlay panels for the current frame (phase 3).
+    ///
+    /// Takes pre-captured state values and updates `actions` with deferred UI responses.
+    /// Returns the egui output (`FullOutput` + `Context`) needed by the wgpu render call,
+    /// or `None` if the egui context/window is not yet initialised for this window.
+    pub(super) fn render_egui_frame(
+        &mut self,
+        params: RenderEguiParams<'_>,
+    ) -> Option<(egui::FullOutput, egui::Context)> {
+        let RenderEguiParams {
+            actions,
+            hovered_mark,
+            window_size_for_badge,
+            progress_snapshot,
+            visible_lines,
+            scrollback_len,
+            any_modal_visible,
+            show_scrollbar,
+        } = params;
+        let egui_start = std::time::Instant::now();
+
+        // Capture values for FPS overlay before closure
+        let show_fps = self.debug.show_fps_overlay;
+        let fps_value = self.debug.fps_value;
+        let frame_time_ms = if !self.debug.frame_times.is_empty() {
+            let avg = self.debug.frame_times.iter().sum::<std::time::Duration>()
+                / self.debug.frame_times.len() as u32;
+            avg.as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+
+        // Capture badge state for closure
+        let badge_enabled = self.badge_state.enabled;
+        let badge_state = if badge_enabled {
+            if self.badge_state.is_dirty() {
+                self.badge_state.interpolate();
+            }
+            Some(self.badge_state.clone())
+        } else {
+            None
+        };
+
+        // Capture session variables for status bar rendering (skip if bar is hidden)
+        let status_bar_session_vars = if self.config.load().status_bar.status_bar_enabled
+            && !self
+                .status_bar_ui
+                .should_hide(&self.config.load(), self.is_fullscreen)
+        {
+            Some(self.badge_state.variables.read().clone())
+        } else {
+            None
+        };
+
+        // Capture values for badge insets (before egui borrow to avoid method-call borrows)
+        let badge_is_tmux = self.is_tmux_connected();
+        let badge_tmux_sb_height =
+            crate::tmux_status_bar_ui::TmuxStatusBarUI::height(&self.config.load(), badge_is_tmux);
+        let badge_custom_sb_height = self
+            .status_bar_ui
+            .height(&self.config.load(), self.is_fullscreen);
+
+        // Resolve the confirmation dialog's target tab now, for the same borrow
+        // reason as the move-tab values below: the dialog takes `&mut
+        // self.trigger_state` and the lookup reads `self.tab_manager`. Resolving
+        // per frame rather than at queue time keeps the named tab current.
+        let pending_action_target_note = self.pending_action_target_note();
+
+        // Capture move-tab context values BEFORE the egui closure so the
+        // `self.is_gateway_active()` method call (which borrows `&self`) does
+        // not conflict with the closure's unique borrow of `*self`.
+        let move_gateway_active = self.is_gateway_active();
+        let move_tab_count = self.tab_manager.tab_count();
+        let move_candidates = self.overlay_ui.move_tab_candidates.clone();
+        let context_tab_has_multiple_panes = self
+            .tab_bar_ui
+            .context_menu_tab_id()
+            .and_then(|tid| self.tab_manager.get_tab(tid))
+            .is_some_and(|tab: &crate::tab::Tab| tab.has_multiple_panes());
+
+        // Collect pane bounds for identify overlay (before egui borrow)
+        let pane_identify_bounds: Vec<(usize, crate::pane::PaneBounds)> =
+            if self.overlay_state.pane_identify_hide_time.is_some() {
+                self.tab_manager
+                    .active_tab()
+                    .and_then(|tab| tab.pane_manager())
+                    .map(|pm| {
+                        pm.all_panes()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, pane)| (i, pane.bounds))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+        // Capture demote state snapshot for overlay rendering inside the egui closure.
+        // This must happen before the closure borrows `*self`.
+        let demote_snapshot: super::types::DemoteSnapshot = match &self.pane_transfer_state {
+            super::super::tab_ops::pane_transfer::PaneTransferState::Idle => {
+                super::types::DemoteSnapshot::Idle
+            }
+            super::super::tab_ops::pane_transfer::PaneTransferState::DemotePickTab { .. } => {
+                super::types::DemoteSnapshot::PickTab
+            }
+            super::super::tab_ops::pane_transfer::PaneTransferState::DemotePickPane { .. } => {
+                super::types::DemoteSnapshot::PickPane
+            }
+            super::super::tab_ops::pane_transfer::PaneTransferState::DemoteChooseDirection {
+                source_tab_id,
+                target_tab_id,
+                target_pane_id,
+            } => super::types::DemoteSnapshot::ChooseDirection {
+                source_tab_id: *source_tab_id,
+                target_tab_id: *target_tab_id,
+                target_pane_id: *target_pane_id,
+            },
+        };
+
+        // Capture pane bounds for the demote direction overlay (if applicable)
+        let demote_pane_bounds: Option<crate::pane::PaneBounds> = match demote_snapshot {
+            super::types::DemoteSnapshot::ChooseDirection {
+                target_tab_id,
+                target_pane_id,
+                ..
+            } => self
+                .tab_manager
+                .get_tab(target_tab_id)
+                .and_then(|t| t.pane_manager())
+                .and_then(|pm| pm.get_pane(target_pane_id))
+                .map(|p| p.bounds),
+            _ => None,
+        };
+
+        // IME preedit overlay inputs, hoisted for the same reason as the demote snapshot above:
+        // the egui closure cannot read the renderer or the tab manager. Skipped entirely when no
+        // composition is in progress, so the common path costs one bool.
+        let ime_active = self.ime.is_composing();
+        let ime_preedit = if ime_active {
+            self.ime.preedit.clone()
+        } else {
+            String::new()
+        };
+        let ime_cell = if ime_active {
+            self.tab_manager
+                .active_tab()
+                .and_then(|tab| tab.active_cache().cursor_pos)
+        } else {
+            None
+        };
+        let ime_metrics = if ime_active {
+            self.renderer.as_ref().map(|renderer| {
+                (
+                    renderer.cell_width(),
+                    renderer.cell_height(),
+                    (renderer.content_offset_x(), renderer.content_offset_y()),
+                    renderer.scale_factor(),
+                )
+            })
+        } else {
+            None
+        };
+        let ime_colors = if ime_active {
+            let theme = self.config.load().load_theme();
+            (
+                egui::Color32::from_rgb(theme.foreground.r, theme.foreground.g, theme.foreground.b),
+                egui::Color32::from_rgb(theme.background.r, theme.background.g, theme.background.b),
+            )
+        } else {
+            (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
+        };
+
+        let result = if let Some(window) = self.window.as_ref() {
+            if let (Some(egui_ctx), Some(egui_state)) = (&self.egui.ctx, &mut self.egui.state) {
+                let mut raw_input = egui_state.take_egui_input(window);
+
+                // Inject pending events from menu accelerators (Cmd+V/C/A intercepted by muda)
+                raw_input.events.append(&mut self.egui.pending_events);
+
+                // When no modal UI overlay is visible, filter out Tab key events to prevent
+                // egui's default focus navigation from stealing Tab/Shift+Tab from the terminal.
+                if !any_modal_visible {
+                    raw_input.events.retain(|e| {
+                        !matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Tab,
+                                ..
+                            }
+                        )
+                    });
+                }
+
+                let egui_output = egui_ctx.run_ui(raw_input, |ctx| {
+                    // FPS overlay (top-right corner)
+                    egui_overlays::render_fps_overlay(ctx, show_fps, fps_value, frame_time_ms);
+
+                    // Resize overlay (centered)
+                    egui_overlays::render_resize_overlay(
+                        ctx,
+                        self.overlay_state.resize_overlay_visible,
+                        self.overlay_state.resize_dimensions,
+                    );
+
+                    // IME preedit, drawn inline on the cursor cell while a composition is open.
+                    if let Some((cell_width, cell_height, content_offset, scale)) = ime_metrics {
+                        egui_overlays::render_ime_preedit(
+                            ctx,
+                            &ime_preedit,
+                            ime_cell,
+                            cell_width,
+                            cell_height,
+                            content_offset,
+                            scale,
+                            ime_colors.0,
+                            ime_colors.1,
+                        );
+                    }
+
+                    // Copy mode status bar overlay (bottom-left)
+                    {
+                        let mode_text = if self.copy_mode.is_searching {
+                            "SEARCH"
+                        } else {
+                            match self.copy_mode.visual_mode {
+                                crate::copy_mode::VisualMode::None => "COPY",
+                                crate::copy_mode::VisualMode::Char => "VISUAL",
+                                crate::copy_mode::VisualMode::Line => "V-LINE",
+                                crate::copy_mode::VisualMode::Block => "V-BLOCK",
+                            }
+                        };
+                        let status = self.copy_mode.status_text();
+                        egui_overlays::render_copy_mode_status_bar(
+                            ctx,
+                            self.copy_mode.active,
+                            self.config.load().copy_mode.copy_mode_show_status,
+                            self.copy_mode.is_searching,
+                            self.copy_mode.visual_mode,
+                            mode_text,
+                            &status,
+                        );
+                    }
+
+                    // Toast notification (top-center)
+                    egui_overlays::render_toast_overlay(
+                        ctx,
+                        self.overlay_state.toast_message.as_deref(),
+                    );
+
+                    // Demote pick-mode overlays (toast hints + direction-choice dialog)
+                    match demote_snapshot {
+                        super::types::DemoteSnapshot::PickTab => {
+                            egui_overlays::render_toast_overlay(
+                                ctx,
+                                Some("Click a tab to merge into (Esc to cancel)"),
+                            );
+                        }
+                        super::types::DemoteSnapshot::PickPane => {
+                            egui_overlays::render_toast_overlay(
+                                ctx,
+                                Some("Click a pane to merge into (Esc to cancel)"),
+                            );
+                        }
+                        // QA-004: destructure ChooseDirection ONCE here so the click
+                        // handlers below can reference the bound IDs directly. The outer
+                        // match guarantees the variant, so there is no failing variant
+                        // check inside the closures — a wrong variant skips this arm
+                        // entirely (falling through to PickTab/PickPane/Idle) instead
+                        // of panicking mid-frame via `unreachable!()`.
+                        super::types::DemoteSnapshot::ChooseDirection {
+                            source_tab_id,
+                            target_tab_id,
+                            target_pane_id,
+                        } => {
+                            if let Some(bounds) = demote_pane_bounds {
+                                let center_x = bounds.x + bounds.width / 2.0;
+                                let center_y = bounds.y + bounds.height / 2.0;
+
+                                egui::Area::new(egui::Id::new("demote_direction_overlay"))
+                                    .fixed_pos(egui::pos2(center_x - 100.0, center_y - 30.0))
+                                    .order(egui::Order::Foreground)
+                                    .show(ctx, |ui| {
+                                        egui::Frame::NONE
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                30, 30, 30, 240,
+                                            ))
+                                            .inner_margin(egui::Margin::symmetric(16, 10))
+                                            .corner_radius(8.0)
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgb(80, 80, 80),
+                                            ))
+                                            .show(ui, |ui| {
+                                                ui.style_mut().visuals.override_text_color =
+                                                    Some(egui::Color32::from_rgb(255, 255, 255));
+                                                ui.vertical_centered(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("Split direction:")
+                                                            .size(14.0),
+                                                    );
+                                                    ui.add_space(4.0);
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .button(
+                                                                egui::RichText::new("Horizontal")
+                                                                    .size(14.0),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            actions.demote =
+                                                                super::types::DemoteAction::Execute {
+                                                                    source_tab_id,
+                                                                    target_tab_id,
+                                                                    target_pane_id,
+                                                                    direction: crate::pane::SplitDirection::Horizontal,
+                                                                };
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                egui::RichText::new("Vertical")
+                                                                    .size(14.0),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            actions.demote =
+                                                                super::types::DemoteAction::Execute {
+                                                                    source_tab_id,
+                                                                    target_tab_id,
+                                                                    target_pane_id,
+                                                                    direction: crate::pane::SplitDirection::Vertical,
+                                                                };
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                    });
+                            }
+                        }
+                        super::types::DemoteSnapshot::Idle => {}
+                    }
+
+                    // Scrollbar mark tooltip (near mouse pointer)
+                    egui_overlays::render_scrollbar_mark_tooltip(ctx, hovered_mark.as_ref());
+
+                    // Render tab bar if visible (action handled after closure)
+                    let tab_bar_right_reserved = if self.overlay_ui.ai_inspector.open {
+                        self.overlay_ui.ai_inspector.consumed_width()
+                    } else {
+                        0.0
+                    };
+                    // Populate move-tab context so the right-click context
+                    // menu has fresh state. Values captured before the closure
+                    // to avoid borrowing `self` for `is_gateway_active()`
+                    // while the closure already uniquely borrows `*self`.
+                    self.tab_bar_ui.set_move_tab_context(
+                        move_gateway_active,
+                        move_tab_count,
+                        move_candidates.clone(),
+                        context_tab_has_multiple_panes,
+                    );
+                    actions.tab_action = self.tab_bar_ui.render(
+                        ctx,
+                        &self.tab_manager,
+                        &self.config.load(),
+                        &self.overlay_ui.profile_manager,
+                        tab_bar_right_reserved,
+                    );
+
+                    // Render tmux status bar if connected
+                    self.overlay_ui.tmux_status_bar_ui.render(
+                        ctx,
+                        &self.config.load(),
+                        self.tmux_state.tmux_session.as_ref(),
+                        self.tmux_state.tmux_session_name.as_deref(),
+                    );
+
+                    // Render custom status bar
+                    if let Some(ref session_vars) = status_bar_session_vars {
+                        let (_bar_height, status_bar_action) = self.status_bar_ui.render(
+                            ctx,
+                            &self.config.load(),
+                            session_vars,
+                            self.is_fullscreen,
+                        );
+                        if status_bar_action
+                            == Some(crate::status_bar::StatusBarAction::ShowUpdateDialog)
+                        {
+                            self.update_state.show_dialog = true;
+                        }
+                    }
+
+                    // Show help UI
+                    self.overlay_ui.help_ui.show(ctx);
+
+                    // Show clipboard history UI and collect action
+                    actions.clipboard = self.overlay_ui.clipboard_history_ui.show(ctx);
+
+                    // Show command history UI and collect action
+                    actions.command_history = self.overlay_ui.command_history_ui.show(ctx);
+
+                    // Show paste special UI and collect action
+                    actions.paste_special = self.overlay_ui.paste_special_ui.show(ctx);
+
+                    // Show search UI and collect action
+                    actions.search =
+                        self.overlay_ui
+                            .search_ui
+                            .show(ctx, visible_lines, scrollback_len);
+
+                    // Show AI Inspector panel and collect action
+                    actions.inspector = self
+                        .overlay_ui
+                        .ai_inspector
+                        .show(ctx, &self.agent_state.available_agents);
+
+                    // Show tmux session picker UI and collect action
+                    let tmux_path = self.config.load().resolve_tmux_path();
+                    actions.session_picker =
+                        self.overlay_ui.tmux_session_picker_ui.show(ctx, &tmux_path);
+
+                    // Show shader install dialog if visible
+                    actions.shader_install = self.overlay_ui.shader_install_ui.show(ctx);
+
+                    // Show integrations welcome dialog if visible
+                    actions.integrations = self.overlay_ui.integrations_ui.show(ctx);
+
+                    // Show close confirmation dialog if visible
+                    actions.close_confirm = self.overlay_ui.close_confirmation_ui.show(ctx);
+
+                    // Show quit confirmation dialog if visible
+                    actions.quit_confirm = self.overlay_ui.quit_confirmation_ui.show(ctx);
+
+                    // Show remote shell install dialog if visible
+                    actions.remote_install = self.overlay_ui.remote_shell_install_ui.show(ctx);
+
+                    // Show SSH Quick Connect dialog if visible
+                    actions.ssh_connect = self.overlay_ui.ssh_connect_ui.show(ctx);
+
+                    // Render update dialog overlay
+                    if self.update_state.show_dialog {
+                        // Poll for update install completion
+                        if let Some(ref rx) = self.update_state.install_receiver
+                            && let Ok(result) = rx.try_recv()
+                        {
+                            match result {
+                                Ok(update_result) => {
+                                    self.update_state.install_status = Some(format!(
+                                        "Updated to v{}! Restart par-term to use the new version.",
+                                        update_result.new_version
+                                    ));
+                                    self.update_state.installing = false;
+                                    self.status_bar_ui.update_available_version = None;
+                                }
+                                Err(e) => {
+                                    self.update_state.install_status =
+                                        Some(format!("Update failed: {}", e));
+                                    self.update_state.installing = false;
+                                }
+                            }
+                            self.update_state.install_receiver = None;
+                        }
+
+                        if let Some(ref update_result) = self.update_state.last_result {
+                            let dialog_action = crate::update_dialog::render(
+                                ctx,
+                                update_result,
+                                env!("CARGO_PKG_VERSION"),
+                                self.update_state.installation_type,
+                                self.update_state.installing,
+                                self.update_state.install_status.as_deref(),
+                            );
+                            match dialog_action {
+                                crate::update_dialog::UpdateDialogAction::Dismiss => {
+                                    if !self.update_state.installing {
+                                        self.update_state.show_dialog = false;
+                                        self.update_state.install_status = None;
+                                    }
+                                }
+                                crate::update_dialog::UpdateDialogAction::SkipVersion(v) => {
+                                    self.config.rcu(|old| {
+                                        let mut new = (**old).clone();
+                                        new.updates.skipped_version = Some(v.clone());
+                                        std::sync::Arc::new(new)
+                                    });
+                                    self.update_state.show_dialog = false;
+                                    self.status_bar_ui.update_available_version = None;
+                                    self.update_state.install_status = None;
+                                    actions.save_config = true;
+                                }
+                                crate::update_dialog::UpdateDialogAction::InstallUpdate(v) => {
+                                    if !self.update_state.installing {
+                                        self.update_state.installing = true;
+                                        self.update_state.install_status =
+                                            Some("Downloading update...".to_string());
+                                        let (tx, rx) = std::sync::mpsc::channel();
+                                        self.update_state.install_receiver = Some(rx);
+                                        let version = v.clone();
+                                        let current_version = crate::VERSION.to_string();
+                                        std::thread::spawn(move || {
+                                            let result = par_term_update::self_updater::perform_update(
+                                                &version,
+                                                &current_version,
+                                            );
+                                            let _ = tx.send(result);
+                                        });
+                                    }
+                                    // Don't close dialog while installing
+                                }
+                                crate::update_dialog::UpdateDialogAction::None => {}
+                            }
+                        } else {
+                            self.update_state.show_dialog = false;
+                        }
+                    }
+
+                    // Render profile drawer (right side panel).
+                    // Pass the custom status bar height as a bottom margin so the
+                    // panel does not extend behind the floating Area-based status bar.
+                    let profile_drawer_bottom_margin =
+                        if self.config.load().status_bar.status_bar_position
+                            == par_term_config::StatusBarPosition::Bottom
+                        {
+                            badge_custom_sb_height
+                        } else {
+                            0.0
+                        };
+                    actions.profile_drawer = self.overlay_ui.profile_drawer_ui.render(
+                        ctx,
+                        &self.overlay_ui.profile_manager,
+                        &self.config.load(),
+                        false, // profile modal is no longer in the terminal window
+                        profile_drawer_bottom_margin,
+                    );
+
+                    // Render progress bar overlay
+                    if let (Some(snap), Some(size)) = (progress_snapshot, window_size_for_badge) {
+                        let tab_count = self.tab_manager.visible_tab_count();
+                        let tb_height = self.tab_bar_ui.get_height(tab_count, &self.config.load());
+                        let (top_inset, bottom_inset) = match self.config.load().tabs.tab_bar_position {
+                            par_term_config::TabBarPosition::Top => (tb_height, 0.0),
+                            par_term_config::TabBarPosition::Bottom => (0.0, tb_height),
+                            par_term_config::TabBarPosition::Left => (0.0, 0.0),
+                        };
+                        render_progress_bars(
+                            ctx,
+                            snap,
+                            &self.config.load(),
+                            size.width as f32,
+                            size.height as f32,
+                            top_inset,
+                            bottom_inset,
+                        );
+                    }
+
+                    // Pane identify overlay (large index numbers centered on each pane)
+                    egui_overlays::render_pane_identify_overlay(ctx, &pane_identify_bounds);
+
+                    // Trigger action confirmation dialog (center modal, shown when pending_trigger_actions is non-empty)
+                    egui_overlays::render_trigger_prompt_dialog(
+                        ctx,
+                        &mut self.trigger_state,
+                        pending_action_target_note.as_deref(),
+                    );
+
+                    // Render file transfer progress overlay (bottom-right corner)
+                    crate::app::file_transfers::render_file_transfer_overlay(
+                        &self.file_transfer_state,
+                        ctx,
+                    );
+
+                    // Render badge overlay (top-right corner, offset by UI insets)
+                    if let (Some(badge), Some(size)) = (&badge_state, window_size_for_badge) {
+                        let tab_count = self.tab_manager.visible_tab_count();
+                        let tb_height = self.tab_bar_ui.get_height(tab_count, &self.config.load());
+
+                        let top_inset = match self.config.load().tabs.tab_bar_position {
+                            par_term_config::TabBarPosition::Top => tb_height,
+                            _ => 0.0,
+                        };
+                        let bottom_inset = match self.config.load().tabs.tab_bar_position {
+                            par_term_config::TabBarPosition::Bottom => tb_height,
+                            _ => 0.0,
+                        } + badge_tmux_sb_height
+                            + badge_custom_sb_height;
+                        let scrollbar_inset = if show_scrollbar {
+                            self.config.load().scrollbar.scrollbar_width + 2.0
+                        } else {
+                            0.0
+                        };
+                        let right_inset = scrollbar_inset
+                            + if self.overlay_ui.ai_inspector.open {
+                                self.overlay_ui.ai_inspector.consumed_width()
+                            } else {
+                                0.0
+                            };
+
+                        let insets = BadgeInsets {
+                            top: top_inset,
+                            bottom: bottom_inset,
+                            right: right_inset,
+                        };
+                        render_badge(ctx, badge, size.width as f32, size.height as f32, &insets);
+                    }
+                });
+
+                // Handle egui platform output (clipboard, cursor changes, etc.)
+                egui_state.handle_platform_output(window, egui_output.platform_output.clone());
+
+                Some((egui_output, egui_ctx.clone()))
+            } else {
+                // egui context/state not yet initialised for this window.
+                None
+            }
+        } else {
+            // Window not yet created; skip egui rendering this frame.
+            crate::debug_error!("RENDER", "egui render skipped: window is None");
+            None
+        };
+
+        // Mark egui as initialized after first ctx.run_ui() - makes is_using_pointer() reliable
+        if !self.egui.initialized && result.is_some() {
+            self.egui.initialized = true;
+        }
+
+        let debug_egui_time = egui_start.elapsed();
+        self.debug.last_egui_time = debug_egui_time;
+
+        result
+    }
+}
+
+/// Helper to get the current scroll offset from the active tab.
+pub(super) fn scroll_offset_from_tab(tab_manager: &crate::tab::TabManager) -> usize {
+    tab_manager
+        .active_tab()
+        .map(|t| t.active_scroll_state().offset)
+        .unwrap_or(0)
+}

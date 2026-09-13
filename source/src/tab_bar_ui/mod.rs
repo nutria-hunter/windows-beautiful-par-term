@@ -1,0 +1,472 @@
+//! Tab bar UI using egui
+//!
+//! Provides a visual tab bar for switching between terminal tabs.
+//!
+//! ## Module layout
+//!
+//! - `state`: `TabBarUI` struct definition and constructor.
+//! - `horizontal`: Horizontal layout rendering (`render_horizontal`).
+//! - `context_menu`: Right-click context menu (rename, color, icon, duplicate, close).
+//! - `drag_drop`: Drag-and-drop state and rendering for tab reordering.
+//! - `profile_menu`: Profile selection popup for the new-tab chevron button.
+//! - `tab_rendering`: Vertical tab rendering and shared params/helpers.
+//! - `tab_painter`: Horizontal per-tab painting (`render_tab_with_width`).
+//! - `title_utils`: HTML title parsing, emoji sanitization, and styled segment rendering.
+
+mod context_menu;
+mod caption_buttons;
+mod drag_drop;
+mod horizontal;
+mod profile_menu;
+mod state;
+mod tab_painter;
+mod tab_rendering;
+mod title_utils;
+
+// Re-export TabBarUI so external callers are unaffected.
+pub use state::TabBarUI;
+
+use crate::config::{Config, TabBarMode, TabBarPosition};
+use crate::tab::{TabId, TabManager};
+use crate::ui_constants::{TAB_DRAW_SHRINK_Y, TAB_SPACING};
+use tab_rendering::TabRenderParams;
+
+/// Width reserved for the profile chevron (▾) button in the tab bar split button.
+/// Accounts for the button min_size (14px) plus egui button frame padding (~4px each side).
+pub(super) const CHEVRON_RESERVED: f32 = 28.0;
+
+/// Actions that can be triggered from the tab bar
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabBarAction {
+    /// No action
+    None,
+    /// Switch to a specific tab
+    SwitchTo(TabId),
+    /// Close a specific tab
+    Close(TabId),
+    /// Create a new tab
+    NewTab,
+    /// Create a new tab from a specific profile
+    NewTabWithProfile(crate::profile::ProfileId),
+    /// Reorder a tab to a new position
+    Reorder(TabId, usize),
+    /// Set custom color for a tab
+    SetColor(TabId, [u8; 3]),
+    /// Clear custom color for a tab (revert to default)
+    ClearColor(TabId),
+    /// Duplicate a specific tab
+    Duplicate(TabId),
+    /// Rename a specific tab
+    RenameTab(TabId, String),
+    /// Set custom icon for a tab (None = clear)
+    SetTabIcon(TabId, Option<String>),
+    /// Toggle the AI assistant panel
+    ToggleAssistantPanel,
+    /// Move a tab to a brand-new par-term window.
+    MoveTabToNewWindow(TabId),
+    /// Move a tab into an existing par-term window.
+    MoveTabToExistingWindow(TabId, winit::window::WindowId),
+    /// Promote the focused pane of this tab to a new tab
+    PromotePaneToTab(TabId),
+    /// Start demote pick mode for this tab
+    DemoteTabToPane(TabId),
+    /// Minimize the window (tab bar window controls)
+    MinimizeWindow,
+    /// Toggle maximize / restore for the window (tab bar window controls)
+    ToggleMaximizeWindow,
+    /// Close the window (tab bar window controls)
+    CloseWindow,
+}
+
+impl TabBarUI {
+    /// Check if tab bar should be visible
+    pub fn should_show(&self, tab_count: usize, mode: TabBarMode) -> bool {
+        match mode {
+            TabBarMode::Always => true,
+            TabBarMode::WhenMultiple => tab_count > 1,
+            TabBarMode::Never => false,
+        }
+    }
+
+    /// Check if a drag operation is in progress
+    pub fn is_dragging(&self) -> bool {
+        self.drag_in_progress
+    }
+
+    /// Render the tab bar and return any action triggered
+    pub fn render(
+        &mut self,
+        ctx: &mut egui::Ui,
+        tabs: &TabManager,
+        config: &Config,
+        profiles: &crate::profile::ProfileManager,
+        right_reserved_width: f32,
+    ) -> TabBarAction {
+        let tab_count = tabs.visible_tab_count();
+
+        // Don't show if configured to hide
+        if !self.should_show(tab_count, config.tabs.tab_bar_mode) {
+            // The in-app menu is drawn inside this bar, so hiding the bar makes
+            // the menu unreachable — including from a `toggle_menu` keybinding,
+            // which only takes effect where the menu is drawn. Users who hide
+            // the tab bar need keybindings for the commands themselves.
+            self.app_menu.hide(ctx.ctx());
+            return TabBarAction::None;
+        }
+
+        // Only the horizontal strip acts as a drag handle; forget any stale region
+        // so a hidden or left-docked bar cannot be grabbed.
+        crate::app::window_manager::titlebar_drag::clear_region();
+        match config.tabs.tab_bar_position {
+            TabBarPosition::Left => self.render_vertical(ctx, tabs, config, profiles),
+            _ => self.render_horizontal(ctx, tabs, config, profiles, right_reserved_width),
+        }
+    }
+
+    /// Render the tab bar in vertical layout (left side panel)
+    fn render_vertical(
+        &mut self,
+        ctx: &mut egui::Ui,
+        tabs: &TabManager,
+        config: &Config,
+        profiles: &crate::profile::ProfileManager,
+    ) -> TabBarAction {
+        let tab_count = tabs.visible_tab_count();
+        let visible_tabs = tabs.visible_tabs();
+
+        self.tab_rects.clear();
+
+        let mut action = TabBarAction::None;
+        let active_tab_id = tabs.active_tab_id();
+
+        let bar_bg = config.tab_colors.tab_bar_background;
+        let bar_alpha = (config.tab_colors.tab_bar_bg_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let tab_spacing = TAB_SPACING;
+        let tab_height = config.tabs.tab_bar_height; // Reuse height config for per-tab row height
+
+        egui::Panel::left("tab_bar")
+            .exact_size(config.tabs.tab_bar_width)
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(
+                bar_bg[0],
+                bar_bg[1],
+                bar_bg[2],
+                bar_alpha,
+            )))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, tab_spacing);
+
+                            // In-app menu — top of the panel, above the new-tab button
+                            if crate::menu::AppMenuUi::enabled() {
+                                self.app_menu.show(
+                                    ui,
+                                    profiles,
+                                    tab_height - TAB_DRAW_SHRINK_Y * 2.0,
+                                );
+                            }
+
+                            // New tab split button — rendered first (top of the panel)
+                            ui.horizontal(|ui| {
+                                // Zero spacing between + and ▾
+                                ui.spacing_mut().item_spacing.x = 0.0;
+
+                                let show_chevron_v = !profiles.is_empty()
+                                    || config.ai_inspector.ai_inspector_enabled;
+                                let chevron_space = if show_chevron_v {
+                                    CHEVRON_RESERVED
+                                } else {
+                                    0.0
+                                };
+                                let plus_btn = ui.add(
+                                    egui::Button::new("+")
+                                        .min_size(egui::vec2(
+                                            ui.available_width() - chevron_space,
+                                            tab_height - TAB_DRAW_SHRINK_Y * 2.0,
+                                        ))
+                                        .fill(egui::Color32::TRANSPARENT),
+                                );
+                                if plus_btn.clicked_by(egui::PointerButton::Primary) {
+                                    action = TabBarAction::NewTab;
+                                }
+                                if plus_btn.hovered() {
+                                    #[cfg(target_os = "macos")]
+                                    plus_btn.on_hover_text("New Tab (Cmd+T)");
+                                    #[cfg(not(target_os = "macos"))]
+                                    plus_btn.on_hover_text("New Tab (Ctrl+Shift+T)");
+                                }
+
+                                if show_chevron_v {
+                                    let chevron_btn = ui.add(
+                                        egui::Button::new("⏷")
+                                            .min_size(egui::vec2(
+                                                CHEVRON_RESERVED / 2.0,
+                                                tab_height - TAB_DRAW_SHRINK_Y * 2.0,
+                                            ))
+                                            .fill(egui::Color32::TRANSPARENT),
+                                    );
+                                    if chevron_btn.clicked_by(egui::PointerButton::Primary) {
+                                        self.show_new_tab_profile_menu =
+                                            !self.show_new_tab_profile_menu;
+                                    }
+                                    if chevron_btn.hovered() {
+                                        chevron_btn.on_hover_text("New tab from profile");
+                                    }
+                                }
+                            });
+
+                            for (index, tab) in visible_tabs.iter().enumerate() {
+                                let is_active = Some(tab.id) == active_tab_id;
+                                let is_bell_active = tab.is_bell_active();
+                                let (tab_action, tab_rect) = self.render_vertical_tab(
+                                    ui,
+                                    TabRenderParams {
+                                        id: tab.id,
+                                        index,
+                                        title: &tab.title,
+                                        profile_icon: tab
+                                            .custom_icon
+                                            .as_deref()
+                                            .or(tab.profile.profile_icon.as_deref()),
+                                        custom_icon: tab.custom_icon.as_deref(),
+                                        is_active,
+                                        has_activity: tab.activity.has_activity,
+                                        is_bell_active,
+                                        custom_color: tab.custom_color,
+                                        config,
+                                        tab_size: tab_height,
+                                        tab_count,
+                                    },
+                                );
+                                self.tab_rects.push((tab.id, tab_rect));
+
+                                if tab_action != TabBarAction::None {
+                                    action = tab_action;
+                                }
+                            }
+                        });
+                    });
+
+                // Handle drag feedback for vertical mode
+                if self.drag_in_progress {
+                    let drag_action = self.render_vertical_drag_feedback(ui, config);
+                    if drag_action != TabBarAction::None {
+                        action = drag_action;
+                    }
+                }
+            });
+
+        // Render floating ghost tab during drag
+        if self.drag_in_progress && self.dragging_tab.is_some() {
+            self.render_ghost_tab(ctx, config);
+        }
+
+        // Handle context menu
+        if let Some(context_tab_id) = self.context_menu_tab {
+            let menu_action = self.render_context_menu(ctx, context_tab_id);
+            if menu_action != TabBarAction::None {
+                action = menu_action;
+            }
+        }
+
+        // Render new-tab profile menu if open
+        let menu_action = self.render_new_tab_profile_menu(ctx, profiles, config);
+        if menu_action != TabBarAction::None {
+            action = menu_action;
+        }
+
+        action
+    }
+
+    /// Get the tab bar height (0 if hidden or if position is Left)
+    pub fn get_height(&self, tab_count: usize, config: &Config) -> f32 {
+        if self.should_show(tab_count, config.tabs.tab_bar_mode)
+            && config.tabs.tab_bar_position.is_horizontal()
+        {
+            config.tabs.tab_bar_height
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the tab bar width (non-zero only for Left position, 0 if hidden)
+    pub fn get_width(&self, tab_count: usize, config: &Config) -> f32 {
+        if self.should_show(tab_count, config.tabs.tab_bar_mode)
+            && config.tabs.tab_bar_position == TabBarPosition::Left
+        {
+            config.tabs.tab_bar_width
+        } else {
+            0.0
+        }
+    }
+
+    /// Check if the context menu is currently open
+    pub fn is_context_menu_open(&self) -> bool {
+        self.context_menu_tab.is_some()
+    }
+
+    /// Check if the in-app menu's drop-down is open.
+    ///
+    /// True only on platforms that draw it (Linux/BSD, or a forced-on run —
+    /// see [`crate::menu::AppMenuUi::enabled`]). While it is open, keyboard
+    /// input should be routed to egui rather than the terminal.
+    pub fn is_app_menu_open(&self) -> bool {
+        self.app_menu.is_open()
+    }
+
+    /// Return the tab ID at the given egui logical-pixel position, using the
+    /// tab rects cached from the last render frame.  Returns `None` if the
+    /// position doesn't fall inside any rendered tab.
+    pub fn tab_at_logical_pos(&self, pos: egui::Pos2) -> Option<TabId> {
+        for (id, rect) in &self.tab_rects {
+            if rect.contains(pos) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// Check if the tab rename text field is active
+    pub fn is_renaming(&self) -> bool {
+        self.renaming_tab && self.context_menu_tab.is_some()
+    }
+
+    /// Calculate the drop target insert index for a horizontal drag given a pointer x position.
+    ///
+    /// Returns `None` if the drop would be a no-op (same position as source), or
+    /// `Some(insert_index)` for a valid insertion point.
+    ///
+    /// This is a pure helper that can be tested without egui rendering.
+    pub fn calculate_drop_target_horizontal(
+        tab_rects: &[(TabId, egui::Rect)],
+        drag_source_index: Option<usize>,
+        pointer_x: f32,
+    ) -> Option<usize> {
+        let mut insert_index = tab_rects.len();
+        for (i, (_id, rect)) in tab_rects.iter().enumerate() {
+            if pointer_x < rect.center().x {
+                insert_index = i;
+                break;
+            }
+        }
+        let is_noop =
+            drag_source_index.is_some_and(|src| insert_index == src || insert_index == src + 1);
+        if is_noop { None } else { Some(insert_index) }
+    }
+
+    /// Convert an insertion index to an effective target index, accounting for source removal.
+    ///
+    /// When a tab is removed from `source_index` and re-inserted at `insert_index`, indices
+    /// after the source shift down by one.  This helper applies that adjustment.
+    pub fn insertion_to_target_index(
+        insert_index: usize,
+        drag_source_index: Option<usize>,
+    ) -> usize {
+        if let Some(src) = drag_source_index {
+            if insert_index > src {
+                insert_index - 1
+            } else {
+                insert_index
+            }
+        } else {
+            insert_index
+        }
+    }
+
+    /// Calculate the x origin for horizontally scrolled tab content.
+    ///
+    /// A larger scroll offset reveals tabs further to the right, so the content
+    /// itself must move left inside the clipped tab area.
+    pub fn horizontal_tab_content_origin_x(tab_area_left: f32, scroll_offset: f32) -> f32 {
+        tab_area_left - scroll_offset.max(0.0)
+    }
+
+    /// Set drag state directly; used by integration tests to exercise state transitions
+    /// without requiring a live egui render loop.
+    pub fn test_set_drag_state(&mut self, tab_id: Option<TabId>, in_progress: bool) {
+        self.drag_in_progress = in_progress;
+        self.dragging_tab = tab_id;
+    }
+
+    /// Set the drop target index directly; used by integration tests.
+    pub fn test_set_drop_target(&mut self, index: Option<usize>) {
+        self.drop_target_index = index;
+    }
+
+    /// Get the current drop target index; used by integration tests.
+    pub fn test_drop_target_index(&self) -> Option<usize> {
+        self.drop_target_index
+    }
+
+    /// Get the id of the tab currently being dragged; used by integration tests.
+    pub fn test_dragging_tab(&self) -> Option<TabId> {
+        self.dragging_tab
+    }
+
+    /// Open the context menu for a specific tab; used by integration tests.
+    pub fn test_open_context_menu(&mut self, tab_id: TabId) {
+        self.context_menu_tab = Some(tab_id);
+        self.context_menu_opened_frame = 0;
+        self.renaming_tab = false;
+        self.picking_icon = false;
+    }
+
+    /// Close the context menu; used by integration tests.
+    pub fn test_close_context_menu(&mut self) {
+        self.context_menu_tab = None;
+        self.renaming_tab = false;
+        self.picking_icon = false;
+    }
+
+    /// Get the context menu tab id; used by integration tests.
+    pub fn test_context_menu_tab(&self) -> Option<TabId> {
+        self.context_menu_tab
+    }
+
+    /// Get the tab ID for which the context menu is currently open, if any.
+    pub fn context_menu_tab_id(&self) -> Option<TabId> {
+        self.context_menu_tab
+    }
+
+    /// Set rename mode active/inactive; used by integration tests.
+    pub fn test_set_renaming(&mut self, value: bool) {
+        self.renaming_tab = value;
+    }
+
+    /// Set cached tab rects directly; used by integration tests to exercise
+    /// `tab_at_logical_pos` without requiring a live egui render pass.
+    pub fn test_set_tab_rects(&mut self, rects: Vec<(TabId, egui::Rect)>) {
+        self.tab_rects = rects;
+    }
+
+    /// Set horizontal scroll state directly for integration tests.
+    pub fn test_set_horizontal_scroll_state(&mut self, needs_scroll: bool, scroll_offset: f32) {
+        self.needs_horizontal_scroll = needs_scroll;
+        self.scroll_offset = scroll_offset;
+    }
+
+    /// Get the current horizontal scroll offset for integration tests.
+    pub fn test_scroll_offset(&self) -> f32 {
+        self.scroll_offset
+    }
+
+    /// Update the move-tab context shown in the right-click context menu.
+    /// Must be called each frame *before* `render()` so the context menu has
+    /// fresh state.
+    pub fn set_move_tab_context(
+        &mut self,
+        gateway_active: bool,
+        tab_count: usize,
+        candidates: Vec<(winit::window::WindowId, String)>,
+        context_tab_has_multiple_panes: bool,
+    ) {
+        self.move_gateway_active = gateway_active;
+        self.move_source_tab_count = tab_count;
+        self.move_candidates = candidates;
+        self.tab_has_multiple_panes = context_tab_has_multiple_panes;
+    }
+}

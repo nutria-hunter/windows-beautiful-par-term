@@ -1,0 +1,678 @@
+//! Keyboard event handler and key-shortcut sub-handlers.
+//!
+//! This module handles all keyboard input routing:
+//! - `handle_key_event`: main key dispatch entry point (this file)
+//! - `scroll`: PageUp/PageDown, Home/End, mark navigation
+//! - `config_reload`: F5 config reload + `reload_config`
+//! - `clipboard`: clipboard history, paste special, `paste_text`
+//! - `command_history`: Cmd/Ctrl+R command history UI
+//! - `search`: Cmd/Ctrl+F search UI
+//! - `ui_toggles`: AI inspector (Assistant panel) toggle
+//! - `utility`: font size, clear scrollback, cursor style
+//! - `tabs`: new/close/navigate/move/number-switch tab shortcuts
+//! - `profiles`: per-profile hotkeys and shortcut string building
+
+pub(crate) mod claims;
+mod clipboard;
+mod command_history;
+mod config_reload;
+mod profiles;
+mod scroll;
+mod search;
+mod tabs;
+mod ui_toggles;
+mod utility;
+
+#[cfg(test)]
+mod chord_tests;
+
+use crate::app::window_state::WindowState;
+use std::sync::Arc;
+use winit::event::ElementState;
+use winit::event::KeyEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::keyboard::{Key, NamedKey};
+
+/// One shortcut layer: inspects a key event and returns `true` if it consumed it.
+pub(super) type KeyLayer = fn(&mut WindowState, &KeyEvent) -> bool;
+
+/// Shortcut layers in precedence order, as consulted by `handle_key_event`.
+///
+/// This is **ordered dispatch, not a lookup table**: each layer decides for
+/// itself whether the key is its own, so an earlier layer can pre-empt a later
+/// one for the same chord. Reordering entries changes which shortcut wins.
+/// `dispatch_tests::key_layer_precedence_is_unchanged` pins the order so a
+/// reorder has to be deliberate rather than incidental.
+///
+/// What each layer claims is declared as data in [`claims::LAYER_CLAIMS`], which
+/// is what lets `chord_tests` answer "who gets this chord first?" without
+/// running the chain.
+///
+/// Two further layers — `handle_utility_shortcuts` and `handle_tab_shortcuts` —
+/// continue this chain immediately after the last entry here but take the
+/// `ActiveEventLoop`, so they are invoked directly in `handle_key_event`.
+pub(super) static KEY_LAYERS: &[(&str, KeyLayer)] = &[
+    // Scroll navigation (PageUp/PageDown, Home/End, mark navigation)
+    ("scroll_keys", WindowState::handle_scroll_keys),
+    // Config reload (F5)
+    ("config_reload", WindowState::handle_config_reload),
+    // Clipboard history (Ctrl+Shift+H)
+    (
+        "clipboard_history",
+        WindowState::handle_clipboard_history_keys,
+    ),
+    // Command history (Ctrl+R / Cmd+R)
+    ("command_history", WindowState::handle_command_history_keys),
+    // Paste special UI
+    ("paste_special", WindowState::handle_paste_special_keys),
+    // Search (Cmd/Ctrl+F)
+    ("search", WindowState::handle_search_keys),
+    // Assistant panel toggle (Cmd+I / Ctrl+Shift+I)
+    (
+        "ai_inspector_toggle",
+        WindowState::handle_ai_inspector_toggle,
+    ),
+    // Fullscreen toggle (F11)
+    ("fullscreen_toggle", WindowState::handle_fullscreen_toggle),
+    // Help toggle (F1)
+    ("help_toggle", WindowState::handle_help_toggle),
+    // Settings toggle (F12)
+    ("settings_toggle", WindowState::handle_settings_toggle),
+    // Shader editor toggle (F11)
+    (
+        "shader_editor_toggle",
+        WindowState::handle_shader_editor_toggle,
+    ),
+    // FPS overlay toggle (F3)
+    ("fps_overlay_toggle", WindowState::handle_fps_overlay_toggle),
+    // Profile drawer toggle (Cmd+Shift+P / Ctrl+Shift+P)
+    (
+        "profile_drawer_toggle",
+        WindowState::handle_profile_drawer_toggle,
+    ),
+    // Per-profile hotkeys
+    ("profile_shortcuts", WindowState::handle_profile_shortcuts),
+];
+
+impl WindowState {
+    pub(crate) fn handle_key_event(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+        // Synthesize modifier state from physical key events.  On Windows, WM_NCACTIVATE can
+        // cause ModifiersChanged(empty) without a matching WM_KILLFOCUS, leaving modifier state
+        // permanently zeroed until the key is re-pressed.  Synthesizing here ensures the state
+        // is always in sync with actual key press/release events regardless of ModifiersChanged
+        // delivery reliability.
+        self.input_handler.sync_modifier_from_key_event(&event);
+
+        // Track Alt key press/release for Option key mode detection
+        self.input_handler.track_alt_key(&event);
+
+        // Check if any modal UI panel is visible that should block keyboard input
+        // Note: Settings are handled by standalone SettingsWindow, not embedded UI
+        // Note: Profile drawer does NOT block input - only modal dialogs do
+
+        // When UI panels are visible, block ALL keys from going to terminal
+        // except for UI control keys (Escape handled by egui, F1/F2/F3 for toggles)
+        if self.any_modal_ui_visible() {
+            let is_ui_control_key = matches!(
+                event.logical_key,
+                Key::Named(NamedKey::F1)
+                    | Key::Named(NamedKey::F2)
+                    | Key::Named(NamedKey::F3)
+                    | Key::Named(NamedKey::Escape)
+            );
+
+            if !is_ui_control_key {
+                return;
+            }
+        }
+
+        // Check if egui UI wants keyboard input (e.g., text fields, ComboBoxes)
+        if self.is_egui_using_keyboard() {
+            return;
+        }
+
+        // Copy mode intercepts all keyboard input
+        if self.is_copy_mode_active() {
+            if event.state == ElementState::Pressed {
+                self.handle_copy_mode_key(&event);
+            }
+            return;
+        }
+
+        // Check if active tab's shell has exited.
+        // Must check pane_manager panes (not tab.terminal) because after split pane
+        // session restore, tab.terminal may be orphaned/dead while restored panes
+        // have their own independent PTYs.
+        let is_running = if let Some(tab) = self.tab_manager.active_tab() {
+            // Tmux-managed tabs (gateway and display) have no local PTY process —
+            // panes are created via Pane::new_for_tmux() which does not spawn a shell,
+            // so PtySession::running is initialized to false. Never treat these as
+            // exited; the actual process is the remote tmux session.
+            if tab.tmux.tmux_gateway_active || tab.tmux.tmux_pane_id.is_some() {
+                true
+            } else if let Some(pm) = tab.pane_manager() {
+                pm.all_panes().iter().any(|p| p.is_running())
+            } else {
+                // Fallback: no pane manager, check tab.terminal directly
+                if let Ok(term) = tab.terminal.try_read() {
+                    term.is_running()
+                } else {
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
+        // If shell exited and user presses any key, exit the application
+        // (fallback behavior if close_on_shell_exit is false)
+        if !is_running && event.state == ElementState::Pressed {
+            log::info!("Shell has exited, closing terminal on keypress");
+            // Abort refresh tasks for all tabs
+            for tab in self.tab_manager.tabs_mut() {
+                if let Some(task) = tab.refresh_task.take() {
+                    task.abort();
+                }
+            }
+            log::info!("Refresh tasks aborted");
+            event_loop.exit();
+            return;
+        }
+
+        // Update last key press time for cursor blink reset and shader effects
+        if event.state == ElementState::Pressed {
+            self.cursor_anim.last_key_press = Some(std::time::Instant::now());
+            // Update shader key press time for visual effects (iTimeKeyPress uniform)
+            if let Some(renderer) = &mut self.renderer {
+                renderer.update_key_press_time();
+            }
+        }
+
+        // When custom-action prefix mode is armed, it owns the next key press.
+        // Swallow all follow-up key events while armed so they can't leak through
+        // to tmux shortcuts, user keybindings, or the terminal PTY.
+        if self.custom_action_prefix_state.is_active() {
+            crate::debug_info!(
+                "PREFIX_ACTION",
+                "Mode active, handling follow-up key={:?} state={:?}",
+                event.logical_key,
+                event.state
+            );
+            let handled = self.handle_custom_action_prefix_key(&event);
+            if handled || self.custom_action_prefix_state.is_active() {
+                return;
+            }
+        }
+
+        // Cancel pane transfer pick mode on Escape
+        if self.pane_transfer_state.is_active()
+            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+        {
+            self.cancel_pane_transfer();
+            return;
+        }
+
+        // Prefix systems must run before normal keybindings so the follow-up key
+        // is consumed by the two-stroke action instead of another shortcut.
+        if self.handle_tmux_prefix_key(&event) {
+            return;
+        }
+
+        if self.handle_custom_action_prefix_key(&event) {
+            return;
+        }
+
+        // Check user-defined keybindings first (before hardcoded shortcuts)
+        if event.state == ElementState::Pressed
+            && let Some(action) = self.keybinding_registry.lookup_with_options(
+                &event,
+                &self.input_handler.modifiers,
+                &self.config.load().input.modifier_remapping,
+                self.config.load().input.use_physical_keys,
+            )
+        {
+            crate::debug_info!(
+                "KEYBINDING",
+                "Keybinding matched: action={}, key={:?}, modifiers={:?}",
+                action,
+                event.logical_key,
+                self.input_handler.modifiers
+            );
+            // Clone to avoid borrow conflict
+            let action = action.to_string();
+            if self.execute_keybinding_action(&action) {
+                return; // Key was handled by user-defined keybinding
+            }
+        } else if event.state == ElementState::Pressed {
+            crate::debug_log!(
+                "KEYBINDING",
+                "No keybinding match for key={:?}, modifiers={:?}",
+                event.logical_key,
+                self.input_handler.modifiers
+            );
+        }
+
+        // Shortcut layers, in precedence order — the first layer to claim the
+        // key wins and the key never reaches the terminal.  See KEY_LAYERS.
+        for (_, layer) in KEY_LAYERS {
+            if layer(self, &event) {
+                return;
+            }
+        }
+
+        // These two layers continue the same precedence chain but need the
+        // event loop (they can exit the app / open windows), so they cannot
+        // live in KEY_LAYERS.  They run last, exactly as before.
+        //
+        // Check for utility shortcuts (clear scrollback, font size, etc.)
+        if self.handle_utility_shortcuts(&event, event_loop) {
+            return; // Key was handled by utility shortcut
+        }
+
+        // Check for tab shortcuts
+        if self.handle_tab_shortcuts(&event, event_loop) {
+            return; // Key was handled by tab shortcut
+        }
+
+        // Handle paste shortcuts with bracketed paste support
+        if event.state == ElementState::Pressed {
+            // macOS: Cmd+V, NamedKey::Paste
+            // Windows/Linux: Ctrl+Shift+V, Shift+Insert, NamedKey::Paste
+            // (Ctrl+V is "literal next" in terminals, must not be intercepted)
+            #[cfg(not(target_os = "macos"))]
+            let is_paste = {
+                let ctrl = self.input_handler.modifiers.state().control_key();
+                let shift = self.input_handler.modifiers.state().shift_key();
+                matches!(event.logical_key, Key::Named(NamedKey::Paste))
+                    || (ctrl
+                        && shift
+                        && matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("v")))
+                    || (shift && matches!(event.logical_key, Key::Named(NamedKey::Insert)))
+            };
+
+            #[cfg(target_os = "macos")]
+            let is_paste = {
+                let cmd = self.input_handler.modifiers.state().super_key();
+                matches!(event.logical_key, Key::Named(NamedKey::Paste))
+                    || (cmd
+                        && matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("v")))
+            };
+
+            if is_paste {
+                if let Some(text) = self.input_handler.paste_from_clipboard() {
+                    let text = crate::paste_transform::sanitize_paste_content(&text);
+                    log::debug!("Paste: got {} chars of text from clipboard", text.len());
+                    if let Some(tab) = self.tab_manager.active_tab() {
+                        let terminal_clone = Arc::clone(&tab.terminal);
+                        self.runtime.spawn(async move {
+                            let term = terminal_clone.read().await;
+                            let _ = term.paste(&text);
+                        });
+                    }
+                } else if self.input_handler.clipboard_has_image() {
+                    // Clipboard has an image but no text — forward as Ctrl+V (0x16) so
+                    // image-aware child processes (e.g., Claude Code) can handle image paste
+                    log::debug!(
+                        "Paste: clipboard has image but no text, forwarding Ctrl+V to terminal"
+                    );
+                    if let Some(tab) = self.tab_manager.active_tab() {
+                        let terminal_clone = Arc::clone(&tab.terminal);
+                        self.runtime.spawn(async move {
+                            let term = terminal_clone.read().await;
+                            if let Err(e) = term.write(b"\x16") {
+                                crate::debug_error!("INPUT", "PTY write failed (image paste): {e}");
+                            }
+                        });
+                    }
+                } else {
+                    log::debug!("Paste: clipboard has neither text nor image");
+                }
+                return;
+            }
+
+            // macOS: Cmd+C, NamedKey::Copy
+            // Windows/Linux: Ctrl+Shift+C, NamedKey::Copy
+            // (Ctrl+C is SIGINT in terminals, must not be intercepted)
+            #[cfg(target_os = "macos")]
+            let is_copy = {
+                let cmd = self.input_handler.modifiers.state().super_key();
+                matches!(event.logical_key, Key::Named(NamedKey::Copy))
+                    || (cmd
+                        && matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("c")))
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            let is_copy = {
+                let ctrl = self.input_handler.modifiers.state().control_key();
+                let shift = self.input_handler.modifiers.state().shift_key();
+                matches!(event.logical_key, Key::Named(NamedKey::Copy))
+                    || (ctrl
+                        && shift
+                        && matches!(event.logical_key, Key::Character(ref c) if c.eq_ignore_ascii_case("c")))
+            };
+
+            if is_copy {
+                if let Some(selected_text) = self.get_selected_text_for_copy() {
+                    if let Err(e) = self.input_handler.copy_to_clipboard(&selected_text) {
+                        log::error!("Failed to copy to clipboard: {}", e);
+                    } else {
+                        log::debug!("Copied {} chars via keyboard copy", selected_text.len());
+                    }
+                }
+                return;
+            }
+        }
+
+        // Clear selection on keyboard input (except for modifier-only keys and special keys handled above)
+        // Don't clear selection when pressing just modifier keys (Ctrl, Alt, Shift, Cmd)
+        let is_modifier_only = matches!(
+            event.logical_key,
+            Key::Named(
+                NamedKey::Control
+                    | NamedKey::Alt
+                    | NamedKey::Shift
+                    | NamedKey::Super
+                    | NamedKey::Meta
+            )
+        );
+
+        if event.state == ElementState::Pressed
+            && !is_modifier_only
+            && let Some(tab) = self.tab_manager.active_tab_mut()
+            && tab.selection_mouse().selection.is_some()
+        {
+            tab.selection_mouse_mut().selection = None;
+            self.request_redraw();
+        }
+
+        // Get terminal modes (if available).
+        //
+        // try_read: intentional — only reading terminal mode flags, no mutation needed.
+        // Multiple readers can hold the lock simultaneously, so this rarely blocks.
+        //
+        // Cache fallback: in release/LTO builds the renderer's per-frame `try_write`
+        // collides with this `try_read` often enough that the previous "fall back to
+        // (0, false, false)" behavior caused Shift+Enter under tmux to silently send
+        // raw LF (which tmux re-encodes as Ctrl+J → \x1b[106;5u for mode-2 panes,
+        // not recognized by Claude Code as Shift+Enter). `read_or_cached_modes`
+        // returns the last successfully-read values on contention, so modifier-aware
+        // encoding stays correct.
+        // Read keyboard mode flags from the correct terminal.
+        //
+        // When pane splits exist, the focused pane may have a different mode state
+        // than the primary pane (e.g., vim in primary with modifyOtherKeys=2, bash
+        // in split with modifyOtherKeys=0). Reading from the wrong terminal causes
+        // keys like Ctrl+U to be encoded as CSI-u sequences that the focused pane's
+        // shell can't interpret, producing garbage control characters.
+        //
+        // Priority: focused pane's terminal → tab's cached modes (fallback).
+        let (modify_other_keys_mode, application_cursor, alt_screen_active) =
+            if let Some(tab) = self.tab_manager.active_tab() {
+                if let Some(ref pane_manager) = tab.pane_manager {
+                    if let Some(focused_pane) = pane_manager.focused_pane() {
+                        if let Ok(term) = focused_pane.terminal.try_read() {
+                            (
+                                term.modify_other_keys_mode(),
+                                term.application_cursor(),
+                                term.is_alt_screen_active(),
+                            )
+                        } else {
+                            // Lock contention on focused pane — fall back to tab's cache
+                            tab.read_or_cached_modes()
+                        }
+                    } else {
+                        tab.read_or_cached_modes()
+                    }
+                } else {
+                    tab.read_or_cached_modes()
+                }
+            } else {
+                (0, false, false)
+            };
+
+        // Kitty keyboard protocol flags, when the application pushed any. The focused
+        // pane is consulted first for the same reason the modes above are, and the tab
+        // cache covers the case where that read collides with the PTY reader. The
+        // config flag is an escape hatch for applications that request the protocol but
+        // cannot parse the CSI-u result.
+        let keyboard_flags = if self.config.load().input.kitty_keyboard {
+            if let Some(tab) = self.tab_manager.active_tab() {
+                tab.pane_manager
+                    .as_ref()
+                    .and_then(|pm| pm.focused_pane())
+                    .and_then(|pane| {
+                        pane.terminal
+                            .try_read()
+                            .ok()
+                            .map(|term| term.keyboard_flags())
+                    })
+                    .unwrap_or_else(|| tab.keyboard_flags_or_cached())
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Evidence for whether an application actually opted in: the flags only change
+        // when it pushes them, so this logs once per request instead of per keystroke.
+        {
+            use std::sync::atomic::{AtomicU16, Ordering};
+            static LAST_FLAGS: AtomicU16 = AtomicU16::new(0);
+            if LAST_FLAGS.swap(keyboard_flags, Ordering::Relaxed) != keyboard_flags {
+                log::info!("KITTY_KEYBOARD flags requested: {keyboard_flags:#08b}");
+            }
+        }
+
+        // Detect Shift+Enter before the event is consumed by handle_key_event_with_mode.
+        // Par-term follows the iTerm2 convention: regular Enter emits CR (\r) so
+        // shells submit the command line, Shift+Enter emits LF (\n) so chat-style
+        // TUIs (Claude Code, pi agent, etc.) insert a soft newline.
+        //
+        // That LF convention breaks inside tmux because tmux converts raw 0x0a
+        // (LF) into Ctrl+J (tty-keys.c: C0 control codes except HT/CR/ESC are
+        // converted to Ctrl+key equivalents), then re-encodes Ctrl+J as
+        // \x1b[106;5u for MODE_KEYS_EXTENDED_2 panes. The inner app never sees
+        // a Shift+Enter it recognizes.
+        //
+        // Fix: send \x1b[13;2u (CSI-u Shift+Enter) whenever a TUI context is
+        // active. tmux's extended-keys parser re-encodes for the pane's negotiated
+        // protocol (kitty or modifyOtherKeys), and direct TUIs parse CSI-u
+        // natively. In shell context (no alternate screen), keep the iTerm2 \n
+        // convention for soft newlines.
+        let is_shift_enter = self.input_handler.modifiers.state().shift_key()
+            && matches!(event.logical_key, Key::Named(NamedKey::Enter));
+
+        // Normal key handling - send to terminal (or via tmux if connected)
+        if let Some(mut bytes) = self.input_handler.handle_key_event_with_modes(
+            event,
+            modify_other_keys_mode,
+            application_cursor,
+            keyboard_flags,
+        ) {
+            if is_shift_enter {
+                // Gateway path: route raw LF via send-keys -H so it bypasses
+                // tmux's per-pane re-encoding. The old C-j rewrite was being
+                // turned into \x1b[27;5;106~ for mode-2 apps.
+                if self.send_literal_bytes_via_tmux(b"\n") {
+                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                        tab.activity.anti_idle_last_activity = std::time::Instant::now();
+                    }
+                    return;
+                }
+
+                // Non-gateway path: decide between \n (iTerm2 convention for
+                // shells) and \x1b[13;2u (CSI-u for TUIs).
+                //
+                // Use alternate screen buffer as the primary signal: TUI apps
+                // (including tmux wrapping a TUI) always enter alternate screen.
+                // When active, send CSI-u so tmux can re-encode for the inner
+                // pane's negotiated protocol, or so direct kitty TUIs parse it.
+                //
+                // Fall back to process-tree tmux detection for edge cases where
+                // tmux is running but alternate screen hasn't been entered yet.
+                let send_csi_u = if alt_screen_active {
+                    crate::debug_info!(
+                        "SHIFTENTER",
+                        "alt-screen active — sending CSI-u \\x1b[13;2u"
+                    );
+                    true
+                } else if self.shell_has_tmux_child() {
+                    crate::debug_info!(
+                        "SHIFTENTER",
+                        "tmux child detected (no alt-screen) — sending CSI-u \\x1b[13;2u"
+                    );
+                    true
+                } else {
+                    crate::debug_info!(
+                        "SHIFTENTER",
+                        "shell context — sending LF (iTerm2 convention)"
+                    );
+                    false
+                };
+
+                if send_csi_u {
+                    bytes = b"\x1b[13;2u".to_vec();
+                }
+            }
+
+            // Try to send via tmux if connected (check before borrowing tab)
+            if self.send_input_via_tmux(&bytes) {
+                // Still need to reset anti-idle timer
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.activity.anti_idle_last_activity = std::time::Instant::now();
+                }
+                return; // Input was routed through tmux
+            }
+
+            // When tmux is connected, send_input_via_tmux may have failed because
+            // the gateway terminal's RwLock is held (e.g., by a prior async write
+            // blocked on the inner parking_lot::Mutex while the PTY reader processes
+            // tmux output). Do NOT fall through to the direct PTY write path — that
+            // writes to the wrong terminal (the tmux display tab instead of the
+            // gateway). Instead, retry asynchronously so the keystroke is delivered
+            // as soon as the gateway lock becomes available.
+            if self.is_tmux_connected() {
+                crate::debug_info!(
+                    "TMUX_INPUT",
+                    "Gateway lock contention — queuing {} bytes for async delivery",
+                    bytes.len()
+                );
+                // Format the send-keys command while we still have access to the
+                // tmux session state (synchronous borrow), then write the
+                // pre-formatted command to the gateway PTY asynchronously.
+                let cmd = if let Some(session) = &self.tmux_state.tmux_session {
+                    match session.format_send_keys(&bytes) {
+                        Some(c) => c,
+                        None => {
+                            let escaped = crate::tmux::escape_keys_for_tmux(&bytes);
+                            format!("send-keys {}\n", escaped)
+                        }
+                    }
+                } else {
+                    let escaped = crate::tmux::escape_keys_for_tmux(&bytes);
+                    format!("send-keys {}\n", escaped)
+                };
+                if let Some(gateway_tab_id) = self.tmux_state.tmux_gateway_tab_id
+                    && let Some(tab) = self.tab_manager.get_tab(gateway_tab_id)
+                {
+                    let terminal_clone = Arc::clone(&tab.terminal);
+                    let cmd_bytes = cmd.into_bytes();
+                    self.runtime.spawn(async move {
+                        let term = terminal_clone.read().await;
+                        if let Err(e) = term.write(&cmd_bytes) {
+                            crate::debug_error!("INPUT", "PTY write failed (tmux send-keys): {e}");
+                        }
+                    });
+                }
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.activity.anti_idle_last_activity = std::time::Instant::now();
+                }
+                return;
+            }
+
+            // Broadcast input to all panes or just the focused pane
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                // Reset anti-idle timer on keyboard input
+                tab.activity.anti_idle_last_activity = std::time::Instant::now();
+
+                // Check if focused pane is awaiting restart input (Enter key to restart)
+                if let Some(ref mut pane_manager) = tab.pane_manager
+                    && let Some(focused_pane) = pane_manager.focused_pane_mut()
+                    && matches!(
+                        focused_pane.restart_state,
+                        Some(crate::pane::RestartState::AwaitingInput)
+                    )
+                {
+                    // Check if this is an Enter key (bytes == "\r" or "\n")
+                    if bytes == b"\r" || bytes == b"\n" || bytes == b"\r\n" {
+                        log::info!(
+                            "Enter pressed, restarting shell in pane {}",
+                            focused_pane.id
+                        );
+                        if let Err(e) = focused_pane.respawn_shell(&self.config.load()) {
+                            log::error!(
+                                "Failed to respawn shell in pane {}: {}",
+                                focused_pane.id,
+                                e
+                            );
+                        }
+                        return;
+                    }
+                    // For any other key, ignore it while awaiting input
+                    return;
+                }
+
+                // Check if we should broadcast to all panes
+                if self.broadcast_input
+                    && let Some(ref mut pane_manager) = tab.pane_manager
+                    && pane_manager.has_multiple_panes()
+                {
+                    // Broadcast to all panes
+                    let terminals: Vec<_> = pane_manager
+                        .all_panes()
+                        .iter()
+                        .map(|p| Arc::clone(&p.terminal))
+                        .collect();
+
+                    let bytes_clone = bytes.clone();
+                    self.runtime.spawn(async move {
+                        for terminal in terminals {
+                            let term = terminal.read().await;
+                            if let Err(e) = term.write(&bytes_clone) {
+                                crate::debug_error!("INPUT", "PTY write failed (broadcast): {e}");
+                            }
+                        }
+                    });
+                    return;
+                }
+
+                // Get the terminal to write to:
+                // - If split panes exist, use the focused pane's terminal
+                // - Otherwise, use the tab's main terminal
+                let terminal_clone = if let Some(ref pane_manager) = tab.pane_manager {
+                    if let Some(focused_pane) = pane_manager.focused_pane() {
+                        Arc::clone(&focused_pane.terminal)
+                    } else {
+                        Arc::clone(&tab.terminal)
+                    }
+                } else {
+                    Arc::clone(&tab.terminal)
+                };
+
+                // read() not write(): TerminalManager::write() takes &self (shared
+                // reference) because mutation is serialized by the inner
+                // parking_lot::Mutex.  Using a read lock here prevents the keyboard
+                // write from exclusively holding the outer RwLock while blocked on the
+                // inner Mutex, which would starve the refresh task (try_read) and the
+                // render pipeline (try_write) of their generation checks.
+                self.runtime.spawn(async move {
+                    let term = terminal_clone.read().await;
+                    if let Err(e) = term.write(&bytes) {
+                        crate::debug_error!("INPUT", "PTY write failed (key input): {e}");
+                    }
+                });
+            }
+        }
+    }
+}

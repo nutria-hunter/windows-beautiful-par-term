@@ -1,0 +1,825 @@
+name: Release and Deploy
+
+# This workflow handles the complete release process:
+# 1. Builds standalone binaries for multiple platforms (in parallel)
+# 2. Publishes the library to crates.io
+# 3. Creates a GitHub release with all binary artifacts
+# 4. Updates Homebrew cask
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  MACOS_SIGNING_IDENTITY: "Developer ID Application: PAUL AARON ROBELLO (QMLVG482FY)"
+  APPLE_TEAM_ID: "QMLVG482FY"
+
+jobs:
+  # Preflight checks - verify Cargo.toml is ready for release
+  preflight-checks:
+    name: Preflight Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Signing configuration is proven here, before the tag is pushed and long
+      # before publish-crates runs. A bad minisign key discovered in the release
+      # job would strand an irreversible crates.io publish with no matching
+      # GitHub release — the v0.37.1 failure the publish-crates comment below
+      # exists to prevent. Signing the probe file exercises the whole path:
+      # secret present, password correct, keypair matching the pin compiled into
+      # par-term-update.
+      - name: Verify release signing configuration
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_SECRET_KEY_PASSWORD: ${{ secrets.MINISIGN_SECRET_KEY_PASSWORD }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          MISSING=0
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
+                      MACOS_KEYCHAIN_PASSWORD APPLE_API_KEY_ID APPLE_API_ISSUER_ID \
+                      APPLE_API_PRIVATE_KEY_BASE64; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is not set — the macOS builds would fail to sign."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Release aborted: macOS signing secrets are incomplete."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+          PROBE_DIR="$(mktemp -d)"
+          echo "par-term release signing preflight" > "$PROBE_DIR/preflight-probe"
+          scripts/release-minisign.sh "$PROBE_DIR"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create version tag
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          TAG="v${VERSION}"
+          if git tag -l "$TAG" | grep -q .; then
+            echo "Tag $TAG already exists"
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install ACP bridge
+        run: |
+          npm install -g @agentclientprotocol/claude-agent-acp
+          command -v claude-agent-acp
+
+      - name: Verify par-term-emu-core-rust is not a path dependency
+        run: |
+          echo "Checking for par-term-emu-core-rust path dependency in all Cargo.toml files..."
+
+          FOUND=0
+          for toml in Cargo.toml par-term-*/Cargo.toml; do
+            if grep -E 'par-term-emu-core-rust.*path\s*=' "$toml"; then
+              echo "::error::$toml contains a local path dependency for par-term-emu-core-rust"
+              FOUND=1
+            fi
+          done
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "::error::Please update to use the published crates.io version before releasing"
+            exit 1
+          fi
+
+          echo "✓ All Cargo.toml files are ready for release"
+
+  # Lint (fmt + clippy) — runs in parallel with the builds and gates publish,
+  # so a formatting or clippy regression can't ship even though push CI no
+  # longer runs the full suite. cargo-deny stays on the push-CI lint job.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-3-dev libxdo-dev
+
+      - name: Install ACP bridge
+        run: |
+          npm install -g @agentclientprotocol/claude-agent-acp
+          command -v claude-agent-acp
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Build Linux ARM64 natively on a GitHub ARM64 runner (parallel)
+  build-linux-arm64:
+    name: Build binary - Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-3-dev libxdo-dev
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Get version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        run: cargo build --release
+
+      - name: Strip binary
+        run: strip target/release/par-term
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p release-binaries
+          cp target/release/par-term release-binaries/par-term-linux-aarch64
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-aarch64-unknown-linux-gnu
+          path: release-binaries/par-term-linux-aarch64
+          retention-days: 1
+
+  # Build Linux x86_64 (parallel)
+  build-linux-x86_64:
+    name: Build binary - Linux x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Add Rust target (ensure installed)
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-3-dev libxdo-dev
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Get version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-gnu/release/par-term
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p release-binaries
+          cp target/x86_64-unknown-linux-gnu/release/par-term release-binaries/par-term-linux-x86_64
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-x86_64-unknown-linux-gnu
+          path: release-binaries/par-term-linux-x86_64
+          retention-days: 1
+
+  # Build Windows x86_64 (parallel)
+  build-windows-x86_64:
+    name: Build binary - Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Add Rust target (ensure installed)
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Get version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p release-binaries
+          cp target/x86_64-pc-windows-msvc/release/par-term.exe release-binaries/par-term-windows-x86_64.exe
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-x86_64-pc-windows-msvc
+          path: release-binaries/par-term-windows-x86_64.exe
+          retention-days: 1
+
+  # Build macOS x86_64 (parallel)
+  build-macos-x86_64:
+    name: Build binary - macOS x86_64
+    # v0.37.1 lost this job to the old 35-minute cap before notarization
+    # existed; the wait on Apple's notary service now adds 5-30 minutes on top
+    # of build and test. The notarytool call is separately capped at 30m so a
+    # stuck submission fails loudly instead of burning the whole budget.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Add Rust target (ensure installed)
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Get version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create app bundle
+        run: |
+          mkdir -p par-term.app/Contents/MacOS
+          mkdir -p par-term.app/Contents/Resources
+
+          # Copy binary
+          cp target/x86_64-apple-darwin/release/par-term par-term.app/Contents/MacOS/par-term
+          chmod +x par-term.app/Contents/MacOS/par-term
+
+          # Copy icon
+          cp assets/par-term.icns par-term.app/Contents/Resources/
+
+          # Create Info.plist
+          cat <<EOF > par-term.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>par-term</string>
+              <key>CFBundleIconFile</key>
+              <string>par-term.icns</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.paulrobello.par-term</string>
+              <key>CFBundleName</key>
+              <string>par-term</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.13</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign, notarize and staple
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: scripts/macos-sign-notarize.sh par-term.app release-binaries/par-term-macos-x86_64.zip
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-x86_64-apple-darwin
+          path: release-binaries/par-term-macos-x86_64.zip
+          retention-days: 1
+
+  # Build macOS ARM64 (parallel)
+  build-macos-arm64:
+    name: Build binary - macOS ARM64
+    # v0.37.1 lost this job to the old 35-minute cap before notarization
+    # existed; the wait on Apple's notary service now adds 5-30 minutes on top
+    # of build and test. The notarytool call is separately capped at 30m so a
+    # stuck submission fails loudly instead of burning the whole budget.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Add Rust target (ensure installed)
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Get version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create app bundle
+        run: |
+          mkdir -p par-term.app/Contents/MacOS
+          mkdir -p par-term.app/Contents/Resources
+
+          # Copy binary
+          cp target/aarch64-apple-darwin/release/par-term par-term.app/Contents/MacOS/par-term
+          chmod +x par-term.app/Contents/MacOS/par-term
+
+          # Copy icon
+          cp assets/par-term.icns par-term.app/Contents/Resources/
+
+          # Create Info.plist
+          cat <<EOF > par-term.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>par-term</string>
+              <key>CFBundleIconFile</key>
+              <string>par-term.icns</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.paulrobello.par-term</string>
+              <key>CFBundleName</key>
+              <string>par-term</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.13</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign, notarize and staple
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: scripts/macos-sign-notarize.sh par-term.app release-binaries/par-term-macos-aarch64.zip
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-aarch64-apple-darwin
+          path: release-binaries/par-term-macos-aarch64.zip
+          retention-days: 1
+
+  # Build a Universal (aarch64 + x86_64) macOS binary and .app (parallel).
+  #
+  # The per-arch jobs above ship single-slice .app bundles on purpose: both
+  # par-term-update's get_asset_name() and the Homebrew cask bake the
+  # arch-specific asset names into shipped/published artifacts, so those names
+  # can't change without breaking in-the-wild updaters. This job additionally
+  # produces ONE fat binary as par-term-macos-universal.zip so a manual download
+  # never has to (and cannot wrongly) pick an Intel-only build on Apple Silicon
+  # — the Rosetta "Support ending for Intel-based apps" path. The universal .app
+  # is signed, notarized, and stapled exactly like the per-arch ones.
+  #
+  # Tests are not re-run here: both per-arch macOS jobs (required by
+  # publish-crates and github-release below) already run `cargo test --workspace`,
+  # so the release stays gated on tests without a third pass.
+  build-macos-universal:
+    name: Build binary - macOS Universal
+    runs-on: macos-latest
+    timeout-minutes: 90
+    needs: [preflight-checks]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Add Rust targets (ensure installed)
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Get version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal-release
+          lipo -create \
+            target/aarch64-apple-darwin/release/par-term \
+            target/x86_64-apple-darwin/release/par-term \
+            -output target/universal-release/par-term
+          chmod +x target/universal-release/par-term
+          echo "Universal binary slices:"
+          lipo -info target/universal-release/par-term
+          file target/universal-release/par-term
+
+      - name: Create app bundle
+        run: |
+          mkdir -p par-term.app/Contents/MacOS
+          mkdir -p par-term.app/Contents/Resources
+
+          # Copy universal binary
+          cp target/universal-release/par-term par-term.app/Contents/MacOS/par-term
+          chmod +x par-term.app/Contents/MacOS/par-term
+
+          # Copy icon
+          cp assets/par-term.icns par-term.app/Contents/Resources/
+
+          # Create Info.plist
+          cat <<EOF > par-term.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>par-term</string>
+              <key>CFBundleIconFile</key>
+              <string>par-term.icns</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.paulrobello.par-term</string>
+              <key>CFBundleName</key>
+              <string>par-term</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.13</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign, notarize and staple
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: scripts/macos-sign-notarize.sh par-term.app release-binaries/par-term-macos-universal.zip
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-universal-apple-darwin
+          path: release-binaries/par-term-macos-universal.zip
+          retention-days: 1
+
+  # Publish to crates.io.
+  #
+  # Gated behind every binary build even though it needs none of their
+  # artifacts. Publishing is the one irreversible step in this workflow — a
+  # version pushed to crates.io can be yanked but never replaced — so it must
+  # not start until every target is known to build. v0.37.1 published all five
+  # crates and then lost the macOS x86_64 build to a timeout, which skipped
+  # github-release and left the version on crates.io with no release to match
+  # it. The cost is that publishing now waits for the slowest build.
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - preflight-checks
+      - build-linux-arm64
+      - build-linux-x86_64
+      - build-windows-x86_64
+      - build-macos-x86_64
+      - build-macos-arm64
+      - build-macos-universal
+      - lint
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libgtk-3-dev libxdo-dev
+
+      - name: Get version and build version map
+        id: version
+        run: |
+          CARGO_VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "par-term") | .version')
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # Build version map once for all publish steps
+          cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | "\(.name)=\(.version)"' > /tmp/crate-versions.txt
+          echo "Crate versions:"
+          cat /tmp/crate-versions.txt
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Publish all crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          get_version() {
+            grep "^${1}=" /tmp/crate-versions.txt | cut -d= -f2
+          }
+
+          wait_for_crate() {
+            local crate=$1 version=$2
+            echo "Waiting for $crate $version to be indexed..."
+            for i in $(seq 1 24); do
+              local http_status
+              http_status=$(curl -s -o /dev/null -w "%{http_code}" \
+                "https://crates.io/api/v1/crates/$crate/$version" \
+                -H "User-Agent: par-term-ci-publish")
+              if [ "$http_status" = "200" ]; then
+                echo "✓ $crate $version indexed after $((i * 5))s"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "⚠ $crate $version not indexed after 120s, proceeding anyway"
+          }
+
+          publish_if_needed() {
+            local crate=$1
+            local version
+            version=$(get_version "$crate")
+
+            local http_status
+            http_status=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://crates.io/api/v1/crates/$crate/$version" \
+              -H "User-Agent: par-term-ci-publish")
+
+            if [ "$http_status" = "200" ]; then
+              echo "✓ $crate $version already on crates.io, skipping"
+            else
+              echo "Publishing $crate $version..."
+              cargo publish -p "$crate" --no-verify --token "$CARGO_REGISTRY_TOKEN"
+              PUBLISHED_CRATES+=("$crate=$version")
+            fi
+          }
+
+          PUBLISHED_CRATES=()
+
+          # Layer 0+1: no workspace deps
+          echo "=== Layer 0+1: Independent crates ==="
+          publish_if_needed par-term-acp
+          publish_if_needed par-term-config
+          publish_if_needed par-term-mcp
+          publish_if_needed par-term-ssh
+
+          # Wait only for crates that were actually published
+          for entry in "${PUBLISHED_CRATES[@]}"; do
+            wait_for_crate "${entry%%=*}" "${entry#*=}"
+          done
+          PUBLISHED_CRATES=()
+
+          # Layer 2: depend on par-term-config
+          echo "=== Layer 2: Config-dependent crates ==="
+          publish_if_needed par-term-fonts
+          publish_if_needed par-term-input
+          publish_if_needed par-term-keybindings
+          publish_if_needed par-term-scripting
+          publish_if_needed par-term-settings-ui
+          publish_if_needed par-term-terminal
+          publish_if_needed par-term-tmux
+          publish_if_needed par-term-update
+
+          for entry in "${PUBLISHED_CRATES[@]}"; do
+            wait_for_crate "${entry%%=*}" "${entry#*=}"
+          done
+          PUBLISHED_CRATES=()
+
+          # Layer 3: depend on par-term-fonts
+          echo "=== Layer 3: Render crate ==="
+          publish_if_needed par-term-render
+
+          for entry in "${PUBLISHED_CRATES[@]}"; do
+            wait_for_crate "${entry%%=*}" "${entry#*=}"
+          done
+
+          # Layer 4: root crate
+          echo "=== Layer 4: Root crate ==="
+          publish_if_needed par-term
+
+      - name: Discord notification
+        if: success()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        # Pinned to a SHA: this step holds DISCORD_WEBHOOK, and a tag can be moved.
+        # To find the SHA: git ls-remote https://github.com/Ilshidur/action-discord 0.4.0
+        uses: Ilshidur/action-discord@d2594079a10f1d6739ee50a2471f0ca57418b554 # 0.4.0
+        with:
+          args: 'Published {{ EVENT_PAYLOAD.repository.name }} v${{ steps.version.outputs.version }} to crates.io successfully!'
+        continue-on-error: true
+
+  # Create GitHub release, after every build AND the crates.io publish.
+  #
+  # Depending on publish-crates keeps the two registries consistent in both
+  # directions: no release without the crates, and (via publish-crates' own
+  # needs) no crates without every binary. Re-running a failed leg is safe —
+  # publish_if_needed skips crates already on the registry.
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - build-linux-arm64
+      - build-linux-x86_64
+      - build-windows-x86_64
+      - build-macos-x86_64
+      - build-macos-arm64
+      - build-macos-universal
+      - publish-crates
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Get version
+        id: get_version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version"
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: binaries
+          merge-multiple: true
+
+      - name: Create shaders archive
+        run: |
+          zip -r binaries/shaders.zip shaders/ -x "*.DS_Store"
+          echo "Created shaders.zip with contents:"
+          unzip -l binaries/shaders.zip | tail -20
+
+      - name: List downloaded binaries
+        run: ls -lh binaries/
+
+      # Both verification gates in par-term-update are fail-closed: a release
+      # missing either the `<asset>.sha256` or the `<asset>.minisig` is rejected
+      # by every client. Producing them must stay ahead of the upload, and must
+      # never be made non-fatal.
+      - name: Generate SHA256 checksums
+        run: scripts/release-checksums.sh binaries
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign release assets with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_SECRET_KEY_PASSWORD: ${{ secrets.MINISIGN_SECRET_KEY_PASSWORD }}
+        run: scripts/release-minisign.sh binaries
+
+      - name: List release assets
+        run: ls -lh binaries/
+
+      - name: Create or update GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v${{ steps.get_version.outputs.version }}"
+
+          # Check if release exists
+          if gh release view "$VERSION" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "Release $VERSION already exists. Deleting and recreating..."
+            gh release delete "$VERSION" --repo '${{ github.repository }}' --yes
+          fi
+
+          # Create new release
+          gh release create \
+          "$VERSION" \
+          --repo '${{ github.repository }}' \
+          --generate-notes \
+          --latest
+
+      - name: Upload binaries to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload \
+          'v${{ steps.get_version.outputs.version }}' binaries/* \
+          --repo '${{ github.repository }}' \
+          --clobber
+
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
+  publish-homebrew-cask:
+    name: Publish Homebrew Cask
+    needs: [github-release]
+    uses: ./.github/workflows/publish-homebrew-cask-core.yml
+    with:
+      version: ${{ needs.github-release.outputs.version }}
+    secrets: inherit

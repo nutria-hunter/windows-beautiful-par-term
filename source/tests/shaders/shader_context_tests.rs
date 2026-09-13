@@ -1,0 +1,135 @@
+//! Integration tests for shader context generation.
+
+use par_term::ai_inspector::shader_context::{build_shader_context, should_inject_shader_context};
+use par_term::config::Config;
+
+#[test]
+fn test_shader_context_contains_all_sections() {
+    let config = Config::default();
+    let ctx = build_shader_context(&config);
+
+    // All sections must be present
+    assert!(ctx.contains("[Shader Assistant Context]"));
+    assert!(ctx.contains("## [Observation] Current Shader State"));
+    assert!(ctx.contains("## [Observation] Available Shaders"));
+    assert!(ctx.contains("## [Observation] Debug Files"));
+    assert!(ctx.contains("## [Observation] Available Uniforms"));
+    assert!(ctx.contains("## [Instruction] Shader Uniform Controls"));
+    assert!(ctx.contains("## [Constraint] GLSL Compatibility Rules"));
+    assert!(ctx.contains("## [Instruction] Minimal Shader Template"));
+    assert!(ctx.contains("## [Instruction] How to Apply Changes"));
+}
+
+#[test]
+fn test_shader_context_template_is_valid_glsl() {
+    let config = Config::default();
+    let ctx = build_shader_context(&config);
+
+    // Template must contain the mainImage signature
+    assert!(ctx.contains("void mainImage(out vec4 fragColor, in vec2 fragCoord)"));
+    assert!(ctx.contains("iChannel4"));
+    assert!(ctx.contains("iResolution"));
+    assert!(ctx.contains("Avoid passing sampler uniforms"));
+    assert!(ctx.contains("normalized UVs in `[0,1]`"));
+    assert!(ctx.contains("clamp(transformedUv, vec2(0.0), vec2(1.0))"));
+    assert!(ctx.contains("pixel-space values"));
+    assert!(ctx.contains("transparent 1x1 placeholders"));
+    assert!(ctx.contains("iChannelResolution[0].x > 1.0"));
+    assert!(ctx.contains("// control slider min=0 max=1 step=0.01"));
+    assert!(ctx.contains("// control color label=\"Tint\""));
+    assert!(ctx.contains("// control color label=\"Overlay\""));
+    assert!(ctx.contains("uniform vec3 iTint;"));
+    assert!(ctx.contains("uniform vec4 iOverlay;"));
+    assert!(ctx.contains("defaults.uniforms"));
+    assert!(ctx.contains("iTint: \"#66ccff\""));
+    assert!(ctx.contains("iOverlay: \"#ff8800cc\""));
+    assert!(ctx.contains("Prefer hex color defaults"));
+    assert!(ctx.contains("`vec3` defaults to RGB / `alpha=false`"));
+    assert!(ctx.contains("`alpha=true` is invalid for `vec3`"));
+    assert!(ctx.contains("`vec4` defaults to RGBA / `alpha=true`"));
+    assert!(ctx.contains("use `alpha=false` on `vec4` only to force an RGB picker"));
+    assert!(ctx.contains("16 color controls"));
+    assert!(ctx.contains("Do not put default= in the control comment"));
+    assert!(ctx.contains("// control int min=1 max=12 step=1"));
+    assert!(ctx.contains("// control select options=\"soft,hard,screen,add\""));
+    assert!(ctx.contains("// control vec2 min=-1 max=1 step=0.01"));
+    assert!(ctx.contains("// control point label=\"Origin\""));
+    assert!(ctx.contains("// control range min=0 max=1 step=0.01"));
+    assert!(ctx.contains("scale=log"));
+    assert!(ctx.contains("// control angle unit=degrees"));
+    assert!(ctx.contains("// control channel options=\"0,1,2,3,4\""));
+    assert!(ctx.contains("Use `select` for discrete shader modes"));
+    assert!(
+        ctx.contains(
+            "Use `channel` only to choose among existing `iChannel0`..`iChannel4` sources"
+        )
+    );
+}
+
+#[test]
+fn test_keyword_detection_comprehensive() {
+    let config = Config::default();
+
+    // Positive cases
+    let positive = vec![
+        "Create a shader effect",
+        "Help me with GLSL code",
+        "What WGSL output do I get?",
+        "Make a CRT effect",
+        "Add scanline post-processing",
+        "Port this Shadertoy shader",
+        "Fix the cursor effect",
+        "iTime is not working",
+    ];
+    for msg in positive {
+        assert!(
+            should_inject_shader_context(msg, &config),
+            "Expected true for: {msg}"
+        );
+    }
+
+    // Negative cases
+    let negative = vec![
+        "How do I change the font?",
+        "Set terminal background color",
+        "Configure keybindings",
+        "What version is this?",
+    ];
+    for msg in negative {
+        assert!(
+            !should_inject_shader_context(msg, &config),
+            "Expected false for: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_shader_context_with_active_config() {
+    let config = Config {
+        shader: par_term_config::GlobalShaderConfig {
+            custom_shader: Some("crt.glsl".to_string()),
+            custom_shader_enabled: true,
+            custom_shader_animation_speed: 2.0,
+            custom_shader_brightness: 0.5,
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+
+    let ctx = build_shader_context(&config);
+
+    // Should include active shader info
+    assert!(ctx.contains("crt.glsl"));
+    assert!(ctx.contains("enabled"));
+    assert!(ctx.contains("animation_speed: 2"));
+    assert!(ctx.contains("brightness: 0.5"));
+    // Resolved via the shared helper, not a hardcoded root: the dumps live in
+    // the system temp dir, which is not /tmp on macOS or Windows.
+    assert!(
+        ctx.contains(
+            &par_term_render::shader_debug::transpiled_wgsl_path("crt")
+                .display()
+                .to_string()
+        )
+    );
+}

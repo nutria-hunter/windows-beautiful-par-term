@@ -1,0 +1,347 @@
+# State Lifecycle
+
+This document describes when state objects in par-term are created, updated, and
+destroyed. It covers the window, tab, and pane layers and traces the data flow from user
+input through PTY processing to GPU rendering.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [State Hierarchy](#state-hierarchy)
+- [Window Lifecycle](#window-lifecycle)
+- [Tab Lifecycle](#tab-lifecycle)
+- [Pane Lifecycle](#pane-lifecycle)
+- [Data Flow: Input to Screen](#data-flow-input-to-screen)
+- [Data Flow: PTY Output to Render](#data-flow-pty-output-to-render)
+- [State Migration and Inheritance](#state-migration-and-inheritance)
+- [Shutdown Sequence](#shutdown-sequence)
+- [Related Documentation](#related-documentation)
+
+## Overview
+
+par-term organizes mutable state in a strict ownership hierarchy. Each layer is created
+by its parent, lives as long as its parent, and is destroyed when its parent is dropped.
+Only the `TerminalManager` at the leaf crosses thread boundaries and is wrapped in
+`Arc<tokio::sync::RwLock<...>>`. `App` creates `WindowManager` as a local variable in
+`App::run()` and passes it to `event_loop.run_app()`; it is not a stored field.
+
+```mermaid
+graph TD
+    App[App entry point]
+    WM[WindowManager]
+    WS[WindowState]
+    TM[TabManager]
+    Tab[Tab]
+    PM[PaneManager]
+    Pane[Pane]
+    Term[TerminalManager]
+
+    App -- "run() local" --> WM
+    WM --> WS
+    WS --> TM
+    TM --> Tab
+    Tab --> PM
+    PM --> Pane
+    Pane --> Term
+    Tab --> Term2[TerminalManager]
+
+    class App primary
+    class WM warning
+    class WS warning
+    class TM warning
+    class Tab active
+    class PM active
+    class Pane active
+    class Term data
+    class Term2 data
+
+    classDef primary fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#ffffff
+    classDef active fill:#1b5e20,stroke:#4caf50,stroke-width:2px,color:#ffffff
+    classDef warning fill:#ff6f00,stroke:#ffa726,stroke-width:2px,color:#ffffff
+    classDef data fill:#0d47a1,stroke:#2196f3,stroke-width:2px,color:#ffffff
+```
+
+## State Hierarchy
+
+| Type | Location | Owned by | Lock |
+|---|---|---|---|
+| `WindowManager` | `src/app/window_manager/mod.rs` | `App::run()` local, passed to `event_loop.run_app()` | None -- main thread only |
+| `WindowState` | `src/app/window_state/mod.rs` | `WindowManager` (in `HashMap<WindowId, WindowState>`) | None -- main thread only |
+| `TabManager` | `src/tab/manager.rs` | `WindowState` | None -- main thread only |
+| `Tab` | `src/tab/mod.rs` | `TabManager` | None -- main thread only |
+| `PaneManager` | `src/pane/manager/mod.rs` | `Tab` (`Option<PaneManager>`, always `Some`) | None -- main thread only |
+| `Pane` | `src/pane/types/pane.rs` | `PaneManager` | None -- main thread only |
+| `TerminalManager` | `par-term-terminal/src/terminal/mod.rs` | `Tab` / `Pane` | `Arc<tokio::sync::RwLock<...>>` |
+
+## Window Lifecycle
+
+### Creation
+
+A `WindowState` is created when the application starts or when a new window is opened
+via the menu. Configuration is loaded in `App::new` (`src/app/mod.rs`) and passed to
+`WindowManager::new`, which calls `WindowState::new` (`src/app/window_state/impl_init.rs`):
+
+1. The renderer is initialized against the wgpu surface for the OS window.
+2. A `TabManager` is created and the first tab is opened.
+3. Input handler, keybinding registry, status bar, and tab bar UI are initialized.
+4. Config file watcher and shader watcher are started.
+5. ACP agents are discovered and the AI inspector is initialized.
+
+### Updates
+
+`WindowState` is updated every frame during the winit event loop:
+
+- `about_to_wait()` — per-frame polling: notifications, config reloads (`check_config_reload()`), cursor blink, smooth scrolling, shader animation, file transfers, anti-idle keep-alive, and more (`src/app/handler/window_state_impl/about_to_wait.rs`).
+- `handle_window_event()` — processes OS keyboard, mouse, and resize events (`src/app/handler/window_state_impl/handle_window_event.rs`).
+- `process_agent_messages_tick()` — drains incoming ACP agent messages.
+- Rendering is performed by `WindowState::render()` (defined in `src/app/render_pipeline/mod.rs`; `render_pipeline` is a module, not a struct). `about_to_wait()` triggers a redraw via `request_redraw()`, and `handle_window_event()` invokes `render()` on each frame.
+
+### Destruction
+
+When the last tab in a window is closed (or the window is closed directly),
+`WindowState::perform_shutdown` is called:
+
+1. The last working directory is saved (if `startup_directory_mode` is `Previous`).
+2. The shutdown flag is set and all tab refresh tasks are aborted.
+
+`WindowState` implements `Drop` for fast-path cleanup. The `Drop` implementation hides
+the OS window for instant visual feedback, drains all tabs via
+`TabManager::drain_tabs()`, collects terminal `Arc`s and session loggers, pre-kills
+PTY processes, and spawns background threads for the remaining cleanup (session log
+finalization and terminal `Arc` drops, which release the PTY sessions). This avoids
+blocking the event loop on slow shell teardowns during quit.
+
+## Tab Lifecycle
+
+### Creation
+
+Tabs are created through `TabManager` via:
+
+- **Default shell**: `Tab::new` — spawns the configured shell with optional working directory.
+- **Profile**: `Tab::new_from_profile` — uses profile-specified command, shell, or SSH
+  connection.
+
+During `Tab::new`:
+
+1. A `TerminalManager` is created with the configured column/row count and scrollback size.
+2. Theme, cursor style, Unicode settings, and clipboard limits are applied from config.
+3. The shell process is spawned via `terminal.spawn_custom_shell_with_dir`.
+4. Configured triggers are synced into the core `TriggerRegistry` (in `new_internal`).
+5. Auto-start coprocesses are started via the PTY session's built-in `CoprocessManager`.
+6. A `SharedSessionLogger` is created; session logging starts immediately if `auto_log_sessions` is enabled.
+7. The `TerminalManager` is wrapped in `Arc<tokio::sync::RwLock<...>>`.
+8. A `PaneManager` is always created with one primary pane that shares the tab's `Arc<RwLock<TerminalManager>>`.
+9. If `initial_text` is configured, it is sent to the PTY after an optional delay via an async task.
+
+### Activation
+
+When a tab becomes active (user switches to it):
+
+1. `TabManager::switch_to` updates the active tab ID.
+2. The renderer's cell cache is cleared to force a full redraw.
+3. The tab's `is_active` atomic flag is set, which raises the refresh task's polling rate
+   from the `inactive_tab_fps` rate back to the normal frame rate.
+
+### Refresh Loop
+
+Each tab runs a background async task (`src/tab/refresh_task.rs`) that polls the
+`TerminalManager`'s update generation for new PTY output. Active tabs poll at a constant
+rate derived from `max_fps` (default 60 Hz, ~16ms). Inactive tabs poll at
+`inactive_tab_fps` (default 2 Hz) and apply exponential backoff, doubling the interval
+per idle tick up to a 250ms cap. Whenever new output is detected the task calls
+`window.request_redraw()`.
+
+### Title Updates
+
+Tab titles update automatically from:
+
+- OSC 0/1/2 escape sequences emitted by the shell.
+- OSC 7 (`file://` URIs) for current working directory tracking.
+- SSH hostname detection from OSC sequences, which also triggers automatic profile
+  switching.
+- User rename via the tab bar context menu (sets `user_named = true`, which locks the
+  title).
+
+### Destruction
+
+When a tab is closed via `TabManager::close_tab`, the tab is removed from the
+`TabManager`'s list and dropped. The `Tab` `Drop` implementation then runs cleanup in
+this order:
+
+1. Session logging is stopped and the log file is finalized.
+2. The refresh task is aborted via `Tab::stop_refresh_task` (non-blocking `abort()` call).
+3. The `TerminalManager` is killed via `terminal.try_write().kill()`.
+
+The `Tab` `Drop` implementation handles cleanup when `shutdown_fast` is false. When
+`shutdown_fast` is true (application-exit path), the Drop impl returns immediately and
+cleanup is handled externally.
+
+## Pane Lifecycle
+
+### Creation
+
+A `PaneManager` is always created at tab construction time (`pane_manager: Some(...)`
+from the start). The primary pane shares the tab's existing `Arc<RwLock<TerminalManager>>`,
+so no extra shell process is spawned.
+
+When a split is requested:
+
+1. A new `Pane` is created with its own `TerminalManager` (fresh PTY, own shell process).
+2. The `PaneManager` adds the pane to a tree structure (`PaneNode`) for layout.
+3. The split orientation (horizontal or vertical) is stored in the `direction` field
+   of the `PaneNode::Split` variant.
+4. Each `Pane` gets its own `ScrollState`, `MouseState`, `BellState`, `RenderCache`, and
+   `SharedSessionLogger`.
+
+### Focus and Bounds
+
+The active pane within a tab is tracked by `PaneManager`. Layout bounds (`PaneBounds`)
+are recalculated whenever the window is resized or a split is added or removed. Pane
+bounds are stored directly on each `Pane` struct and updated by the `PaneManager`.
+
+### Destruction
+
+Panes are destroyed when:
+
+- The user closes a pane explicitly (unsplit).
+- The shell exits and the pane auto-closes based on config.
+- The owning tab is closed (all panes are dropped with the `PaneManager`).
+
+Each `Pane` runs the same cleanup sequence as a `Tab`: the refresh task is stopped,
+session logging is finalized, and the terminal is killed.
+
+## Data Flow: Input to Screen
+
+This sequence describes what happens between a key press and the updated frame reaching
+the display.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant winit as winit EventLoop
+    participant Input as InputHandler
+    participant Term as TerminalManager
+    participant PTY as PTY / Shell
+    participant Render as GPU Renderer
+
+    User->>winit: KeyboardInput event
+    winit->>Input: handle_key_event()
+    Input->>Input: Look up keybinding registry
+    alt Keybinding action
+        Input->>winit: Execute action (copy, switch tab, etc.)
+    else Terminal input
+        Input->>Term: write(bytes)
+        Term->>PTY: stdin bytes
+    end
+    PTY->>Term: stdout/stderr bytes (async reader)
+    Term->>Term: VT parser updates cell grid
+    winit->>Render: render() called next frame
+    Render->>User: GPU frame presented
+```
+
+### Step-by-step
+
+1. **Key event** arrives on the winit `EventLoop` (main thread).
+2. **`InputHandler`** translates the OS key event into bytes using VT encoding rules.
+3. If a **keybinding** matches, the action is dispatched (copy, paste, switch tab,
+   open settings, etc.) before the bytes reach the PTY.
+4. Otherwise, bytes are written to **`TerminalManager`** via the `write()` method, which
+   forwards them to the shell's PTY stdin.
+5. The shell processes the input and writes response bytes to PTY stdout.
+6. The **async PTY reader task** reads those bytes and calls the core VT parser, which
+   updates the in-memory cell grid, scrollback, and graphics state.
+7. On the next frame, the **render pipeline** calls `gather_render_data()` which calls
+   `try_read()` on the `TerminalManager`'s `RwLock` and snapshots the current cell grid.
+8. The snapshot is passed to the GPU renderer, which uploads changed cells to the glyph
+   atlas and submits a wgpu command buffer.
+9. The frame is presented to the display.
+
+## Data Flow: PTY Output to Render
+
+```mermaid
+sequenceDiagram
+    participant PTY as PTY / Shell
+    participant Reader as Async PTY Reader
+    participant Core as VT Parser (core lib)
+    participant Tab as Tab / Pane state
+    participant Gather as gather_render_data()
+    participant GPU as GPU Renderer
+
+    PTY->>Reader: stdout bytes
+    Reader->>Core: feed(bytes)
+    Core->>Core: Parse escape sequences
+    Core->>Core: Update cell grid + graphics
+    Tab->>Gather: try_read() TerminalManager
+    Gather->>Gather: Extract cells, graphics, metadata
+    Gather->>Gather: Detect URLs, apply search highlights
+    Gather-->>GPU: FrameRenderData snapshot
+    GPU->>GPU: Three-pass render
+    GPU->>GPU: Cell Pass (glyph atlas instancing)
+    GPU->>GPU: Graphics Pass (Sixel/iTerm2/Kitty)
+    GPU->>GPU: Overlay Pass (egui tab bar/status bar)
+```
+
+### Render passes
+
+The GPU renderer executes three passes per frame:
+
+1. **Cell Pass** — renders text cells using the glyph atlas with instanced draw calls.
+   Cell backgrounds and foregrounds are separate sub-passes.
+2. **Graphics Pass** — composites inline images (Sixel, iTerm2, Kitty) as RGBA textures.
+3. **Overlay Pass** — renders the egui UI: tab bar, status bar, search bar, settings
+   window, and any modal dialogs.
+
+Custom background shaders run before the Cell Pass; cursor shaders run after the Cell
+Pass. Both run before the Overlay Pass.
+
+## State Migration and Inheritance
+
+### New Tab Inherits CWD
+
+When `tab_inherit_cwd` is enabled, a new tab starts in the active tab's current working
+directory. The CWD is read from the OSC 7 URI stored in `Tab.detected_cwd`.
+
+### Profile Auto-Switch
+
+When an OSC 7 URI reveals a new hostname (detected in `profile_tracking.rs`),
+`check_auto_hostname_switch` in `src/app/tab_ops/profile_auto_switch.rs` scans all
+profiles for SSH hostname matches. If a match is found:
+
+1. The current tab title and profile ID are saved to `pre_profile_title` and
+   `pre_ssh_switch_profile`.
+2. The new profile is applied to the tab (title, badge override, icon).
+3. On SSH disconnect (shell returns to original hostname), the pre-switch state is
+   restored.
+
+### Config Live Reload
+
+When `~/.config/par-term/config.yaml` changes on disk, the `ConfigWatcher` (file system
+watcher initialized in `WindowState::init_config_watcher`) detects the change. The
+`check_config_reload()` method in `about_to_wait()` reads the updated config, and the
+`WindowManager` propagates it to all windows via `apply_config_to_windows()`. Each window
+applies the update without requiring a restart.
+
+## Shutdown Sequence
+
+When the user quits par-term (Cmd+Q / Alt+F4):
+
+1. `WindowState::handle_window_event()` receives the `CloseRequested` event (routed through `WindowManager` from the winit event loop).
+2. If `prompt_on_quit` is enabled, a confirmation dialog is shown first.
+3. `WindowState::perform_shutdown()` is called: refresh tasks are aborted, the shutdown flag is set.
+4. The `WindowState` `Drop` implementation drains all tabs, pre-kills PTY processes, and spawns a background thread for cleanup.
+5. The renderer releases GPU resources.
+6. The Tokio runtime is shut down.
+7. The process exits.
+
+During application exit, `shutdown_fast = true` is set on all tabs and panes before
+dropping them. This causes the `Drop` implementations to return immediately, deferring
+actual PTY process cleanup to the OS. This avoids blocking the event loop on slow shell
+teardowns during quit.
+
+## Related Documentation
+
+- [Architecture](ARCHITECTURE.md) — high-level component and crate structure overview
+- [Concurrency Guide](CONCURRENCY.md) — mutex strategy and threading model
+- [Mutex Patterns](MUTEX_PATTERNS.md) — detailed mutex usage patterns and anti-patterns
+- [Session Logging](../features/SESSION_LOGGING.md) — session log lifecycle details
+- [Tabs](../features/TABS.md) — user-facing tab management documentation

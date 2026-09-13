@@ -1,0 +1,749 @@
+From 56829bc6273480d1038949c29ac2a63b0319a4b6 Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 09:11:51 +0900
+Subject: [PATCH 3/4] fix(render): stop a minimized window from killing or
+ mis-sizing the child
+
+Minimizing killed the process with an `f32::clamp` whose min exceeded its max, and
+the stock 0.45.0 binary dies the same way, so this was never a chrome-patch
+regression. The numbers in the panic (min = 0.0, max = -19.0) are the scrollbar's
+thumb arithmetic: the thumb height was raised to a 20px clickable minimum while the
+track collapses to about a pixel when the window is icon-sized, so the travel range
+went negative. Clamp the thumb to the track, hide the scrollbar when the track cannot
+hold it, and skip frame construction while minimized - a minimized window has no
+drawable area, which is the other half of that clamp path.
+
+Two more ways a bogus one-row grid still reached the children, both found by watching
+what the child actually received rather than what par-term logged:
+
+* The settling gate promoted the grid it had remembered from before the minimize. A
+  minimized window reports its icon size (192x34 -> 13x1) and frames resume a few
+  milliseconds before the restored size event arrives, so the same stale grid was seen
+  on two "consecutive" frames. Record that the grid is untrustworthy from the moment
+  the window is minimized until a real Resized event clears it, and hold the children
+  on their last good size in the meantime. The failure direction is safe: the worst
+  case is a child that keeps the size it already had.
+* gather_pane_render_data resizes the PTY on every frame and bypassed that gate
+  entirely, which is why the one-row grid survived the first fix. Give it the same
+  trust flag, skipping only the commit so the viewport still matches the surface.
+  clippy::too_many_arguments is allowed there, as elsewhere in this tree, because the
+  parameters come from four different owners.
+
+The two per-frame paths are now both gated. The remaining resize call sites are
+one-shot user actions (open/close a tab, change a setting) with no relation to
+minimizing.
+
+Also send a submitted command with CR on Windows: ConPTY takes a bare LF as a literal
+newline in the input buffer rather than as Enter, so a command sent with \n was typed
+into the prompt and never run.
+---
+ par-term-render/src/scrollbar.rs              |  65 ++++++-
+ par-term-render/src/shaders/scrollbar.wgsl    |  29 ++-
+ .../window_state_impl/handle_window_event.rs  |  66 ++-----
+ src/app/render_pipeline/frame_setup.rs        | 174 ++++++++++++++++--
+ src/app/render_pipeline/gather_data.rs        |  33 ++++
+ src/app/render_pipeline/gpu_submit.rs         |   5 +
+ src/app/render_pipeline/mod.rs                |   5 +
+ src/app/render_pipeline/pane_render.rs        |  28 ++-
+ src/app/window_manager/cli_timer.rs           |  13 +-
+ src/app/window_state/impl_init.rs             |   4 +
+ src/app/window_state/mod.rs                   |  23 +++
+ 11 files changed, 361 insertions(+), 84 deletions(-)
+
+diff --git a/par-term-render/src/scrollbar.rs b/par-term-render/src/scrollbar.rs
+index a0d6a12..f6354a9 100644
+--- a/par-term-render/src/scrollbar.rs
++++ b/par-term-render/src/scrollbar.rs
+@@ -119,6 +119,20 @@ struct ScrollbarUniforms {
+     size: [f32; 2],     // width, height
+     // Color (RGBA)
+     color: [f32; 4],
++    // Rounded-rect parameters for the shader: radius along x, radius along y,
++    // anti-alias width, unused. See [`ScrollbarUniforms::capsule_shape`].
++    shape: [f32; 4],
++}
++
++impl ScrollbarUniforms {
++    /// Capsule parameters derived from pixel sizes.
++    ///
++    /// The shader works in pixels so the end caps come out as true semicircles: the
++    /// bar is swept by a radius of half its width, whatever the aspect ratio. `z` is
++    /// an anti-alias width of one pixel, keeping the edge crisp.
++    fn capsule_shape(width_px: f32, height_px: f32) -> [f32; 4] {
++        [width_px.max(1.0), height_px.max(1.0), 1.0, 0.0]
++    }
+ }
+ 
+ /// Data for hit-testing marks on the scrollbar
+@@ -252,6 +266,7 @@ impl Scrollbar {
+                             position: [0.0, 0.0],
+                             size: [1.0, 1.0],
+                             color: self.thumb_color,
++                            shape: [0.0, 0.0, 0.0, 0.0],
+                         }]),
+                         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                     });
+@@ -263,6 +278,7 @@ impl Scrollbar {
+                             position: [0.0, 0.0],
+                             size: [1.0, 1.0],
+                             color: self.track_color,
++                            shape: [0.0, 0.0, 0.0, 0.0],
+                         }]),
+                         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                     });
+@@ -337,7 +353,9 @@ impl Scrollbar {
+         self.ensure_slot(slot);
+ 
+         // Show scrollbar when either scrollback exists or mark indicators are available
+-        let visible = total_lines > visible_lines || !marks.is_empty();
++        let visible = (total_lines > visible_lines || !marks.is_empty())
++            && window_width > 0
++            && window_height as f32 > content_offset_y + content_inset_bottom;
+         self.slots[slot].visible = visible;
+         if record_hit_state {
+             self.hit_visible = visible;
+@@ -372,8 +390,7 @@ impl Scrollbar {
+         // Calculate scrollbar dimensions (guard against zero)
+         let total = total_lines.max(1);
+         let viewport_ratio = visible_lines.min(total) as f32 / total as f32;
+-        let scrollbar_height =
+-            (viewport_ratio * track_pixel_height).max(MIN_SCROLLBAR_THUMB_HEIGHT_PX);
++        let scrollbar_height = thumb_height(viewport_ratio, track_pixel_height);
+ 
+         // Calculate scrollbar position
+         // When scroll_offset is 0, we're at the bottom
+@@ -426,6 +443,10 @@ impl Scrollbar {
+             position: [ndc_x, track_ndc_y],
+             size: [ndc_width, track_ndc_height],
+             color: self.track_color,
++            shape: ScrollbarUniforms::capsule_shape(
++                ndc_width * ww * 0.5,
++                track_ndc_height * wh * 0.5,
++            ),
+         };
+         queue.write_buffer(
+             &self.slots[slot].track_uniform_buffer,
+@@ -441,6 +462,10 @@ impl Scrollbar {
+             position: [ndc_x, thumb_ndc_y],
+             size: [ndc_width, thumb_ndc_height],
+             color: self.thumb_color,
++            shape: ScrollbarUniforms::capsule_shape(
++                ndc_width * ww * 0.5,
++                thumb_ndc_height * wh * 0.5,
++            ),
+         };
+         queue.write_buffer(
+             &self.slots[slot].thumb_uniform_buffer,
+@@ -589,6 +614,10 @@ impl Scrollbar {
+                 position: [ndc_x, ndc_y - mark_height_ndc / 2.0],
+                 size: [ndc_width, mark_height_ndc],
+                 color,
++                shape: ScrollbarUniforms::capsule_shape(
++                    ndc_width * ww * 0.5,
++                    mark_height_ndc * wh * 0.5,
++                ),
+             };
+ 
+             // Update the pre-allocated buffer using queue.write_buffer (no new allocation)
+@@ -739,3 +768,33 @@ impl Scrollbar {
+         closest.map(|(_, hit_info)| &hit_info.mark)
+     }
+ }
++
++/// The minimum clickable size cannot exceed the available track (e.g. on minimize).
++fn thumb_height(viewport_ratio: f32, track_height: f32) -> f32 {
++    (viewport_ratio * track_height)
++        .max(MIN_SCROLLBAR_THUMB_HEIGHT_PX)
++        .min(track_height)
++}
++
++#[cfg(test)]
++mod geometry_tests {
++    use super::thumb_height;
++
++    #[test]
++    fn tiny_tracks_never_produce_a_negative_scroll_range() {
++        for track in [0.0_f32, 1.0, 19.0, 20.0, 21.0, 100.0] {
++            for ratio in [0.0_f32, 0.01, 0.5, 1.0] {
++                let height = thumb_height(ratio, track);
++                let travel = track - height;
++                assert!(height >= 0.0 && height <= track);
++                assert_eq!(travel.clamp(0.0, travel), travel);
++            }
++        }
++    }
++
++    #[test]
++    fn normal_tracks_keep_the_clickable_minimum_and_proportional_height() {
++        assert_eq!(thumb_height(0.01, 100.0), 20.0);
++        assert_eq!(thumb_height(0.5, 100.0), 50.0);
++    }
++}
+diff --git a/par-term-render/src/shaders/scrollbar.wgsl b/par-term-render/src/shaders/scrollbar.wgsl
+index 1dc531d..780ae7e 100644
+--- a/par-term-render/src/shaders/scrollbar.wgsl
++++ b/par-term-render/src/shaders/scrollbar.wgsl
+@@ -4,6 +4,11 @@ struct Uniforms {
+     position: vec2<f32>,  // Position in NDC
+     size: vec2<f32>,      // Size in NDC
+     color: vec4<f32>,     // RGBA color
++    // Rounded-rect / capsule parameters: the quad's size in pixels, an
++    // anti-alias width in pixels, and one unused slot. Working in pixels lets the
++    // shader build a true capsule, whose end caps stay circular regardless of the
++    // bar's aspect ratio.
++    shape: vec4<f32>,
+ }
+ 
+ @group(0) @binding(0)
+@@ -36,16 +41,20 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+ 
+ @fragment
+ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+-    // Simple rounded corners at left and right edges
+-    let edge_radius = 0.3;  // Radius for rounded corners
+-    let edge_x = min(in.uv.x, 1.0 - in.uv.x);  // Distance from left or right edge
+-
+-    // Only apply rounding at the left and right edges
+-    var alpha = uniforms.color.a;
+-    if edge_x < edge_radius {
+-        let edge_dist = edge_x / edge_radius;
+-        alpha *= smoothstep(0.0, 0.5, edge_dist);
+-    }
++    // Capsule in pixel space: a vertical segment inset by half the width, swept by a
++    // radius of half the width. Doing this per-axis in normalised units would give an
++    // ellipse whose corners differ on x and y; in pixels the caps are true semicircles.
++    let size_px = max(uniforms.shape.xy, vec2<f32>(1.0, 1.0));
++    let p_px = (in.uv - vec2<f32>(0.5, 0.5)) * size_px;
++    let radius = size_px.x * 0.5;
++    let half_segment = max((size_px.y - size_px.x) * 0.5, 0.0);
++    let d = vec2<f32>(abs(p_px.x), max(abs(p_px.y) - half_segment, 0.0));
++    let dist = length(d) - radius;
++
++    // Fade across roughly one pixel so the edge is crisp rather than blurry.
++    let aa = max(uniforms.shape.z, 0.5);
++    let coverage = 1.0 - smoothstep(-aa, aa, dist);
++    let alpha = uniforms.color.a * coverage;
+ 
+     // Output premultiplied colors for PreMultiplied composite alpha mode
+     return vec4<f32>(uniforms.color.rgb * alpha, alpha);
+diff --git a/src/app/handler/window_state_impl/handle_window_event.rs b/src/app/handler/window_state_impl/handle_window_event.rs
+index 2d0cc82..4ae00d1 100644
+--- a/src/app/handler/window_state_impl/handle_window_event.rs
++++ b/src/app/handler/window_state_impl/handle_window_event.rs
+@@ -101,41 +101,24 @@ impl WindowState {
+ 
+             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
++                    log::info!(
++                        "SURFACE_SRC ScaleFactorChanged scale={} inner_size={:?}",
++                        scale_factor,
++                        window.inner_size()
++                    );
+                     log::info!(
+                         "Scale factor changed to {} (display change detected)",
+                         scale_factor
+                     );
+ 
+                     let size = window.inner_size();
+-                    let (cols, rows) = renderer.handle_scale_factor_change(scale_factor, size);
++                    // Grid only; the PTY is told once the size settles (see
++                    // `commit_pty_grid_when_settled`).
++                    let _ = renderer.handle_scale_factor_change(scale_factor, size);
+ 
+                     // Reconfigure surface after scale factor change.
+                     // This is important when the physical extent is unchanged.
+                     renderer.reconfigure_surface();
+-                    // Calculate pixel dimensions
+-                    let cell_width = renderer.cell_width();
+-                    let cell_height = renderer.cell_height();
+-                    let width_px = (cols as f32 * cell_width) as usize;
+-                    let height_px = (rows as f32 * cell_height) as usize;
+-
+-                    // Resize all tabs' terminals with pixel dimensions for TIOCGWINSZ support
+-                    for tab in self.tab_manager.tabs_mut() {
+-                        // try_lock: intentional — resize happens during ScaleFactorChanged
+-                        // which fires in the sync event loop. On miss: this tab's terminal
+-                        // keeps its old size until the next resize event. Low risk as scale
+-                        // factor changes are rare (drag between displays).
+-                        if let Ok(mut term) = tab.terminal.try_write() {
+-                            if let Err(e) = term.resize_with_pixels(cols, rows, width_px, height_px)
+-                            {
+-                                crate::debug_error!(
+-                                    "TERMINAL",
+-                                    "resize_with_pixels failed (scale_factor): {e}"
+-                                );
+-                            }
+-                        } else {
+-                            crate::debug::record_try_lock_failure("scale_factor_resize");
+-                        }
+-                    }
+ 
+                     // Reconfigure macOS Metal layer after display change
+                     #[cfg(target_os = "macos")]
+@@ -186,31 +169,22 @@ impl WindowState {
+ 
+             WindowEvent::Resized(physical_size) => {
+                 if let Some(renderer) = &mut self.renderer {
++                    log::info!("SURFACE_SRC Resized physical_size={:?}", physical_size);
+                     let (cols, rows) = renderer.resize(physical_size);
+ 
+-                    // Calculate text area pixel dimensions
+-                    let cell_width = renderer.cell_width();
+-                    let cell_height = renderer.cell_height();
+-                    let width_px = (cols as f32 * cell_width) as usize;
+-                    let height_px = (rows as f32 * cell_height) as usize;
++                    // A real size arrived, so the grid is trustworthy again: this is what
++                    // lets the settling gate resume after a minimize. See
++                    // `WindowState::pty_grid_suspect`.
++                    self.pty_grid_suspect = false;
+ 
+-                    // Resize all tabs' terminals with pixel dimensions for TIOCGWINSZ support
+-                    // This allows applications like kitty icat to query pixel dimensions
+-                    // Note: The core library (v0.11.0+) implements scrollback reflow when
+-                    // width changes - wrapped lines are unwrapped/re-wrapped as needed.
++                    // The PTY is told about the new grid by
++                    // `commit_pty_grid_when_settled`, once this size has survived a
++                    // frame. Pushing it here is what let a transient grid reach the
++                    // children mid-settle, so only the caches are refreshed now.
+                     for tab in self.tab_manager.tabs_mut() {
+-                        // try_lock: intentional — Resized fires in the sync event loop.
+-                        // On miss: this tab's terminal keeps its old dimensions; the cell
+-                        // cache is still invalidated below so rendering uses the correct
+-                        // grid size. The terminal size will be fixed on the next resize event.
+-                        let new_scrollback_len = if let Ok(mut term) = tab.terminal.try_write() {
+-                            if let Err(e) = term.resize_with_pixels(cols, rows, width_px, height_px)
+-                            {
+-                                crate::debug_error!(
+-                                    "TERMINAL",
+-                                    "resize_with_pixels failed (Resized): {e}"
+-                                );
+-                            }
++                        // try_read: the resize itself moved to the settling gate, so this
++                        // pass only refreshes the scrollback length the scrollbar uses.
++                        let new_scrollback_len = if let Ok(term) = tab.terminal.try_read() {
+                             Some(term.scrollback_len())
+                         } else {
+                             crate::debug::record_try_lock_failure("resize");
+diff --git a/src/app/render_pipeline/frame_setup.rs b/src/app/render_pipeline/frame_setup.rs
+index 0798768..77fe6db 100644
+--- a/src/app/render_pipeline/frame_setup.rs
++++ b/src/app/render_pipeline/frame_setup.rs
+@@ -20,6 +20,29 @@ impl WindowState {
+     /// press/release) would stall until the next unrelated wake — the "have to click
+     /// twice to switch tabs" bug.
+     pub(super) fn should_render_frame(&mut self) -> bool {
++        // A minimized window has no drawable area. Building a frame for it drives the
++        // layout code against a zero-sized surface, which is what made par-term panic
++        // (`f32::clamp` with min > max) the moment the window was minimized — the same
++        // panic the stock 0.45.0 build shows. No frame is built while minimized; a
++        // repaint is armed so restoring the window redraws immediately.
++        if self
++            .window
++            .as_ref()
++            .is_some_and(|window| window.is_minimized() == Some(true))
++        {
++            // A minimized window reports its icon size, not a usable terminal size
++            // (192x34 -> a 12x1 grid). Mark the grid untrustworthy and drop any pending
++            // candidate: restoring re-enables frames a few milliseconds before the
++            // restored size arrives, so the renderer still holds that one-row grid when
++            // settling resumes. Without this the gate would see the same grid on two
++            // consecutive frames and hand a one-row terminal to the children. The flag
++            // is cleared by the next real `WindowEvent::Resized`.
++            self.pty_grid_suspect = true;
++            self.pty_grid_candidate = None;
++            self.focus_state.pending_egui_repaint = true;
++            return false;
++        }
++
+         let target_fps =
+             if self.config.load().power.pause_refresh_on_blur && !self.focus_state.is_focused {
+                 self.config.load().power.unfocused_fps
+@@ -116,28 +139,15 @@ impl WindowState {
+                 tab_bar_width,
+             );
+             if let Some((new_cols, new_rows)) = grid_changed {
+-                let cell_width = renderer.cell_width();
+-                let cell_height = renderer.cell_height();
+-                let width_px = (new_cols as f32 * cell_width) as usize;
+-                let height_px = (new_rows as f32 * cell_height) as usize;
+-
++                // Invalidate the caches only. The PTY learns the new grid from
++                // `commit_pty_grid_when_settled`, once the size stops changing, so a
++                // tab-bar offset that is itself still settling cannot reach the child.
+                 for tab in self.tab_manager.tabs_mut() {
+-                    if let Ok(mut term) = tab.terminal.try_write() {
+-                        term.set_cell_dimensions(cell_width as u32, cell_height as u32);
+-                        if let Err(e) =
+-                            term.resize_with_pixels(new_cols, new_rows, width_px, height_px)
+-                        {
+-                            crate::debug_error!(
+-                                "TERMINAL",
+-                                "resize_with_pixels failed (sync_layout): {e}"
+-                            );
+-                        }
+-                    }
+                     tab.active_cache_mut().cells = None;
+                 }
+                 crate::debug_info!(
+                     "TAB_SYNC",
+-                    "Tab bar offsets changed (position={:?}), resized terminals to {}x{}",
++                    "Tab bar offsets changed (position={:?}), grid now {}x{}",
+                     self.config.load().tabs.tab_bar_position,
+                     new_cols,
+                     new_rows
+@@ -149,4 +159,134 @@ impl WindowState {
+         // Must happen before cell gathering so the row count is correct.
+         self.sync_status_bar_inset();
+     }
++
++    /// Hand the terminal grid to the PTY, but only once it has stopped changing.
++    ///
++    /// Window setup and display changes report several grids within a few
++    /// milliseconds — a restored placement, the real window size, then the tab bar
++    /// offset — and each one used to be pushed straight to the children. A TUI that
++    /// reads the size during that burst lays out for a value that is already stale
++    /// and leaves its input box off-screen, which is why the pi agent looks like it
++    /// is not accepting input. Waiting for the same grid on two consecutive frames
++    /// costs one frame of latency and removes the burst entirely.
++    pub(super) fn commit_pty_grid_when_settled(&mut self) {
++        // A minimized window's grid is its icon size, and the frames that resume on
++        // restore run before the restored size event arrives. Hold the children on
++        // their last good grid until a real size lands.
++        if self.pty_grid_suspect {
++            self.pty_grid_candidate = None;
++            return;
++        }
++        let Some(renderer) = &self.renderer else {
++            return;
++        };
++        let current = renderer.grid_size();
++
++        if self.pty_grid_committed == Some(current) {
++            // Already delivered; nothing left to settle.
++            self.pty_grid_candidate = None;
++            return;
++        }
++        if self.pty_grid_candidate != Some(current) {
++            // New value: remember it and wait to see whether it survives a frame.
++            self.pty_grid_candidate = Some(current);
++            return;
++        }
++        self.push_grid_to_pty(current);
++    }
++
++    /// Send `size` to every tab's PTY, retrying on the next frame if a lock is missed.
++    fn push_grid_to_pty(&mut self, size: (usize, usize)) {
++        let Some(renderer) = &self.renderer else {
++            return;
++        };
++        let cell_width = renderer.cell_width();
++        let cell_height = renderer.cell_height();
++        let (cols, rows) = size;
++        let width_px = (cols as f32 * cell_width) as usize;
++        let height_px = (rows as f32 * cell_height) as usize;
++
++        // The reader thread holds a terminal's write lock while it parses output, and
++        // contention peaks exactly when a TUI floods the screen. Leaving the size
++        // uncommitted on a miss makes the next frame retry instead of dropping it.
++        let mut all_delivered = true;
++        for tab in self.tab_manager.tabs_mut() {
++            let Ok(mut term) = tab.terminal.try_write() else {
++                crate::debug::record_try_lock_failure("pty_grid_settle");
++                all_delivered = false;
++                continue;
++            };
++            term.set_cell_dimensions(cell_width as u32, cell_height as u32);
++            // A same-size re-assert is a no-op for ConPTY: only a real size change makes
++            // it queue a size record for the child. Shrink one column and restore it,
++            // which is the sequence that forces a Windows TUI to re-lay out (the same
++            // trick wmux uses to make Claude redraw after re-attaching to a session).
++            if cols > 1 {
++                let narrow_px = ((cols - 1) as f32 * cell_width) as usize;
++                let _ = term.resize_with_pixels(cols - 1, rows, narrow_px, height_px);
++            }
++            if let Err(e) = term.resize_with_pixels(cols, rows, width_px, height_px) {
++                crate::debug_error!("TERMINAL", "grid commit failed: {e}");
++                all_delivered = false;
++            }
++        }
++
++        if all_delivered {
++            self.pty_grid_committed = Some(size);
++            self.pty_grid_candidate = None;
++            crate::debug_info!("PTY_GRID", "committed settled grid {}x{}", cols, rows);
++        }
++        // Otherwise the candidate stays set, so the next frame retries the same size.
++    }
++
++    /// Re-assert the PTY size for tabs that entered the alternate screen.
++    ///
++    /// Unix terminals deliver a `SIGWINCH` pulse at that moment (the emulator core
++    /// does it), but Windows/ConPTY has no out-of-band resize channel — so the only
++    /// way to make the child re-read its size there is to set the size again
++    /// through the PTY. Entering the alternate screen is exactly when a TUI reads
++    /// its geometry, which is why the pulse is timed to that transition.
++    ///
++    /// The request stays pending until a write actually succeeds. The reader thread
++    /// holds the terminal write lock while it parses output, so a one-shot attempt
++    /// dropped on contention would leave a TUI on a stale size with nothing left to
++    /// retry it — and contention peaks precisely when the TUI floods output.
++    pub(super) fn sync_resize_pulses(&mut self) {
++        // Hoist the cell metrics so the immutable borrow of `self.renderer` ends
++        // before `self.tab_manager` is borrowed mutably below.
++        let Some(renderer) = &self.renderer else {
++            return;
++        };
++        let cell_width = renderer.cell_width();
++        let cell_height = renderer.cell_height();
++
++        for tab in self.tab_manager.tabs_mut() {
++            if !tab.pending_resize_pulse {
++                continue;
++            }
++            let Ok(mut term) = tab.terminal.try_write() else {
++                // Still held by the reader thread; retry on the next frame.
++                continue;
++            };
++            let (cols, rows) = term.dimensions();
++            term.set_cell_dimensions(cell_width as u32, cell_height as u32);
++            let width_px = (cols as f32 * cell_width) as usize;
++            let height_px = (rows as f32 * cell_height) as usize;
++            match term.resize_with_pixels(cols, rows, width_px, height_px) {
++                Ok(()) => {
++                    tab.pending_resize_pulse = false;
++                    crate::debug_info!(
++                        "TAB_SYNC",
++                        "Alt-screen resize pulse applied ({}x{})",
++                        cols,
++                        rows
++                    );
++                }
++                Err(e) => {
++                    // Keep it pending so the next frame tries again.
++                    crate::debug_error!("TERMINAL", "Alt-screen resize pulse failed: {e}");
++                }
++            }
++        }
++    }
+ }
+diff --git a/src/app/render_pipeline/gather_data.rs b/src/app/render_pipeline/gather_data.rs
+index 4975815..3d62481 100644
+--- a/src/app/render_pipeline/gather_data.rs
++++ b/src/app/render_pipeline/gather_data.rs
+@@ -100,6 +100,39 @@ impl WindowState {
+         let cell_grid_dims = snap.grid_dims;
+ 
+         if let Some(tab) = self.tab_manager.active_tab_mut() {
++            // A TUI reads its geometry when it starts, so that is when a size pulse has
++            // to land. Unix gets one from the emulator core (a real SIGWINCH);
++            // Windows/ConPTY has no out-of-band channel, so it is queued here and
++            // re-applied through the PTY by `sync_resize_pulses`.
++            //
++            // Two start signals are watched, because they cover different apps:
++            // full-screen TUIs switch to the alternate screen, while inline ones
++            // (the pi agent) never do and instead enable modifyOtherKeys. Without the
++            // second signal such an app waits forever for a size event that a
++            // Windows terminal never sends on its own.
++            if cfg!(target_os = "windows") {
++                let (modify_other_keys, _cursor, _alt) = tab.read_or_cached_modes();
++                let modify_other_keys_on = modify_other_keys > 0;
++                if modify_other_keys_on && !tab.was_modify_other_keys {
++                    tab.pending_resize_pulse = true;
++                }
++                tab.was_modify_other_keys = modify_other_keys_on;
++
++                if is_alt_screen && !tab.was_alt_screen {
++                    tab.pending_resize_pulse = true;
++                }
++
++                // Chat-style TUIs (the pi agent) never switch screens; they reveal
++                // themselves by grabbing the mouse for scrolling instead.
++                let mouse_tracking = tab
++                    .terminal
++                    .try_read()
++                    .is_ok_and(|term| term.is_mouse_tracking_enabled());
++                if mouse_tracking && !tab.was_mouse_tracking {
++                    tab.pending_resize_pulse = true;
++                }
++                tab.was_mouse_tracking = mouse_tracking;
++            }
+             tab.was_alt_screen = is_alt_screen;
+         }
+ 
+diff --git a/src/app/render_pipeline/gpu_submit.rs b/src/app/render_pipeline/gpu_submit.rs
+index e281026..d7685a5 100644
+--- a/src/app/render_pipeline/gpu_submit.rs
++++ b/src/app/render_pipeline/gpu_submit.rs
+@@ -296,6 +296,10 @@ impl WindowState {
+             };
+ 
+             let actual_render_start = std::time::Instant::now();
++            // Read before the closure below borrows `self.tab_manager` mutably, and pass
++            // the same trust rule `commit_pty_grid_when_settled` uses: a minimized window
++            // reports its icon size, which the panes turn into a one-row grid.
++            let grid_trustworthy = !self.pty_grid_suspect;
+             let render_result = if pane_count > 0 {
+                 // Gather all per-pane render data.
+                 let pane_render_data = self.tab_manager.active_tab_mut().and_then(|tab| {
+@@ -310,6 +314,7 @@ impl WindowState {
+                         // panes have a stable column count regardless of focus or
+                         // scrollback state — prevents layout reflow on pane click.
+                         sizing.scrollbar_width,
++                        grid_trustworthy,
+                     )
+                 });
+ 
+diff --git a/src/app/render_pipeline/mod.rs b/src/app/render_pipeline/mod.rs
+index 247e8dc..92b6256 100644
+--- a/src/app/render_pipeline/mod.rs
++++ b/src/app/render_pipeline/mod.rs
+@@ -51,6 +51,11 @@ impl WindowState {
+ 
+         let t_layout = std::time::Instant::now();
+         self.sync_layout();
++        // These two run here rather than inside `sync_layout`: their triggers are
++        // terminal state changes (a settled grid, alt-screen entry), not chrome
++        // geometry.
++        self.commit_pty_grid_when_settled();
++        self.sync_resize_pulses();
+         let layout_ms = t_layout.elapsed().as_millis();
+ 
+         let t_gather = std::time::Instant::now();
+diff --git a/src/app/render_pipeline/pane_render.rs b/src/app/render_pipeline/pane_render.rs
+index 672f327..9c17108 100644
+--- a/src/app/render_pipeline/pane_render.rs
++++ b/src/app/render_pipeline/pane_render.rs
+@@ -64,6 +64,10 @@ pub(super) type PaneRenderDataResult = Option<(
+ ///   for the scrollbar.  In split-pane mode this is applied to ALL panes so the
+ ///   column count never changes on focus switch (preventing layout reflow).
+ ///   The scrollbar is shown per-pane based on each pane's scrollback state.
++/// * `grid_trustworthy` - Whether the pane bounds describe a size the user actually
++///   asked for. False while the window is minimized or its restored size has not
++///   arrived yet, when the bounds are the icon-sized surface (a one-row grid).
++#[allow(clippy::too_many_arguments)] // Each parameter comes from a different owner (tab, config, renderer sizing, pane manager); grouping them would only shuffle the borrows
+ pub(super) fn gather_pane_render_data(
+     tab: &mut crate::tab::Tab,
+     config: &Config,
+@@ -72,6 +76,7 @@ pub(super) fn gather_pane_render_data(
+     cursor_opacity: f32,
+     pane_count: usize,
+     scrollbar_inset: f32,
++    grid_trustworthy: bool,
+ ) -> PaneRenderDataResult {
+     let effective_padding = if pane_count > 1 && config.window.hide_window_padding_on_split {
+         0.0
+@@ -176,12 +181,20 @@ pub(super) fn gather_pane_render_data(
+         let center_offset_x = ((content_w - actual_content_w) / 2.0).floor();
+         let center_offset_y = ((content_h - actual_content_h) / 2.0).floor();
+ 
+-        pane.resize_terminal_with_cell_dims(
+-            cols,
+-            rows,
+-            sizing.cell_width as u32,
+-            sizing.cell_height as u32,
+-        );
++        // This is the second of the two paths that resize a child, and unlike
++        // `commit_pty_grid_when_settled` it runs on every frame, so it has to apply the
++        // same trust rule: while the window is minimized the pane bounds describe the
++        // icon-sized surface, and restoring re-enables frames before the restored size
++        // event arrives. Pushing that grid makes a TUI lay out for a terminal it will
++        // never see. The grid is still computed so `viewport` below matches the surface.
++        if grid_trustworthy {
++            pane.resize_terminal_with_cell_dims(
++                cols,
++                rows,
++                sizing.cell_width as u32,
++                sizing.cell_height as u32,
++            );
++        }
+ 
+         let mut viewport = PaneViewport::with_padding(
+             bounds.x,
+@@ -668,6 +681,8 @@ impl crate::app::window_state::WindowState {
+         // Same call the live frame makes. `resize_terminal_with_cell_dims` inside
+         // is a no-op when the dimensions already match, so a capture does not
+         // resize the PTY or emit SIGWINCH.
++        //
++        // A capture only happens on a visible window, so the grid is trustworthy here.
+         let Some((pane_data, dividers, pane_titles, focused_viewport, _)) =
+             self.tab_manager.active_tab_mut().and_then(|tab| {
+                 gather_pane_render_data(
+@@ -678,6 +693,7 @@ impl crate::app::window_state::WindowState {
+                     cursor_opacity,
+                     pane_count,
+                     sizing.scrollbar_width,
++                    true,
+                 )
+             })
+         else {
+diff --git a/src/app/window_manager/cli_timer.rs b/src/app/window_manager/cli_timer.rs
+index 7aa90b1..962cc77 100644
+--- a/src/app/window_manager/cli_timer.rs
++++ b/src/app/window_manager/cli_timer.rs
+@@ -54,8 +54,17 @@ impl WindowManager {
+         if let Some(window_state) = self.focused_window_mut()
+             && let Some(tab) = window_state.tab_manager.active_tab_mut()
+         {
+-            // Send the command followed by Enter
+-            let cmd_with_enter = format!("{}\n", cmd);
++            // Send the command followed by Enter.
++            //
++            // The terminator is platform-specific: Windows ConPTY treats a bare LF as
++            // a literal newline in the input buffer rather than as the Enter key, so a
++            // command sent with `\n` is typed into the prompt but never submitted.
++            // POSIX ptys accept LF from readline, so they keep it.
++            #[cfg(windows)]
++            let terminator = "\r";
++            #[cfg(not(windows))]
++            let terminator = "\n";
++            let cmd_with_enter = format!("{cmd}{terminator}");
+             if let Ok(term) = tab.terminal.try_read() {
+                 if let Err(e) = term.write(cmd_with_enter.as_bytes()) {
+                     log::error!("Failed to send command to shell: {}", e);
+diff --git a/src/app/window_state/impl_init.rs b/src/app/window_state/impl_init.rs
+index e55d547..b7d4400 100644
+--- a/src/app/window_state/impl_init.rs
++++ b/src/app/window_state/impl_init.rs
+@@ -128,6 +128,10 @@ impl WindowState {
+ 
+             pending_snap_size: None,
+ 
++            pty_grid_committed: None,
++            pty_grid_candidate: None,
++            pty_grid_suspect: false,
++
+             last_workflow_context: std::sync::Arc::new(std::sync::Mutex::new(None)),
+         }
+     }
+diff --git a/src/app/window_state/mod.rs b/src/app/window_state/mod.rs
+index 88c4453..d8b3399 100644
+--- a/src/app/window_state/mod.rs
++++ b/src/app/window_state/mod.rs
+@@ -266,4 +266,27 @@ pub struct WindowState {
+     /// Tracks the last size we requested via `request_inner_size` for snap-to-grid.
+     /// Cleared once we receive a Resized event matching this size, preventing infinite re-snap.
+     pub(crate) pending_snap_size: Option<winit::dpi::PhysicalSize<u32>>,
++
++    // =========================================================================
++    // PTY grid settling
++    // =========================================================================
++    /// Last grid size actually handed to the PTY.
++    ///
++    /// Window setup reports several grids in quick succession (a restored placement,
++    /// then the real size, then the tab bar offset). Pushing each one makes a TUI
++    /// read a size that is already stale, lay out for it, and leave its input box
++    /// off-screen — so the child only ever sees a settled grid.
++    pub(crate) pty_grid_committed: Option<(usize, usize)>,
++    /// Grid seen on the previous check; a repeat means the size has settled.
++    pub(crate) pty_grid_candidate: Option<(usize, usize)>,
++    /// The window is minimized or was, so the grid it reports cannot be trusted.
++    ///
++    /// A minimized window reports its icon size (192x34 for 1300x900 at 150%), which
++    /// the renderer happily turns into a 13x1 grid. Restoring re-enables frames a few
++    /// milliseconds *before* the restored size arrives, so without this gate the settle
++    /// logic sees the same one-row grid on two consecutive frames and hands it to the
++    /// children — exactly the transient garbage the settling gate exists to prevent.
++    /// Cleared by the next real `WindowEvent::Resized`, which is the point where the
++    /// grid is derived from a size the user actually asked for.
++    pub(crate) pty_grid_suspect: bool,
+ }

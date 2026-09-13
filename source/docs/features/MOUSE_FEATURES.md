@@ -1,0 +1,337 @@
+# Mouse Features
+
+par-term provides comprehensive mouse support for text selection, URL handling, and pane management.
+
+## Table of Contents
+- [Overview](#overview)
+- [Text Selection](#text-selection)
+- [URL Handling](#url-handling)
+- [Semantic History](#semantic-history)
+- [Cursor Positioning](#cursor-positioning)
+- [Scrolling](#scrolling)
+- [Pane Interaction](#pane-interaction)
+- [Configuration](#configuration)
+- [Platform Differences](#platform-differences)
+- [Known Fixes](#known-fixes)
+- [Related Documentation](#related-documentation)
+
+## Overview
+
+Mouse interactions in par-term:
+
+```mermaid
+graph TD
+    Mouse[Mouse Input]
+    Left[Left Button]
+    Middle[Middle Button]
+    Right[Right Button]
+    Wheel[Scroll Wheel]
+
+    Mouse --> Left
+    Mouse --> Middle
+    Mouse --> Right
+    Mouse --> Wheel
+
+    Left --> Selection[Text Selection]
+    Left --> URLs[URL Clicking]
+    Left --> Files[File Path Opening]
+    Left --> Cursor[Cursor Position]
+    Left --> Scrollbar[Scrollbar]
+    Left --> Divider[Pane Dividers]
+
+    Middle --> Paste[Paste Primary]
+    Right --> AppMouse[App Mouse Tracking]
+    Wheel --> Scroll[Scrolling]
+
+    class Mouse primary
+    class Left active
+    class Middle info
+    class Right external
+    class Wheel warning
+    class Selection,URLs,Files,Cursor,Scrollbar,Divider,Paste,AppMouse,Scroll neutral
+
+    classDef primary fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#ffffff
+    classDef active fill:#1b5e20,stroke:#4caf50,stroke-width:2px,color:#ffffff
+    classDef info fill:#0d47a1,stroke:#2196f3,stroke-width:2px,color:#ffffff
+    classDef external fill:#4a148c,stroke:#9c27b0,stroke-width:2px,color:#ffffff
+    classDef warning fill:#ff6f00,stroke:#ffa726,stroke-width:2px,color:#ffffff
+    classDef neutral fill:#37474f,stroke:#78909c,stroke-width:2px,color:#ffffff
+```
+
+## Text Selection
+
+### Selection Modes
+
+| Action | Mode | Description |
+|--------|------|-------------|
+| Click + Drag | Normal | Character-by-character selection |
+| Double-Click | Word | Select word at cursor |
+| Triple-Click | Line | Select entire line |
+| Alt+Cmd/Super + Drag | Rectangular | Column-based block selection (Option+Cmd on macOS, Alt+Win on Windows/Linux) |
+
+### Word Selection
+
+Double-click selects a word based on word boundary characters.
+
+**Default word characters:** `/-+\~_.` (alphanumeric + these)
+
+Configure in `config.yaml`:
+```yaml
+word_characters: "/-+\\~_."
+```
+
+### Smart Selection
+
+When enabled, double-click can detect and select:
+- URLs (http://, https://, etc.)
+- Email addresses
+- File paths
+- IP addresses
+- UUIDs, Java/Python imports, C++ namespaces, quoted strings
+
+Built-in rules are ordered by precision (highest first). Configure custom rules:
+```yaml
+smart_selection_enabled: true
+smart_selection_rules:
+  - name: "HTTP URL"
+    regex: 'https?://[^\s<>\[\]{}|\\^`\x00-\x1f]+'
+    precision: very_high
+    enabled: true
+```
+
+Precision levels: `very_low`, `low`, `normal`, `high`, `very_high`. Higher precision rules are checked first.
+
+### Auto-Copy
+
+Selected text is automatically copied to clipboard when selection ends:
+```yaml
+auto_copy_selection: true
+copy_trailing_newline: false  # Strip trailing newlines
+```
+
+### OSC 52 Clipboard (Remote Copy)
+
+Programs can also push content *to* your clipboard with the OSC 52 escape sequence. This is how a remote application copies to your local clipboard over a plain SSH session — terminal multiplexers such as tmux and remote workspace managers use it so that a copy initiated on the remote host lands in your local clipboard rather than the remote shell's.
+
+par-term polls the active tab's OSC 52 content each frame and, when it changes, writes it to the system clipboard via the same path local selection-copy uses. Writes are deduped against the last applied value so the clipboard is not rewritten every frame, and only the active tab's terminal is polled (covering the single-PTY SSH case); OSC 52 writes from other split panes are not applied.
+
+```yaml
+osc52_clipboard: true  # Apply OSC 52 clipboard-set sequences to the system clipboard (default)
+```
+
+Disable it if you don't want programs — including those running over SSH — overwriting your clipboard. The toggle also lives under Settings → Input → Selection & Clipboard ("OSC 52 clipboard sync (programs set clipboard over SSH)").
+
+### Click Timing
+
+Configure double/triple-click detection:
+```yaml
+mouse_double_click_threshold: 500  # milliseconds (default)
+mouse_triple_click_threshold: 500  # milliseconds (default)
+```
+
+## URL Handling
+
+### Opening URLs
+
+Hold `Cmd` (macOS) or `Ctrl` (Windows/Linux) and click a URL to open it.
+
+**Detected Schemes (highlighted on hover):**
+- `http://`, `https://`
+- `ftp://`, `ftps://`, `file://`, `git://`, `ssh://`
+- `www.*` (normalized to `https://` on open)
+
+**Openable schemes** are restricted by an allowlist (SEC-009): only `http`, `https`, and `mailto` open by default. `file://` opens only when `allow_file_scheme_urls: true` is set. The other detected schemes (`ftp://`, `ftps://`, `git://`, `ssh://`) are highlighted but not forwarded to the OS handler, since the OS would otherwise dispatch them to arbitrary default apps.
+
+**Visual Feedback:**
+- Cursor changes to hand pointer on URL hover
+- Window title shows URL as tooltip
+
+### Custom Link Handler
+
+Override the default browser for URL clicks:
+```yaml
+link_handler_command: "firefox {url}"     # Linux
+link_handler_command: "open -a Safari {url}"  # macOS
+```
+
+When empty (default), URLs open in the system default browser.
+
+### OSC 8 Hyperlinks
+
+par-term supports terminal-embedded hyperlinks (OSC 8 protocol) for more reliable URL detection.
+
+## Semantic History
+
+### Opening File Paths
+
+Hold `Cmd` (macOS) or `Ctrl` (Windows/Linux) and click a detected file path to open it in your editor.
+
+**Detected Paths:**
+- Absolute paths: `/Users/name/projects/main.rs`, `/etc/config.yaml`
+- Relative paths: `./src/main.rs`, `../lib/utils.py`
+- Home-relative paths: `~/projects/app.js`
+- Paths with line numbers: `./src/main.rs:42` or `./src/main.rs:42:10`
+
+**Visual Feedback:**
+- Detected paths are highlighted with a configurable color (default: bright cyan) and optional underline
+- Underline style (solid or stipple) and visibility are configurable
+- Cursor changes to hand pointer on hover
+
+**Editor Selection:**
+- Uses `$EDITOR` / `$VISUAL` by default
+- Configurable custom editor command with `{file}`, `{line}`, `{col}` placeholders
+- Directories open in the system file manager
+
+Configure:
+```yaml
+semantic_history_enabled: true
+semantic_history_editor_mode: environment_variable  # or: custom, system_default
+semantic_history_editor: "code -g {file}:{line}"    # custom mode only
+```
+
+> See [Semantic History](SEMANTIC_HISTORY.md) for full documentation.
+
+## Cursor Positioning
+
+### Option/Alt + Click
+
+Move the text cursor to the clicked position:
+
+| Platform | Shortcut |
+|----------|----------|
+| macOS | `Option + Click` |
+| Windows/Linux | `Alt + Click` |
+
+**Requirements:**
+- Must be at bottom of scrollback (not scrolled up)
+- Not on alternate screen (apps like vim handle their own cursor)
+- Not combined with Cmd/Super
+
+Configure:
+```yaml
+option_click_moves_cursor: true
+```
+
+## Scrolling
+
+### Mouse Wheel
+
+Scroll through the scrollback buffer with the mouse wheel.
+
+Configure scroll speed:
+```yaml
+mouse_scroll_speed: 3.0  # Lines per scroll tick (default)
+```
+
+### Scrollbar
+
+- **Click thumb:** Drag to scroll
+- **Click track:** Jump to position
+- **Drag:** Smooth scrolling
+
+### Application Scrolling
+
+When a terminal application requests mouse tracking (vim, htop, etc.), scroll events are forwarded to the application instead of scrolling locally.
+
+### Right-Click
+
+Right-click forwards the event to the terminal application when mouse tracking is enabled. This allows applications like tmux and vim to handle right-click for their own context menus or actions.
+
+## Pane Interaction
+
+### Focus Panes
+
+Click on a pane to focus it.
+
+### Resize Panes
+
+Drag the divider between panes to resize:
+- Horizontal dividers: resize height
+- Vertical dividers: resize width
+
+**Visual Feedback:**
+- Cursor changes to resize indicator on divider hover
+- Dividers sync to tmux if gateway is active
+
+## Configuration
+
+### All Mouse Options
+
+```yaml
+# Selection behavior
+auto_copy_selection: true
+copy_trailing_newline: false
+word_characters: "/-+\\~_."
+smart_selection_enabled: true
+# smart_selection_rules: [...]  # Custom rules (see Smart Selection section)
+
+# Click timing
+mouse_double_click_threshold: 500
+mouse_triple_click_threshold: 500
+
+# Scroll behavior
+mouse_scroll_speed: 3.0
+report_horizontal_scroll: true
+
+# Cursor movement
+option_click_moves_cursor: true
+
+# Paste behavior
+middle_click_paste: true
+
+# URL handling
+# link_handler_command: ""  # Custom browser command with {url} placeholder
+
+# Window focus
+focus_follows_mouse: false
+```
+
+### Settings UI
+
+The Input tab in Settings provides:
+
+| Option | Description |
+|--------|-------------|
+| **Auto-copy selection** | Copy to clipboard on selection |
+| **Include trailing newline when copying** | Include newlines when copying |
+| **Middle-click paste** | Enable middle-click paste |
+| **Option+Click moves cursor** | Alt/Option+click cursor positioning |
+| **Focus follows mouse** | Auto-focus window on cursor enter |
+| **Report horizontal scroll events** | Forward horizontal scroll to applications |
+
+## Platform Differences
+
+| Feature | macOS | Windows/Linux |
+|---------|-------|---------------|
+| URL modifier | `Cmd` | `Ctrl` |
+| Cursor move | `Option` | `Alt` |
+| Rectangular select | `Option + Cmd` | `Alt + Win` |
+| Primary selection | No | Yes (X11) |
+| Middle-click paste | Clipboard | Primary selection |
+
+## Known Fixes
+
+The following mouse-related issues have been resolved:
+- **Soft-wrapped URL Cmd+click truncation** -- wrap-continuation flags are captured with the rendered cell snapshot, so a URL split across lines no longer opens only the first line when detection reacquires a terminal lock after cell extraction
+
+- **Text Selection in Mouse-Tracking Apps** -- Holding Shift while clicking or dragging now bypasses application mouse tracking to allow local text selection. This matches the standard behavior of iTerm2, Kitty, and Alacritty for apps like `less`, `vim`, and `htop` that enable mouse tracking on the alternate screen
+
+- **Trackpad Jitter Selection** -- Increased the mouse drag dead-zone threshold from 4 px to 8 px so that trackpad tap-to-click movement noise and minor jitter no longer create unintended micro-selections that overwrite clipboard content
+
+- **tmux Pane Click Through Clipboard Guard** -- Clicking to switch tmux panes no longer fails when an image is in the clipboard. The clipboard-image protection guard now correctly allows mouse-tracked clicks to pass through to the terminal application
+
+- **Clipboard Image Loss on Plain Click** -- When an image was present in the system clipboard, a single left-click inside an already-focused terminal window with mouse reporting (e.g., tmux) could clear the image from the clipboard. par-term now snapshots the clipboard image on mouse-down and restores it after a plain click-like gesture (no drag, no modifier keys) if the image was lost during the click
+
+- **Middle-Click Paste Priority** -- Middle-click paste now takes priority over mouse tracking and alternate screen mode, matching iTerm2 behavior. This ensures paste works reliably even in applications like tmux that enable mouse tracking
+
+- **Middle-Click Paste Focuses tmux Pane** -- When middle-clicking in tmux mode with mouse tracking active, par-term now sends a synthetic left-click press/release at the cursor position before pasting, matching iTerm2 behaviour. This ensures the correct tmux pane is focused before the paste arrives
+
+- **tmux Selection Stuck Across Panes** -- When a mouse press is consumed by mouse tracking (e.g., clicking a tmux pane), the local selection state is now cleared immediately. Previously, a stale highlight could persist across all panes indefinitely until the next local mouse interaction
+
+- **Stale Mouse State on Pane Focus Switch** -- Clicking to switch focus between split panes could leave `button_pressed = true` on the old pane, causing spurious text selection on the next click back. The old pane's mouse state is now explicitly cleared during focus transfer
+
+## Related Documentation
+
+- [README.md](../../README.md) - Project overview
+- [Keyboard Shortcuts](../guides/KEYBOARD_SHORTCUTS.md) - Keyboard shortcut reference
+- [Semantic History](SEMANTIC_HISTORY.md) - File path clicking details

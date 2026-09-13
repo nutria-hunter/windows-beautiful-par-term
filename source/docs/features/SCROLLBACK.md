@@ -1,0 +1,243 @@
+# Scrollback & Command Marks
+
+par-term provides a comprehensive scrollback system with command markers that track shell command execution, enabling navigation between prompts and viewing command timing information.
+
+## Table of Contents
+- [Overview](#overview)
+- [Scrollback Buffer](#scrollback-buffer)
+- [Command Marks](#command-marks)
+  - [How Marks Work](#how-marks-work)
+  - [Mark Colors](#mark-colors)
+  - [Mark Tooltips](#mark-tooltips)
+- [Mark Navigation](#mark-navigation)
+- [Scrollbar](#scrollbar)
+- [Configuration](#configuration)
+- [Requirements](#requirements)
+- [Related Documentation](#related-documentation)
+
+## Overview
+
+The scrollback system combines buffer history with command tracking:
+
+```mermaid
+graph TD
+    Scrollback[Scrollback System]
+    Buffer[Scrollback Buffer]
+    Marks[Command Marks]
+    Scrollbar[Scrollbar Display]
+    Navigation[Mark Navigation]
+
+    Scrollback --> Buffer
+    Scrollback --> Marks
+    Scrollback --> Scrollbar
+    Scrollback --> Navigation
+
+    Marks --> Colors[Color Coding]
+    Marks --> Tooltips[Hover Tooltips]
+    Marks --> Metadata[Command Metadata]
+
+    Metadata --> Time[Timestamp]
+    Metadata --> Duration[Duration]
+    Metadata --> Exit[Exit Code]
+
+    classDef primary fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#ffffff
+    classDef active fill:#1b5e20,stroke:#4caf50,stroke-width:2px,color:#ffffff
+    classDef data fill:#0d47a1,stroke:#2196f3,stroke-width:2px,color:#ffffff
+    classDef external fill:#4a148c,stroke:#9c27b0,stroke-width:2px,color:#ffffff
+    classDef accent fill:#880e4f,stroke:#c2185b,stroke-width:2px,color:#ffffff
+    classDef neutral fill:#37474f,stroke:#78909c,stroke-width:2px,color:#ffffff
+    classDef neutralThin fill:#37474f,stroke:#78909c,stroke-width:1px,color:#ffffff
+
+    class Scrollback primary
+    class Buffer active
+    class Marks data
+    class Scrollbar external
+    class Navigation accent
+    class Colors,Tooltips,Metadata neutral
+    class Time,Duration,Exit neutralThin
+```
+
+## Scrollback Buffer
+
+The scrollback buffer stores terminal output history for scrolling and searching.
+
+**Configuration:**
+
+```yaml
+# Number of lines to retain in scrollback
+scrollback_lines: 10000
+```
+
+**Scrolling:**
+
+| Action | Shortcut |
+|--------|----------|
+| Scroll up in scrollback | Mouse wheel up (`mouse_scroll_speed` lines per tick, default `3.0`) |
+| Scroll down in scrollback | Mouse wheel down (`mouse_scroll_speed` lines per tick, default `3.0`) |
+| Scroll up one page | `Shift+Page Up` |
+| Scroll down one page | `Shift+Page Down` |
+| Scroll to top | `Shift+Home` |
+| Scroll to bottom | `Shift+End` |
+
+> **Note:** Bare `Page Up` and `Page Down` are forwarded to the terminal application (as `\x1b[5~` / `\x1b[6~`) rather than scrolling par-term's buffer. Add `Shift` to scroll the buffer itself.
+
+## Command Marks
+
+Command marks are visual indicators on the scrollbar showing where commands were executed in the terminal history.
+
+### How Marks Work
+
+When shell integration is installed, par-term tracks:
+
+1. **Prompt Start (OSC 133;A)** - Where each prompt begins
+2. **Command Start (OSC 133;B)** - Where command input starts
+3. **Command Executed (OSC 133;C)** - When command execution starts
+4. **Command Finished (OSC 133;D)** - When command completes with exit code
+
+This metadata is displayed as colored marks on the scrollbar.
+
+```mermaid
+sequenceDiagram
+    participant Shell
+    participant Terminal
+    participant Scrollbar
+
+    Shell->>Terminal: OSC 133;A (Prompt Start)
+    Note over Terminal: Record prompt line
+    Shell->>Terminal: OSC 133;B (Command Start)
+    Shell->>Terminal: User types command
+    Shell->>Terminal: OSC 133;C (Command Executed)
+    Note over Terminal: Record start time
+    Shell->>Terminal: Command output
+    Shell->>Terminal: OSC 133;D;exit_code (Command Finished)
+    Note over Terminal: Record duration & exit code
+    Terminal->>Scrollbar: Update mark with color
+```
+
+### Mark Colors
+
+Marks are color-coded based on command exit status:
+
+| Color | Meaning | Exit Code |
+|-------|---------|-----------|
+| **Green** | Success | `0` |
+| **Red** | Failure | Non-zero |
+| **Gray** | Unknown | Not available |
+
+### Mark Tooltips
+
+Hover over scrollbar marks to see command details:
+
+**Tooltip Information:**
+- **Command**: The executed command text (truncated if long)
+- **Time**: Execution start time (HH:MM:SS)
+- **Duration**: How long the command ran
+- **Exit**: Exit code
+
+**Enabling Tooltips:**
+
+1. Press `F12` to open Settings
+2. Navigate to **Window** → Scrollbar section
+3. Enable "Show command markers" (if not already enabled)
+4. Enable "Show tooltips on hover"
+
+Or via configuration:
+
+```yaml
+scrollbar_command_marks: true
+scrollbar_mark_tooltips: true
+```
+
+## Mark Navigation
+
+Jump between command prompts using keyboard shortcuts:
+
+| Action | Shortcut |
+|--------|----------|
+| Previous command mark | `Cmd+Up` (macOS) / `Super+Up` |
+| Next command mark | `Cmd+Down` (macOS) / `Super+Down` |
+
+This is useful for quickly navigating through command history in a long terminal session.
+
+### Split Pane Support
+
+Scrollback and scrollbar work correctly in split pane mode. Each pane maintains its own independent scrollback buffer. The scrollbar appears on every pane that has scrollback content, not just the focused pane, and renders within each pane's bounds rather than spanning the full window.
+
+All panes in a split layout reserve space for the scrollbar inset, regardless of whether the scrollbar is currently visible. This ensures stable column counts when focus changes between panes and prevents text reflow caused by width fluctuations.
+
+On HiDPI displays, the scrollbar width and positioning scale correctly with the display's DPI factor. The scrollbar also rescales dynamically when a window moves between displays with different DPI values.
+
+## Scrollbar
+
+The scrollbar displays both scroll position and command marks.
+
+**Scrollbar Settings:**
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `scrollbar_position` | `"left"` or `"right"` | `"right"` |
+| `scrollbar_width` | Width in pixels | `15.0` |
+| `scrollbar_autohide_delay` | Auto-hide delay in ms (0=never) | `0` |
+| `scrollbar_thumb_color` | Thumb RGBA color (0.0-1.0 floats) | `[0.4, 0.4, 0.4, 0.95]` |
+| `scrollbar_track_color` | Track RGBA color (0.0-1.0 floats) | `[0.15, 0.15, 0.15, 0.6]` |
+| `scrollbar_command_marks` | Show command marks | `true` |
+| `scrollbar_mark_tooltips` | Show tooltips on hover | `false` |
+
+**Example Configuration:**
+
+```yaml
+scrollbar_position: right
+scrollbar_width: 14.0
+scrollbar_autohide_delay: 3000  # Hide after 3 seconds (0 = never)
+scrollbar_command_marks: true
+scrollbar_mark_tooltips: true
+scrollbar_thumb_color: [0.5, 0.5, 0.5, 0.9]
+scrollbar_track_color: [0.2, 0.2, 0.2, 0.5]
+```
+
+## Configuration
+
+Complete scrollback configuration:
+
+```yaml
+# Buffer size
+scrollback_lines: 10000
+
+# Scrollbar appearance
+scrollbar_position: right
+scrollbar_width: 15.0
+scrollbar_autohide_delay: 0
+scrollbar_thumb_color: [0.4, 0.4, 0.4, 0.95]
+scrollbar_track_color: [0.15, 0.15, 0.15, 0.6]
+
+# Command marks (requires shell integration)
+scrollbar_command_marks: true
+scrollbar_mark_tooltips: false
+```
+
+## Requirements
+
+**Command marks require shell integration to be installed.**
+
+Without shell integration, the terminal cannot track command boundaries, timestamps, or exit codes.
+
+To install shell integration:
+
+1. Press `F12` to open Settings
+2. Navigate to the **Integrations** tab
+3. In the **Shell Integration** section, click **Install** (or **Reinstall** if already installed)
+
+Or via CLI:
+
+```bash
+par-term install-shell-integration
+```
+
+See [Integrations](INTEGRATIONS.md) for detailed installation instructions.
+
+## Related Documentation
+
+- [Integrations](INTEGRATIONS.md) - Shell integration installation
+- [Keyboard Shortcuts](../guides/KEYBOARD_SHORTCUTS.md) - Navigation shortcuts
+- [Search](SEARCH.md) - Search through scrollback buffer
+- [Mouse Features](MOUSE_FEATURES.md) - Mouse wheel scrolling

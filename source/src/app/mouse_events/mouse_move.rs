@@ -1,0 +1,472 @@
+use crate::app::window_state::WindowState;
+use crate::selection::{Selection, SelectionMode};
+use crate::ui_constants::DRAG_THRESHOLD_PX;
+use crate::url_detection;
+use std::sync::Arc;
+
+impl WindowState {
+    pub(crate) fn handle_mouse_move(&mut self, position: (f64, f64)) {
+        // Update mouse position in active tab (always needed for egui)
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.active_mouse_mut().position = position;
+        }
+
+        // If a protected image-clipboard click turns into a drag, restore normal terminal
+        // mouse behavior by sending the press event once movement proves drag intent.
+        self.maybe_forward_guarded_terminal_mouse_press_on_drag(position);
+
+        // Notify status bar of mouse activity (for auto-hide timer)
+        self.status_bar_ui.on_mouse_activity();
+
+        // Check if profile drawer is open - let egui handle mouse events
+        if self.overlay_ui.profile_drawer_ui.expanded {
+            self.clear_url_hover_if_needed();
+            self.request_redraw();
+            return;
+        }
+
+        // Check if mouse is in the tab bar area - if so, skip terminal-specific processing
+        // Position update above is still needed for proper event handling
+        // Tab bar height is in logical pixels (egui); position is physical pixels (winit)
+        let tab_bar_height = self
+            .tab_bar_ui
+            .get_height(self.tab_manager.tab_count(), &self.config.load());
+        let scale_factor = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor())
+            .unwrap_or(1.0);
+        if position.1 < tab_bar_height as f64 * scale_factor {
+            self.clear_url_hover_if_needed();
+            // Request redraw so egui can update hover states
+            self.request_redraw();
+            return; // Mouse is on tab bar, let egui handle it
+        }
+
+        // --- 1. Shader Uniform Updates ---
+        // Update current mouse position for custom shaders (iMouse.xy)
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.set_shader_mouse_position(position.0 as f32, position.1 as f32);
+        }
+
+        // --- 2. URL Hover Detection ---
+        // Identify if mouse is over a clickable link and update window UI (cursor/title)
+        // Use pane-local coordinates when split panes are active so the col/row
+        // match the URL positions detected from the focused pane's terminal.
+        let url_cell = self
+            .tab_manager
+            .active_tab()
+            .and_then(|tab| {
+                tab.pane_manager.as_ref().and_then(|pm| {
+                    pm.focused_pane().and_then(|pane| {
+                        self.pixel_to_pane_cell(position.0, position.1, &pane.bounds)
+                    })
+                })
+            })
+            .or_else(|| self.pixel_to_cell(position.0, position.1));
+        if let Some((col, row)) = url_cell {
+            // Get scroll offset and terminal title from active tab (clone to avoid borrow conflicts)
+            let (scroll_offset, terminal_title, detected_urls, hovered_url) = self
+                .tab_manager
+                .active_tab()
+                .map(|t| {
+                    (
+                        t.active_scroll_state().offset,
+                        t.active_cache().terminal_title.clone(),
+                        t.active_mouse().detected_urls.clone(),
+                        t.active_mouse().hovered_url.clone(),
+                    )
+                })
+                .unwrap_or((0, String::new(), Vec::new(), None));
+
+            let adjusted_row = row + scroll_offset;
+            let url_opt = url_detection::find_url_at_position(&detected_urls, col, adjusted_row);
+
+            if let Some(url) = url_opt {
+                // Hovering over a new/different URL
+                if hovered_url.as_ref() != Some(&url.url) {
+                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                        tab.active_mouse_mut().hovered_url = Some(url.url.clone());
+                        tab.active_mouse_mut().hovered_url_bounds =
+                            Some((url.row, url.start_col, url.end_col));
+                    }
+                    if let Some(window) = &self.window {
+                        // Visual feedback: hand pointer + URL tooltip in title
+                        window.set_cursor(winit::window::CursorIcon::Pointer);
+                        let base_title = self.format_title(&self.config.load().window_title);
+                        let tooltip_title = format!("{} - {}", base_title, url.url);
+                        window.set_title(&tooltip_title);
+                    }
+                }
+            } else if hovered_url.is_some() {
+                // Mouse left a URL area: restore default state
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.active_mouse_mut().hovered_url = None;
+                    tab.active_mouse_mut().hovered_url_bounds = None;
+                }
+                if let Some(window) = &self.window {
+                    window.set_cursor(winit::window::CursorIcon::Text);
+                    // Restore terminal-controlled title or config default
+                    if self.config.load().allow_title_change && !terminal_title.is_empty() {
+                        window.set_title(&self.format_title(&terminal_title));
+                    } else {
+                        window.set_title(&self.format_title(&self.config.load().window_title));
+                    }
+                }
+            }
+        }
+
+        // --- 3. Mouse Motion Reporting ---
+        // Forward motion events to PTY if requested by terminal app (e.g., mouse tracking in vim)
+        // In split pane mode, only forward when mouse is inside the focused pane's bounds.
+        // Clicks outside the focused pane (on dividers or other panes) must fall through
+        // to divider drag and hover handlers.
+        // Shift held bypasses mouse tracking so the user can drag-select even inside
+        // apps like `less` that enable mouse tracking on the alternate screen.
+        let shift_held = self.input_handler.modifiers.state().shift_key();
+        // When a divider drag is in progress, skip motion reporting entirely.
+        // Otherwise, dragging the divider toward the focused pane keeps the mouse
+        // inside that pane's bounds, causing motion reporting to return early and
+        // starving the divider-drag handler (section 4b) of move events.
+        let dragging_divider = self
+            .tab_manager
+            .active_tab()
+            .and_then(|t| t.active_mouse().dragging_divider)
+            .is_some();
+        if let Some(tab) = self.tab_manager.active_tab() {
+            let resolved = if let Some(ref pm) = tab.pane_manager
+                && let Some(focused_pane) = pm.focused_pane()
+            {
+                // Split pane mode: only report motion inside the focused pane
+                let btn = tab.active_mouse().button_pressed;
+                let tracking_press = tab.active_mouse().tracking_press_position;
+                self.pixel_to_pane_cell(position.0, position.1, &focused_pane.bounds)
+                    .map(|(col, row)| {
+                        (
+                            Arc::clone(&focused_pane.terminal),
+                            col,
+                            row,
+                            btn,
+                            tracking_press,
+                        )
+                    })
+            } else {
+                // Single pane mode: use tab's terminal with global coordinates
+                let btn = tab.active_mouse().button_pressed;
+                let tracking_press = tab.active_mouse().tracking_press_position;
+                self.pixel_to_cell(position.0, position.1)
+                    .map(|(col, row)| (Arc::clone(&tab.terminal), col, row, btn, tracking_press))
+            };
+
+            if let Some((terminal_arc, col, row, button_pressed, tracking_press)) = resolved {
+                // try_read (not try_write): should_report_mouse_motion() takes &self.
+                // On miss: assumes no tracking (false) so the motion event is skipped this frame.
+                let should_report = terminal_arc
+                    .try_read()
+                    .ok()
+                    .is_some_and(|term| term.should_report_mouse_motion(button_pressed));
+
+                if should_report && !shift_held && !dragging_divider {
+                    // Encode button+motion (button 32 marker)
+                    let button = if button_pressed {
+                        32 // Motion while button pressed
+                    } else {
+                        35 // Motion without button pressed
+                    };
+
+                    // For button-pressed (drag) events, suppress within the dead zone.
+                    // Trackpad tap-to-click generates tiny movements that would otherwise
+                    // cause tmux to interpret a pane-focus click as a drag-selection,
+                    // committing an empty selection that wipes the clipboard.
+                    //
+                    // - None: press was not forwarded to mouse tracking (pane-switch click)
+                    //   → always suppress drag to avoid sending unmatched drag+release.
+                    // - Some(pos): press WAS forwarded; suppress only within the threshold.
+                    let suppress_drag = button == 32
+                        && match tracking_press {
+                            None => true,
+                            Some((px, py)) => {
+                                let dx = position.0 - px;
+                                let dy = position.1 - py;
+                                (dx * dx + dy * dy) < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX
+                            }
+                        };
+
+                    // try_read (not try_write): encode_mouse_event() takes &self.
+                    // On miss: mouse motion encoding is skipped this frame.
+                    if !suppress_drag && let Ok(term) = terminal_arc.try_read() {
+                        let encoded = term.encode_mouse_event(button, col, row, true, 0);
+                        if !encoded.is_empty() {
+                            let terminal_clone = Arc::clone(&terminal_arc);
+                            let runtime = Arc::clone(&self.runtime);
+                            runtime.spawn(async move {
+                                let t = terminal_clone.read().await;
+                                if let Err(e) = t.write(&encoded) {
+                                    crate::debug_error!(
+                                        "MOUSE",
+                                        "PTY write failed (drag motion): {e}"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    return; // Always exit: terminal app is managing mouse events
+                }
+            }
+        }
+
+        // --- 4. Scrollbar Dragging ---
+        let is_dragging = self
+            .tab_manager
+            .active_tab()
+            .map(|t| t.active_scroll_state().dragging)
+            .unwrap_or(false);
+
+        if is_dragging {
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                tab.active_scroll_state_mut().last_activity = std::time::Instant::now();
+            }
+            self.drag_scrollbar_to(position.1 as f32);
+            return; // Exit early: scrollbar dragging takes precedence over selection
+        }
+
+        // --- 4b. Divider Dragging ---
+        // Handle pane divider drag resize
+        let divider_dragging = self
+            .tab_manager
+            .active_tab()
+            .and_then(|t| t.active_mouse().dragging_divider);
+
+        if let Some(divider_index) = divider_dragging {
+            // Guard: if the mouse button is no longer pressed the drag ended but the release
+            // was silently consumed by mouse tracking (e.g. tmux with `mouse on` — the release
+            // lands inside a tracked pane, `try_send_mouse_event` returns true, and
+            // `handle_left_mouse_release` is never called).  Without this check every
+            // subsequent mouse-move would hit the early-return below, hover detection would
+            // never run, and the divider highlight would stay on permanently.
+            let button_still_pressed = self
+                .tab_manager
+                .active_tab()
+                .is_some_and(|t| t.active_mouse().button_pressed);
+
+            if !button_still_pressed {
+                // End the drag gracefully: clear state and sync tmux layout.
+                let divider_is_horizontal = self
+                    .tab_manager
+                    .active_tab()
+                    .and_then(|t| Some(t.get_divider(divider_index)?.is_horizontal));
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.active_mouse_mut().dragging_divider = None;
+                }
+                if let Some(is_horizontal) = divider_is_horizontal {
+                    self.sync_pane_resize_to_tmux(is_horizontal);
+                }
+                self.focus_state.needs_redraw = true;
+                // Reset the resize cursor here too: this branch fires when the
+                // release was consumed by a mouse-tracking app (tmux), so the
+                // normal release handler never ran. The fall-through to hover
+                // detection below only clears the cursor on a hover *transition*,
+                // which may not fire — reset explicitly to avoid a stuck
+                // ColResize/RowResize cursor.
+                if let Some(window) = &self.window {
+                    window.set_cursor(winit::window::CursorIcon::Text);
+                }
+                // Fall through to hover detection so the highlight clears immediately.
+            } else {
+                // Actively dragging a divider
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.drag_divider(divider_index, position.0 as f32, position.1 as f32);
+                }
+                self.focus_state.needs_redraw = true;
+                self.request_redraw();
+                return; // Exit early: divider dragging takes precedence
+            }
+        }
+
+        // --- 4c. Divider Hover Detection ---
+        // Check if mouse is hovering over a pane divider
+        let is_on_divider = self
+            .tab_manager
+            .active_tab()
+            .is_some_and(|t| t.is_on_divider(position.0 as f32, position.1 as f32));
+
+        let was_hovering = self
+            .tab_manager
+            .active_tab()
+            .is_some_and(|t| t.active_mouse().divider_hover);
+
+        if is_on_divider != was_hovering {
+            // Hover state changed
+            if let Some(tab) = self.tab_manager.active_tab_mut() {
+                let new_idx = if is_on_divider {
+                    tab.find_divider_at(position.0 as f32, position.1 as f32)
+                } else {
+                    None
+                };
+                tab.active_mouse_mut().divider_hover = is_on_divider;
+                tab.active_mouse_mut().hovered_divider_index = new_idx;
+            }
+            if let Some(window) = &self.window {
+                if is_on_divider {
+                    // Get divider orientation to set correct cursor
+                    if let Some(tab) = self.tab_manager.active_tab()
+                        && let Some(divider_idx) =
+                            tab.find_divider_at(position.0 as f32, position.1 as f32)
+                        && let Some(divider) = tab.get_divider(divider_idx)
+                    {
+                        let cursor = if divider.is_horizontal {
+                            winit::window::CursorIcon::RowResize
+                        } else {
+                            winit::window::CursorIcon::ColResize
+                        };
+                        window.set_cursor(cursor);
+                    }
+                } else {
+                    window.set_cursor(winit::window::CursorIcon::Text);
+                }
+            }
+        }
+
+        // --- 5. Drag Selection Logic ---
+        // Perform local text selection if mouse tracking is NOT active.
+        // Resolve the FOCUSED pane's terminal, not `tab.terminal` (which is the
+        // primary/first pane). Reading `tab.terminal` here was the multi-pane
+        // "Shift required to drag-select" bug: when the primary pane ran an
+        // alt-screen app (vim/tmux/less/...), drag-select was blocked in a
+        // normal-shell pane unless Shift was held, because this gate answered
+        // "is the PRIMARY pane on the alt screen?" instead of the focused one.
+        // Mirrors the focused-pane resolution in §2/§3 above and in detect_urls().
+        // try_read (not try_write): is_alt_screen_active() takes &self.
+        let alt_screen_active = self.tab_manager.active_tab().is_some_and(|tab| {
+            let focused_terminal = tab
+                .pane_manager
+                .as_ref()
+                .and_then(|pm| pm.focused_pane())
+                .map(|p| Arc::clone(&p.terminal))
+                .unwrap_or_else(|| Arc::clone(&tab.terminal));
+            focused_terminal
+                .try_read()
+                .ok()
+                .is_some_and(|term| term.is_alt_screen_active())
+        });
+
+        // Get mouse state for selection logic (per-pane in split mode)
+        let (
+            button_pressed,
+            click_count,
+            is_selecting,
+            click_position,
+            click_pixel_position,
+            selection_mode,
+        ) = self
+            .tab_manager
+            .active_tab()
+            .map(|t| {
+                let sm = t.selection_mouse();
+                (
+                    t.active_mouse().button_pressed,
+                    sm.click_count,
+                    sm.is_selecting,
+                    sm.click_position,
+                    sm.click_pixel_position,
+                    sm.selection.as_ref().map(|s| s.mode),
+                )
+            })
+            .unwrap_or((false, 0, false, None, None, None));
+
+        // Use pane-relative coordinates in split-pane mode so drag selection
+        // coordinates match the focused pane's terminal buffer.
+        if let Some((col, row)) = self.pixel_to_selection_cell(position.0, position.1)
+            && button_pressed
+            && (!alt_screen_active || shift_held)
+        {
+            // Minimum pixel distance before a click becomes a drag selection.
+            // Prevents accidental micro-drags (e.g. trackpad taps) from creating
+            // tiny selections that overwrite clipboard content (including images).
+            // Slightly larger dead zone to avoid accidental selection starts from
+            // trackpad jitter / tap-to-click movement noise.
+            let past_drag_threshold = click_pixel_position.is_some_and(|(cx, cy)| {
+                let dx = position.0 - cx;
+                let dy = position.1 - cy;
+                (dx * dx + dy * dy) >= DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX
+            });
+
+            if click_count == 1
+                && !is_selecting
+                && let Some(click_pos) = click_position
+                && click_pos != (col, row)
+                && past_drag_threshold
+            {
+                // Initial drag move: Start selection if we've moved past the pixel drag threshold
+                // Option+Cmd (Alt+Super) triggers Rectangular/Block selection mode (matches iTerm2)
+                // Option alone is for cursor positioning, not selection
+                let mode = if self.input_handler.modifiers.state().alt_key()
+                    && self.input_handler.modifiers.state().super_key()
+                {
+                    SelectionMode::Rectangular
+                } else {
+                    SelectionMode::Normal
+                };
+
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    let scroll_offset = tab.active_scroll_state().offset;
+                    let sm = tab.selection_mouse_mut();
+                    sm.is_selecting = true;
+                    sm.selection = Some(Selection::new(click_pos, (col, row), mode, scroll_offset));
+                }
+                self.request_redraw();
+            } else if is_selecting && let Some(mode) = selection_mode {
+                // Dragging in progress: Update selection endpoints
+                if mode == SelectionMode::Line {
+                    // Triple-click mode: Selection always covers whole lines
+                    self.extend_line_selection(row);
+                    self.request_redraw();
+                } else {
+                    // Normal/Rectangular mode: update end cell
+                    if let Some(tab) = self.tab_manager.active_tab_mut() {
+                        let scroll_offset = tab.active_scroll_state().offset;
+                        if let Some(ref mut sel) = tab.selection_mouse_mut().selection {
+                            sel.end = (col, row);
+                            sel.scroll_offset = scroll_offset;
+                        }
+                    }
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Clear URL hover state (hovered_url, cursor, title) if a URL is currently hovered.
+    ///
+    /// Called before early returns that skip the main URL detection block (e.g. tab bar,
+    /// profile drawer) so the Pointer cursor is never left stuck after leaving a URL.
+    fn clear_url_hover_if_needed(&mut self) {
+        let (hovered, terminal_title) = self
+            .tab_manager
+            .active_tab()
+            .map(|t| {
+                (
+                    t.active_mouse().hovered_url.is_some(),
+                    t.active_cache().terminal_title.clone(),
+                )
+            })
+            .unwrap_or((false, String::new()));
+
+        if !hovered {
+            return;
+        }
+
+        if let Some(tab) = self.tab_manager.active_tab_mut() {
+            tab.active_mouse_mut().hovered_url = None;
+            tab.active_mouse_mut().hovered_url_bounds = None;
+        }
+        if let Some(window) = &self.window {
+            window.set_cursor(winit::window::CursorIcon::Text);
+            if self.config.load().allow_title_change && !terminal_title.is_empty() {
+                window.set_title(&self.format_title(&terminal_title));
+            } else {
+                window.set_title(&self.format_title(&self.config.load().window_title));
+            }
+        }
+    }
+}

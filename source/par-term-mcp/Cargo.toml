@@ -1,0 +1,31 @@
+[package]
+name = "par-term-mcp"
+version = "0.2.9"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "MCP (Model Context Protocol) stdio server for par-term terminal emulator"
+license = "MIT"
+repository = "https://github.com/paulrobello/par-term"
+homepage = "https://github.com/paulrobello/par-term"
+keywords = ["terminal", "mcp", "json-rpc", "stdio"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# JSON serialization for JSON-RPC protocol
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+log.workspace = true
+
+# Platform-specific directories for config path resolution
+dirs.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Serialises the tests that mutate the process environment against every other
+# test that reads it — see the `#[serial]` / `#[parallel]` pairing in `lib.rs`.
+serial_test.workspace = true

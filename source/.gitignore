@@ -1,0 +1,57 @@
+# Rust
+/target/
+
+# Generated rustdoc output
+/doc/
+
+# Local Claude overrides
+CLAUDE.local.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+log.txt
+**/flamegraph.svg
+# par-term debug/trace log (make run-debug / run-trace tee output)
+par_term_debug.log
+
+# Step runner lock files and logs
+feature-spec/.step*.lock
+step-logs/
+
+# Gemini/Claude temporary files
+*-mcp.json
+.gemini-clipboard
+claude_scratch/
+.claude/settings.local.json.bak
+.claude/ralph-state.json
+ralph-refactor.md
+settings.local.json.bak
+**/cc-ralph-loop-*.md
+
+# Git worktrees
+.worktrees/
+.claude/worktrees/
+
+# Claude local settings — may contain API tokens (SEC-001)
+.claude/settings.local.json
+settings.local.json
+.claude/scheduled_tasks.lock
+.claude/.cc2cc-session-id
+*.local
+*.local.*
+.pi/extensions/discord-relay/state.json
+ideas.md
+
+# `make package` output
+dist/

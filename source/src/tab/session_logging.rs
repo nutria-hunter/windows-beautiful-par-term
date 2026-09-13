@@ -1,0 +1,106 @@
+//! Tab session logging methods.
+//!
+//! Provides methods for toggling session logging on/off and querying its state.
+
+use crate::config::Config;
+use crate::session_logger::SessionLogger;
+use crate::tab::Tab;
+use std::sync::Arc;
+
+impl Tab {
+    /// Toggle session logging on/off.
+    ///
+    /// Returns `Ok(true)` if logging is now active, `Ok(false)` if stopped.
+    /// If logging wasn't active and no logger exists, creates a new one.
+    pub fn toggle_session_logging(&mut self, config: &Config) -> anyhow::Result<bool> {
+        let mut logger_guard = self.session_logger.lock();
+
+        if let Some(ref mut logger) = *logger_guard {
+            // Logger exists - toggle based on current state
+            if logger.is_active() {
+                logger.stop()?;
+                log::info!("Session logging stopped via hotkey");
+                Ok(false)
+            } else {
+                logger.start()?;
+                log::info!("Session logging started via hotkey");
+                Ok(true)
+            }
+        } else {
+            // No logger exists - create one and start it
+            let logs_dir = config.logs_dir();
+            if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+                log::warn!("Failed to create logs directory: {}", e);
+                return Err(anyhow::anyhow!("Failed to create logs directory: {}", e));
+            }
+            // SEC-010: Enforce restrictive directory permissions so that session logs
+            // (which may capture terminal output including passwords) are not
+            // world-listable even if the user's umask is permissive.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&logs_dir, std::fs::Permissions::from_mode(0o700));
+            }
+
+            // Get terminal dimensions
+            let dimensions = if let Ok(term) = self.terminal.try_read() {
+                term.dimensions()
+            } else {
+                (80, 24) // fallback
+            };
+
+            let session_title = Some(format!(
+                "{} - {}",
+                self.title,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+            ));
+
+            let mut logger = SessionLogger::new(
+                config.session_log.session_log_format,
+                &logs_dir,
+                dimensions,
+                session_title,
+            )?;
+
+            logger.set_redact_passwords(config.session_log.session_log_redact_passwords);
+            logger.start()?;
+
+            // SEC-002: Emit a prominent one-time warning when session logging is enabled.
+            // Session logs capture raw terminal I/O and may include passwords, API keys,
+            // tokens, and other credentials even with heuristic redaction active.
+            eprintln!(
+                "\n[par-term SESSION LOGGING ENABLED]\n\
+                 Session output is now being recorded to: {}\n\
+                 WARNING: Session logs may capture sensitive data (passwords, API keys, tokens)\n\
+                 despite heuristic redaction. Password-prompt detection is enabled: {}\n\
+                 Do NOT share session log files unless you have reviewed their contents.\n\
+                 Disable session logging when working with sensitive credentials.\n",
+                logs_dir.display(),
+                config.session_log.session_log_redact_passwords,
+            );
+
+            // Set up output callback to record PTY output
+            let logger_clone = Arc::clone(&self.session_logger);
+            if let Ok(term) = self.terminal.try_read() {
+                term.set_output_callback(move |data: &[u8]| {
+                    if let Some(ref mut logger) = *logger_clone.lock() {
+                        logger.record_output(data);
+                    }
+                });
+            }
+
+            *logger_guard = Some(logger);
+            log::info!("Session logging created and started via hotkey");
+            Ok(true)
+        }
+    }
+
+    /// Check if session logging is currently active.
+    pub fn is_session_logging_active(&self) -> bool {
+        if let Some(ref logger) = *self.session_logger.lock() {
+            logger.is_active()
+        } else {
+            false
+        }
+    }
+}

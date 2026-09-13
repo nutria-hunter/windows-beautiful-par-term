@@ -1,0 +1,589 @@
+use super::TerminalManager;
+use par_term_config::{Cell, Theme};
+
+/// Shared context for row-level cell rendering helpers.
+///
+/// Bundles the per-row state that `push_line_from_slice` and `push_grid_row`
+/// need so their signatures stay below the `clippy::too_many_arguments` limit.
+pub(crate) struct RowRenderContext<'a> {
+    pub cols: usize,
+    pub dest: &'a mut Vec<Cell>,
+    pub screen_row: usize,
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    pub rectangular: bool,
+    pub cursor: Option<(
+        (usize, usize),
+        f32,
+        par_term_emu_core_rust::cursor::CursorStyle,
+    )>,
+    pub theme: &'a Theme,
+}
+
+impl TerminalManager {
+    /// Non-blocking variant of [`Self::get_cells_with_scrollback`].
+    ///
+    /// Uses `try_lock()` on the internal `PtySession` and `Terminal` mutexes
+    /// instead of blocking `lock()`.  Returns `None` when either lock is held
+    /// by the PTY reader thread, allowing the caller to fall back to cached
+    /// cells without stalling the render loop.
+    pub fn try_get_cells_with_scrollback(
+        &self,
+        scroll_offset: usize,
+        selection: Option<((usize, usize), (usize, usize))>,
+        rectangular: bool,
+    ) -> Option<Vec<Cell>> {
+        let pty = self.pty_session.try_lock()?;
+        let terminal = pty.terminal();
+        let mut term = terminal.try_write()?;
+        let grid = term.active_grid();
+
+        let rows = grid.rows();
+        let cols = grid.cols();
+        let scrollback_len = grid.scrollback_len();
+        let clamped_offset = scroll_offset.min(scrollback_len);
+        let total_lines = scrollback_len + rows;
+        let end_line = total_lines.saturating_sub(clamped_offset);
+        let start_line = end_line.saturating_sub(rows);
+
+        let mut cells = Vec::with_capacity(rows * cols);
+        let mut wrap_flags = Vec::with_capacity(rows);
+
+        for line_idx in start_line..end_line {
+            let screen_row = line_idx - start_line;
+            let is_continuation = if screen_row == 0 {
+                false
+            } else {
+                let prev_line = line_idx.saturating_sub(1);
+                if prev_line < scrollback_len {
+                    grid.is_scrollback_wrapped(prev_line)
+                } else {
+                    grid.is_line_wrapped(prev_line - scrollback_len)
+                }
+            };
+            wrap_flags.push(is_continuation);
+
+            if line_idx < scrollback_len {
+                if let Some(line) = grid.scrollback_line(line_idx) {
+                    Self::push_line_from_slice(
+                        line,
+                        &mut RowRenderContext {
+                            cols,
+                            dest: &mut cells,
+                            screen_row,
+                            selection,
+                            rectangular,
+                            cursor: None,
+                            theme: &self.theme,
+                        },
+                    );
+                } else {
+                    Self::push_empty_cells(cols, &mut cells);
+                }
+            } else {
+                let grid_row = line_idx - scrollback_len;
+                Self::push_grid_row(
+                    grid,
+                    grid_row,
+                    &mut RowRenderContext {
+                        cols,
+                        dest: &mut cells,
+                        screen_row,
+                        selection,
+                        rectangular,
+                        cursor: None,
+                        theme: &self.theme,
+                    },
+                );
+            }
+        }
+        if let Some(mut cache) = self.wrap_flags_cache.try_lock() {
+            *cache = Some((scroll_offset, rows, wrap_flags));
+        }
+
+        // Apply trigger highlights on top of cell colors
+        let highlights = term.get_trigger_highlights();
+        for highlight in &highlights {
+            let abs_row = scrollback_len + highlight.row;
+            if abs_row < start_line || abs_row >= end_line {
+                continue;
+            }
+            let screen_row = abs_row - start_line;
+
+            for col in highlight.col_start..highlight.col_end.min(cols) {
+                let cell_idx = screen_row * cols + col;
+                if cell_idx < cells.len() {
+                    if let Some((r, g, b)) = highlight.fg {
+                        cells[cell_idx].fg_color = [r, g, b, 255];
+                    }
+                    if let Some((r, g, b)) = highlight.bg {
+                        cells[cell_idx].bg_color = [r, g, b, 255];
+                    }
+                }
+            }
+        }
+        term.clear_expired_highlights();
+
+        Some(cells)
+    }
+
+    /// Per-visible-row soft-wrap continuation flags for URL detection.
+    ///
+    /// Returns a `Vec` of length `rows` where entry `r` is `true` when visible
+    /// row `r` is a soft-wrapped continuation of row `r-1` (i.e. the line above
+    /// it overflowed the margin). This lets URL detection join wrapped lines so
+    /// a URL split across a wrap is detected as one link rather than a truncated
+    /// per-row fragment.
+    ///
+    /// Mirrors the line iteration in [`Self::try_get_cells_with_scrollback`] so
+    /// the scrollback-vs-screen wrap resolution matches exactly. Non-blocking:
+    /// on lock contention, returns the matching cached viewport flags.
+    pub fn viewport_wrap_flags(&self, scroll_offset: usize, rows: usize) -> Vec<bool> {
+        // Prefer flags captured with the rendered cells. A second live-grid read
+        // could observe different content after cell extraction completed.
+        let cached = self.cached_wrap_flags(scroll_offset, rows);
+        if !cached.is_empty() || rows == 0 {
+            return cached;
+        }
+
+        let Some(pty) = self.pty_session.try_lock() else {
+            return Vec::new();
+        };
+        let terminal = pty.terminal();
+        let Some(term) = terminal.try_read() else {
+            return Vec::new();
+        };
+        let grid = term.active_grid();
+
+        let scrollback_len = grid.scrollback_len();
+        let clamped_offset = scroll_offset.min(scrollback_len);
+        let total_lines = scrollback_len + grid.rows();
+        let end_line = total_lines.saturating_sub(clamped_offset);
+        let start_line = end_line.saturating_sub(rows);
+
+        // Visible row r (absolute line `start_line + r`) is a continuation iff
+        // the line above it (`start_line + r - 1`) was wrapped. Wrap is a
+        // property of the overflowing line, resolved against scrollback or the
+        // active screen the same way cell generation does.
+        let mut wrapped = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let is_cont = if r == 0 {
+                false
+            } else {
+                let prev_line = (start_line + r).saturating_sub(1);
+                if prev_line < scrollback_len {
+                    grid.is_scrollback_wrapped(prev_line)
+                } else {
+                    grid.is_line_wrapped(prev_line - scrollback_len)
+                }
+            };
+            wrapped.push(is_cont);
+        }
+        if let Some(mut cache) = self.wrap_flags_cache.try_lock() {
+            *cache = Some((scroll_offset, rows, wrapped.clone()));
+        }
+        wrapped
+    }
+
+    fn cached_wrap_flags(&self, scroll_offset: usize, rows: usize) -> Vec<bool> {
+        let Some(cache) = self.wrap_flags_cache.try_lock() else {
+            return Vec::new();
+        };
+        match cache.as_ref() {
+            Some((cached_offset, cached_rows, flags))
+                if *cached_offset == scroll_offset && *cached_rows == rows =>
+            {
+                flags.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Get terminal grid with scrollback offset as Cell array for CellRenderer
+    pub fn get_cells_with_scrollback(
+        &self,
+        scroll_offset: usize,
+        selection: Option<((usize, usize), (usize, usize))>,
+        rectangular: bool,
+        _cursor: Option<((usize, usize), f32)>,
+    ) -> Vec<Cell> {
+        let pty = self.pty_session.lock();
+        let terminal = pty.terminal();
+        let mut term = terminal.write();
+        let grid = term.active_grid();
+
+        let cursor_with_style = None;
+
+        let rows = grid.rows();
+        let cols = grid.cols();
+        let scrollback_len = grid.scrollback_len();
+        let clamped_offset = scroll_offset.min(scrollback_len);
+        let total_lines = scrollback_len + rows;
+        let end_line = total_lines.saturating_sub(clamped_offset);
+        let start_line = end_line.saturating_sub(rows);
+
+        let mut cells = Vec::with_capacity(rows * cols);
+
+        for line_idx in start_line..end_line {
+            let screen_row = line_idx - start_line;
+
+            if line_idx < scrollback_len {
+                if let Some(line) = grid.scrollback_line(line_idx) {
+                    Self::push_line_from_slice(
+                        line,
+                        &mut RowRenderContext {
+                            cols,
+                            dest: &mut cells,
+                            screen_row,
+                            selection,
+                            rectangular,
+                            cursor: cursor_with_style,
+                            theme: &self.theme,
+                        },
+                    );
+                } else {
+                    Self::push_empty_cells(cols, &mut cells);
+                }
+            } else {
+                let grid_row = line_idx - scrollback_len;
+                Self::push_grid_row(
+                    grid,
+                    grid_row,
+                    &mut RowRenderContext {
+                        cols,
+                        dest: &mut cells,
+                        screen_row,
+                        selection,
+                        rectangular,
+                        cursor: cursor_with_style,
+                        theme: &self.theme,
+                    },
+                );
+            }
+        }
+        let mut wrap_flags = Vec::with_capacity(rows);
+        for screen_row in 0..rows {
+            let is_continuation = if screen_row == 0 {
+                false
+            } else {
+                let prev_line = (start_line + screen_row).saturating_sub(1);
+                if prev_line < scrollback_len {
+                    grid.is_scrollback_wrapped(prev_line)
+                } else {
+                    grid.is_line_wrapped(prev_line - scrollback_len)
+                }
+            };
+            wrap_flags.push(is_continuation);
+        }
+        if let Some(mut cache) = self.wrap_flags_cache.try_lock() {
+            *cache = Some((scroll_offset, rows, wrap_flags));
+        }
+
+        // Apply trigger highlights on top of cell colors
+        let highlights = term.get_trigger_highlights();
+        for highlight in &highlights {
+            let abs_row = scrollback_len + highlight.row;
+            if abs_row < start_line || abs_row >= end_line {
+                continue;
+            }
+            let screen_row = abs_row - start_line;
+
+            for col in highlight.col_start..highlight.col_end.min(cols) {
+                let cell_idx = screen_row * cols + col;
+                if cell_idx < cells.len() {
+                    if let Some((r, g, b)) = highlight.fg {
+                        cells[cell_idx].fg_color = [r, g, b, 255];
+                    }
+                    if let Some((r, g, b)) = highlight.bg {
+                        cells[cell_idx].bg_color = [r, g, b, 255];
+                    }
+                }
+            }
+        }
+        term.clear_expired_highlights();
+
+        cells
+    }
+
+    pub(crate) fn push_line_from_slice(
+        line: &[par_term_emu_core_rust::cell::Cell],
+        ctx: &mut RowRenderContext<'_>,
+    ) {
+        let copy_len = ctx.cols.min(line.len());
+        for (col, cell) in line[..copy_len].iter().enumerate() {
+            let is_selected =
+                Self::is_cell_selected(col, ctx.screen_row, ctx.selection, ctx.rectangular);
+            let cursor_info = ctx.cursor.and_then(|((cx, cy), opacity, style)| {
+                if cx == col && cy == ctx.screen_row {
+                    Some((opacity, style))
+                } else {
+                    None
+                }
+            });
+            ctx.dest.push(Self::convert_term_cell_with_theme(
+                cell,
+                is_selected,
+                cursor_info,
+                ctx.theme,
+            ));
+        }
+
+        if copy_len < ctx.cols {
+            Self::push_empty_cells(ctx.cols - copy_len, ctx.dest);
+        }
+    }
+
+    pub(crate) fn push_grid_row(
+        grid: &par_term_emu_core_rust::grid::Grid,
+        row: usize,
+        ctx: &mut RowRenderContext<'_>,
+    ) {
+        for col in 0..ctx.cols {
+            let is_selected =
+                Self::is_cell_selected(col, ctx.screen_row, ctx.selection, ctx.rectangular);
+            let cursor_info = ctx.cursor.and_then(|((cx, cy), opacity, style)| {
+                if cx == col && cy == ctx.screen_row {
+                    Some((opacity, style))
+                } else {
+                    None
+                }
+            });
+            if let Some(cell) = grid.get(col, row) {
+                ctx.dest.push(Self::convert_term_cell_with_theme(
+                    cell,
+                    is_selected,
+                    cursor_info,
+                    ctx.theme,
+                ));
+            } else {
+                ctx.dest.push(Cell::default());
+            }
+        }
+    }
+
+    pub(crate) fn push_empty_cells(count: usize, dest: &mut Vec<Cell>) {
+        for _ in 0..count {
+            dest.push(Cell::default());
+        }
+    }
+
+    /// Check if a cell at (col, row) is within the selection range
+    pub(crate) fn is_cell_selected(
+        col: usize,
+        row: usize,
+        selection: Option<((usize, usize), (usize, usize))>,
+        rectangular: bool,
+    ) -> bool {
+        if let Some(((start_col, start_row), (end_col, end_row))) = selection {
+            if rectangular {
+                let min_col = start_col.min(end_col);
+                let max_col = start_col.max(end_col);
+                let min_row = start_row.min(end_row);
+                let max_row = start_row.max(end_row);
+
+                return col >= min_col && col <= max_col && row >= min_row && row <= max_row;
+            }
+
+            if start_row == end_row {
+                return row == start_row && col >= start_col && col <= end_col;
+            }
+
+            if row == start_row {
+                return col >= start_col;
+            } else if row == end_row {
+                return col <= end_col;
+            } else if row > start_row && row < end_row {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn convert_term_cell_with_theme(
+        term_cell: &par_term_emu_core_rust::cell::Cell,
+        is_selected: bool,
+        cursor_info: Option<(f32, par_term_emu_core_rust::cursor::CursorStyle)>,
+        theme: &Theme,
+    ) -> Cell {
+        use par_term_emu_core_rust::color::{Color as TermColor, NamedColor};
+        use par_term_emu_core_rust::cursor::CursorStyle as TermCursorStyle;
+
+        let bg_rgb = term_cell.bg().to_rgb();
+        let fg_rgb = term_cell.fg().to_rgb();
+        let has_colored_bg = bg_rgb != (0, 0, 0);
+        let has_reverse = term_cell.flags().reverse();
+
+        if has_colored_bg || has_reverse {
+            log::debug!(
+                "Cell with colored BG or REVERSE: '{}' (U+{:04X}): fg={:?} (RGB:{},{},{}), bg={:?} (RGB:{},{},{}), reverse={}, flags={:?}",
+                if term_cell.c().is_control() {
+                    '?'
+                } else {
+                    term_cell.c()
+                },
+                term_cell.c() as u32,
+                term_cell.fg(),
+                fg_rgb.0,
+                fg_rgb.1,
+                fg_rgb.2,
+                term_cell.bg(),
+                bg_rgb.0,
+                bg_rgb.1,
+                bg_rgb.2,
+                has_reverse,
+                term_cell.flags()
+            );
+        }
+
+        // Apply theme colors for ANSI colors (Named colors)
+        let fg = match &term_cell.fg() {
+            TermColor::Named(named) => {
+                // Exhaustive over NamedColor, deliberately without a catch-all:
+                // `NamedColor` is not `#[non_exhaustive]`, so a new upstream variant
+                // is a breaking change that must fail this build rather than silently
+                // render as `theme.foreground`.
+                let theme_color = match named {
+                    NamedColor::Black => theme.black,
+                    NamedColor::Red => theme.red,
+                    NamedColor::Green => theme.green,
+                    NamedColor::Yellow => theme.yellow,
+                    NamedColor::Blue => theme.blue,
+                    NamedColor::Magenta => theme.magenta,
+                    NamedColor::Cyan => theme.cyan,
+                    NamedColor::White => theme.white,
+                    NamedColor::BrightBlack => theme.bright_black,
+                    NamedColor::BrightRed => theme.bright_red,
+                    NamedColor::BrightGreen => theme.bright_green,
+                    NamedColor::BrightYellow => theme.bright_yellow,
+                    NamedColor::BrightBlue => theme.bright_blue,
+                    NamedColor::BrightMagenta => theme.bright_magenta,
+                    NamedColor::BrightCyan => theme.bright_cyan,
+                    NamedColor::BrightWhite => theme.bright_white,
+                };
+                (theme_color.r, theme_color.g, theme_color.b)
+            }
+            _ => term_cell.fg().to_rgb(),
+        };
+
+        let bg = match &term_cell.bg() {
+            TermColor::Named(named) => {
+                // Exhaustive, same reasoning as the foreground match above.
+                let theme_color = match named {
+                    NamedColor::Black => theme.black,
+                    NamedColor::Red => theme.red,
+                    NamedColor::Green => theme.green,
+                    NamedColor::Yellow => theme.yellow,
+                    NamedColor::Blue => theme.blue,
+                    NamedColor::Magenta => theme.magenta,
+                    NamedColor::Cyan => theme.cyan,
+                    NamedColor::White => theme.white,
+                    NamedColor::BrightBlack => theme.bright_black,
+                    NamedColor::BrightRed => theme.bright_red,
+                    NamedColor::BrightGreen => theme.bright_green,
+                    NamedColor::BrightYellow => theme.bright_yellow,
+                    NamedColor::BrightBlue => theme.bright_blue,
+                    NamedColor::BrightMagenta => theme.bright_magenta,
+                    NamedColor::BrightCyan => theme.bright_cyan,
+                    NamedColor::BrightWhite => theme.bright_white,
+                };
+                (theme_color.r, theme_color.g, theme_color.b)
+            }
+            _ => term_cell.bg().to_rgb(),
+        };
+
+        let is_reverse = term_cell.flags().reverse();
+
+        let (fg_color, bg_color) = if let Some((opacity, style)) = cursor_info {
+            let blend = |normal: u8, inverted: u8, opacity: f32| -> u8 {
+                (normal as f32 * (1.0 - opacity) + inverted as f32 * opacity) as u8
+            };
+
+            match style {
+                TermCursorStyle::SteadyBlock | TermCursorStyle::BlinkingBlock => (
+                    [
+                        blend(fg.0, bg.0, opacity),
+                        blend(fg.1, bg.1, opacity),
+                        blend(fg.2, bg.2, opacity),
+                        255,
+                    ],
+                    [
+                        blend(bg.0, fg.0, opacity),
+                        blend(bg.1, fg.1, opacity),
+                        blend(bg.2, fg.2, opacity),
+                        255,
+                    ],
+                ),
+                TermCursorStyle::SteadyBar
+                | TermCursorStyle::BlinkingBar
+                | TermCursorStyle::SteadyUnderline
+                | TermCursorStyle::BlinkingUnderline => (
+                    [
+                        blend(fg.0, bg.0, opacity),
+                        blend(fg.1, bg.1, opacity),
+                        blend(fg.2, bg.2, opacity),
+                        255,
+                    ],
+                    [
+                        blend(bg.0, fg.0, opacity),
+                        blend(bg.1, fg.1, opacity),
+                        blend(bg.2, fg.2, opacity),
+                        255,
+                    ],
+                ),
+            }
+        } else if is_selected || is_reverse {
+            ([bg.0, bg.1, bg.2, 255], [fg.0, fg.1, fg.2, 255])
+        } else {
+            ([fg.0, fg.1, fg.2, 255], [bg.0, bg.1, bg.2, 255])
+        };
+
+        let grapheme = if term_cell.has_combining_chars() {
+            term_cell.get_grapheme()
+        } else {
+            term_cell.base_char().to_string()
+        };
+
+        Cell {
+            grapheme,
+            fg_color,
+            bg_color,
+            bold: term_cell.flags().bold(),
+            italic: term_cell.flags().italic(),
+            underline: term_cell.flags().underline(),
+            strikethrough: term_cell.flags().strikethrough(),
+            hyperlink_id: term_cell.flags().hyperlink_id.map(|n| n.get()),
+            wide_char: term_cell.flags().wide_char(),
+            wide_char_spacer: term_cell.flags().wide_char_spacer(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalManager;
+
+    #[test]
+    fn cell_extraction_captures_wrap_flags_for_nonblocking_path() {
+        let manager = TerminalManager::new_with_scrollback(8, 3, 16).unwrap();
+        manager.process_data(b"123456789");
+
+        let cells = manager
+            .try_get_cells_with_scrollback(0, None, false)
+            .unwrap();
+
+        assert_eq!(cells.len(), 24);
+        let _pty = manager.pty_session.lock();
+        assert_eq!(manager.viewport_wrap_flags(0, 3), vec![false, true, false]);
+    }
+
+    #[test]
+    fn cell_extraction_captures_wrap_flags_for_blocking_path() {
+        let manager = TerminalManager::new_with_scrollback(8, 3, 16).unwrap();
+        manager.process_data(b"123456789");
+
+        let cells = manager.get_cells_with_scrollback(0, None, false, None);
+
+        assert_eq!(cells.len(), 24);
+        let _pty = manager.pty_session.lock();
+        assert_eq!(manager.viewport_wrap_flags(0, 3), vec![false, true, false]);
+    }
+}

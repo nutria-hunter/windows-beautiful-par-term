@@ -1,0 +1,374 @@
+[workspace]
+members = ["par-term-acp", "par-term-config", "par-term-fonts", "par-term-input", "par-term-keybindings", "par-term-mcp", "par-term-render", "par-term-scripting", "par-term-settings-ui", "par-term-ssh", "par-term-terminal", "par-term-tmux", "par-term-update"]
+
+[patch.crates-io]
+# ConPTY may emit DEC 2026 end before a long repaint in the same read.
+par-term-emu-core-rust = { path = "vendor/par-term-emu-core-rust" }
+
+# ---------------------------------------------------------------------------
+# Workspace-level dependency declarations (ARC-001)
+# Centralise all external deps shared across 2+ crates here.
+# Sub-crates opt in with `dep.workspace = true` and may append extra features
+# via `dep = { workspace = true, features = ["extra"] }`.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Terminal emulator core
+par-term-emu-core-rust = { version = "0.48", default-features = false, features = ["rust-only", "pty_session"] }
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml_ng = "0.10.0"
+toml = "1.1"
+
+# UUID
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# Error handling
+anyhow = "1.0.103"
+thiserror = "2"
+
+# Logging
+log = "0.4.33"
+
+# Platform-specific directories
+dirs = "6.0"
+
+# Concurrency
+parking_lot = "0.12.5"
+arc-swap = "1"
+
+# Window management
+winit = "0.30"
+
+# GPU rendering
+wgpu = { version = "30", features = ["wgsl"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+naga = { version = "30", features = ["glsl-in", "wgsl-out"] }
+half = "2.7.1"
+
+# Font handling
+swash = "0.2.9"
+fontdb = "0.24"
+rustybuzz = "0.20.1"
+unicode-segmentation = "1.13"
+lru = "0.18.0"
+
+# GUI
+egui = "0.36.1"
+egui-wgpu = "0.36.1"
+egui-winit = "0.36.1"
+rfd = "0.17.2"
+
+# Image / media
+image = "0.25.10"
+
+# Shell / process
+shell-words = "1.1"
+arboard = "3.6.1"
+open = "5.3.5"
+
+# Network / HTTP
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls", "gzip"] }
+native-tls = "0.2.18"
+mdns-sd = "0.21"
+url = "2"
+
+# Date / time
+chrono = "0.4.45"
+
+# Text / regex
+regex = "1.12.4"
+
+# Versioning / crypto
+semver = "1.0.28"
+sha2 = "0.11.0"
+zip = "8.6.0"
+
+# Misc utilities
+base64 = "0.23.1"
+hostname = "0.4.2"
+sysinfo = "0.39"
+
+# File watching
+notify = "8.2"
+
+# Dev dependencies
+tempfile = "3.27"
+serial_test = { version = "4.0.1", default-features = false }
+
+[package]
+name = "par-term"
+version = "0.45.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "Cross-platform GPU-accelerated terminal emulator with inline graphics support (Sixel, iTerm2, Kitty)"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/paulrobello/par-term"
+homepage = "https://github.com/paulrobello/par-term"
+documentation = "https://github.com/paulrobello/par-term/blob/main/README.md"
+keywords = ["terminal", "emulator", "tui", "gpu", "graphics"]
+categories = ["command-line-utilities", "gui"]
+default-run = "par-term"
+exclude = [
+    "*.sixel",
+    "images/",
+    "test_*.rs",
+    ".github/",
+    ".gitignore",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "MATRIX.md",
+    "PANES.md",
+    "agents/",
+    "gh-pages/",
+    "shaders/textures/",
+    "assets/par-term.icns",
+    "docs/plans/",
+    ".claude/",
+]
+
+[dependencies]
+# ACP (Agent Communication Protocol) implementation
+par-term-acp = { path = "par-term-acp", version = "0.6.0" }
+
+# Configuration system
+par-term-config = { path = "par-term-config", version = "0.14.3", features = ["watcher"] }
+
+# Font management and text shaping
+par-term-fonts = { path = "par-term-fonts", version = "0.3.2" }
+
+# Terminal manager (PTY, shell integration, scrollback)
+par-term-terminal = { path = "par-term-terminal", version = "0.5.5" }
+
+# GPU-accelerated rendering engine
+par-term-render = { path = "par-term-render", version = "0.11.0" }
+
+# Settings UI (egui-based settings interface)
+par-term-settings-ui = { path = "par-term-settings-ui", version = "0.17.3" }
+
+# Input sequence generation (keyboard/mouse → VT escape sequences)
+par-term-input = { path = "par-term-input", version = "0.1.20" }
+
+# Keybinding system (key parsing, matching, registry)
+par-term-keybindings = { path = "par-term-keybindings", version = "0.1.13" }
+
+# Scripting and observer system
+par-term-scripting = { path = "par-term-scripting", version = "0.1.16" }
+
+# SSH host management and discovery
+par-term-ssh = { path = "par-term-ssh", version = "0.2.2", default-features = false }
+
+# Self-update and update-check system
+par-term-update = { path = "par-term-update", version = "0.5.1" }
+
+# MCP (Model Context Protocol) stdio server
+par-term-mcp = { path = "par-term-mcp", version = "0.2.9" }
+
+# tmux control mode integration
+par-term-tmux = { path = "par-term-tmux", version = "0.1.15" }
+
+# Terminal emulator core (with OSC 7/1337 hostname/cwd events, RemoteHost, and OSC 934 named progress bars)
+par-term-emu-core-rust.workspace = true
+
+# Window management and rendering
+winit.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+swash.workspace = true         # Font rasterization with colored glyph support
+fontdb.workspace = true        # Font database for system font discovery and fallback
+rustybuzz.workspace = true     # HarfBuzz text shaping for ligatures and complex scripts
+unicode-segmentation.workspace = true  # Grapheme cluster detection for proper text boundaries
+parking_lot.workspace = true
+arc-swap.workspace = true
+
+# Async runtime for PTY handling
+tokio.workspace = true
+
+# Configuration
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+toml.workspace = true
+
+# UUID for profile identifiers
+uuid.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+log.workspace = true
+
+# Platform-specific directories
+dirs.workspace = true
+
+# Clipboard support
+arboard.workspace = true
+
+# URL detection and opening
+regex.workspace = true
+open.workspace = true          # Cross-platform URL opener
+shell-words.workspace = true   # Safe shell command parsing (prevents argument injection)
+url.workspace = true           # URL parsing for shader download validation
+
+# Audio playback for bell sound (feature-gated: `audio`)
+rodio = { version = "0.22.2", features = ["mp3"], optional = true }
+
+# Desktop notifications
+notify-rust = "4.18"
+
+# GUI for settings interface
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+rfd.workspace = true
+
+# Date/time for screenshots
+chrono.workspace = true
+
+# Image loading for background images
+image.workspace = true
+
+
+# Half-precision float for HDR cubemap textures
+half.workspace = true
+
+# GLSL to WGSL transpilation for custom shaders
+naga.workspace = true
+
+# Native window menus
+muda = "0.19"
+libc = "0.2.186"
+clap = { version = "4.6.1", features = ["derive"] }
+ureq.workspace = true
+native-tls.workspace = true
+zip.workspace = true
+semver.workspace = true        # Semantic version parsing for update checks
+sha2.workspace = true
+
+# Badge system
+hostname.workspace = true      # Cross-platform hostname detection
+base64.workspace = true        # Base64 decoding for OSC 1337 SetBadgeFormat
+flate2 = "1.1.9"               # Gzip compression for upload tar.gz archives
+tar = "0.4.46"                 # Tar archive creation for upload (iTerm2 tgz format)
+lru.workspace = true
+fuzzy-matcher = "0.3.7"        # Fuzzy string matching for command history search
+sysinfo = { workspace = true, features = ["system"], optional = true }  # Cross-platform CPU/memory/network monitoring for status bar (feature-gated: `system-monitor`)
+mdns-sd = { workspace = true, optional = true }       # mDNS/Bonjour service discovery for SSH host auto-detection (feature-gated: `mdns`)
+
+# Linux-specific: GTK for native menus (muda requires gtk feature on Linux)
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.muda]
+version = "0.19"
+features = ["gtk"]
+
+# macOS-specific: Access CAMetalLayer for performance optimization
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-quartz-core = "0.3.2"
+# Native desktop notifications (UNUserNotificationCenter) — pinned to the same
+# objc2 0.6.x ecosystem already in the tree (see objc2-app-kit/objc2-foundation above).
+objc2-user-notifications = "0.3.2"
+block2 = "0.6.2"
+raw-window-handle = "0.6.2"
+
+# File watching for shader hot reload - platform-specific backends
+# macOS: use FSEvents (default) — kqueue opens O_EVTONLY fds per file and
+# bleeds into recursive directory watches when the shaders dir grows, exhausting
+# the process file-descriptor limit.  FSEvents is path-based, opens no per-file
+# fds, and is more efficient for watching config + shader directories.
+[target.'cfg(target_os = "macos")'.dependencies.notify]
+workspace = true
+
+# Windows/Linux: use default backends (ReadDirectoryChangesW on Windows, inotify on Linux)
+[target.'cfg(not(target_os = "macos"))'.dependencies.notify]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Windows resources (icon embedding)
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
+
+# Integration tests live in tests/ as individual binaries (one per .rs file).
+# Logical groupings by filename prefix:
+#   script_*          — scripting engine tests (ScriptManager, observer, protocol, process)
+#   shader_*          — shader configuration and hot-reload watcher tests
+#   tab_*             — tab bar UI, color, and stability tests
+#   *_notification_*  — activity and session notification tests
+#   config_tests      — general configuration loading and validation
+#   automation_*      — automation / trigger configuration tests
+#
+# Future: migrate each group into tests/<group>/mod.rs when the number of files
+# in a group exceeds ~5, using the Rust 2018+ integration test submodule pattern.
+[lib]
+name = "par_term"
+path = "src/lib.rs"
+
+[[bin]]
+name = "par-term"
+path = "src/main.rs"
+
+[features]
+default = ["audio", "system-monitor", "mdns"]
+audio = ["dep:rodio"]
+system-monitor = ["dep:sysinfo"]
+mdns = ["dep:mdns-sd", "par-term-ssh/mdns"]
+dev-tools = []  # Enable to build test-cr and test-grid utilities
+
+[[bin]]
+name = "test-cr"
+path = "src/bin/test_cr.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "test-grid"
+path = "src/bin/test_grid.rs"
+required-features = ["dev-tools"]
+
+[profile.release]
+opt-level = 3
+# Fat LTO with a single codegen unit is the slowest combination available: each binary is
+# one codegen unit, so rustc effectively uses one core, and fat LTO then adds a serial
+# whole-program pass on top. A one-line change under `src/` therefore cost ~5m40s on this
+# 32-core machine while only two rustc processes were ever alive. Thin LTO parallelises
+# both stages and lands within a few percent of fat LTO, so day-to-day `--release` builds
+# no longer dominate the edit/verify loop.
+lto = "thin"
+codegen-units = 16
+strip = true
+
+# The pre-2026-09-13 `release` settings, kept verbatim (fat LTO, one codegen unit).
+# Slower to build, marginally smaller and faster binary — use it when cutting a release or
+# when a frame timing has to stay comparable with the numbers recorded in the handoff docs.
+[profile.release-fat]
+inherits = "release"
+lto = true
+codegen-units = 1
+
+# Fast optimized builds for day-to-day development and testing.
+# Use `cargo build --profile dev-release` or `make build`.
+# Incremental + opt-level 2 + no LTO → fast rebuilds (~1-2s after initial).
+# Performance is ~90-95% of full release. Prefer plain `--release` when the difference
+# matters; it is thin-LTO now, so the gap between the two is mostly opt-level.
+[profile.dev-release]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+strip = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+

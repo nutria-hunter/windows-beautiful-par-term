@@ -1,0 +1,297 @@
+//! Per-window state for multi-window terminal emulator
+//!
+//! This module contains `WindowState`, which holds all state specific to a single window,
+//! including its renderer, tab manager, input handler, and UI components.
+//!
+//! # ARC-002: Remaining God-Object Decomposition (Requires Manual Intervention)
+//!
+//! `WindowState` is being decomposed from a God Object into cohesive sub-state structs.
+//! Twelve already live in their own `*_state.rs` module beside this one — `agent_state`,
+//! `cursor_anim_state`, `debug_state`, `egui_state`, `focus_state`, `overlay_state`,
+//! `overlay_ui_state`, `render_loop_state`, `shader_state`, `trigger_state`,
+//! `update_state`, `watcher_state` — joined by `NotificationClickState` in
+//! `notifications.rs`.
+//!
+//! What remains is a wide field list plus an `impl WindowState` surface spread across
+//! most of `src/app/`. No process maintains a count here, so re-measure before acting
+//! on this note instead of trusting a number written into it:
+//!
+//! ```text
+//! grep -rc '^impl WindowState' --include='*.rs' src/ | awk -F: '{s+=$2} END {print s}'
+//! grep -rl '^impl WindowState' --include='*.rs' src/ | wc -l
+//! ```
+//!
+//! The remaining work is deferred to a future session:
+//!
+//! **Suggested next extractions (in order of isolation):**
+//!
+//! 1. `TmuxSubsystem` — owns `tmux_state` and all methods in `src/app/tmux_handler/`.
+//!    Safe to extract once `TmuxState` has no shared borrow with other sub-state.
+//!
+//! 2. `SelectionSubsystem` — owns `smart_selection_cache`, `copy_mode`, and the
+//!    text-selection helpers in `text_selection.rs`. These three fields form a tight
+//!    read-only cluster during rendering.
+//!
+//! 3. `WindowInfrastructure` — groups `window`, `renderer`, `runtime` as the GPU/OS
+//!    surface layer; separates it from application-level state.
+//!
+//! **Blocker:** every `impl WindowState` block must be audited before moving any
+//! field to ensure no method holds simultaneous mutable borrows across sub-systems.
+//! Recommend using `cargo expand` on each field before
+//! moving it. The `#[path]` redirect blocker (ARC-003) has been resolved — field
+//! extraction from step 3+ can now proceed.
+//!
+//! **Tracking:** ARC-002 on the projects board. Lifecycle and ownership rules for the
+//! extracted sub-states are documented in `docs/architecture/STATE_LIFECYCLE.md`.
+//!
+//! # ARC-003: render_pipeline `#[path]` Redirect — RESOLVED
+//!
+//! The `#[path = "../render_pipeline/mod.rs"]` redirect has been removed.
+//! `render_pipeline` is now declared as a first-class module in `src/app/mod.rs`,
+//! matching the physical directory layout (`src/app/render_pipeline/`).
+//! All `super::` references inside `render_pipeline/*.rs` correctly resolve to
+//! the `render_pipeline` module itself (unchanged).
+
+mod action_handlers;
+mod agent_config;
+mod agent_message_helpers;
+mod agent_messages;
+mod agent_screenshot;
+pub(crate) mod agent_state;
+mod agent_tick_helpers;
+pub(crate) mod anti_idle;
+mod automation_target;
+mod clipboard_sync;
+pub(crate) mod config_updates;
+mod config_watchers;
+pub(crate) mod cursor_anim_state;
+pub(crate) mod debug_state;
+mod egui_state;
+mod focus_state;
+pub(crate) mod frame_state;
+mod ime_state;
+mod impl_agent;
+mod impl_helpers;
+mod impl_init;
+pub(crate) mod keyboard_handlers;
+mod notifications;
+mod overlay_state;
+pub(crate) mod overlay_ui_state;
+mod render_loop_state;
+pub(crate) mod renderer_init;
+mod renderer_ops;
+pub(crate) mod scroll_ops;
+pub(crate) mod search_highlight;
+mod shader_ops;
+pub(crate) mod shader_state;
+pub(crate) mod text_selection;
+mod trigger_state;
+mod ui_query_helpers;
+mod update_state;
+pub(crate) mod url_hover;
+mod watcher_state;
+
+// Re-export the sub-state types
+pub(crate) use crate::app::tmux_handler::tmux_state::TmuxState;
+pub(crate) use automation_target::AutomationTarget;
+pub(crate) use egui_state::EguiState;
+pub(crate) use focus_state::FocusState;
+pub(crate) use ime_state::ImeState;
+pub(crate) use notifications::NotificationClickState;
+pub(crate) use overlay_state::OverlayState;
+pub(crate) use render_loop_state::{ConfigSaveState, RenderLoopState};
+pub(crate) use trigger_state::{PendingTriggerAction, TriggerState};
+pub(crate) use update_state::UpdateState;
+pub(crate) use watcher_state::WatcherState;
+
+use crate::app::window_state::debug_state::DebugState;
+use crate::badge::BadgeState;
+use crate::config::Config;
+use crate::smart_selection::SmartSelectionCache;
+use crate::status_bar::StatusBarUI;
+use crate::tab::TabManager;
+use crate::tab_bar_ui::TabBarUI;
+use arc_swap::ArcSwap;
+use par_term_input::InputHandler;
+use par_term_keybindings::{KeyCombo, KeybindingRegistry};
+use par_term_render::renderer::Renderer;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+use winit::window::Window;
+
+#[derive(Clone)]
+pub(crate) struct PreservedClipboardImage {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct ClipboardImageClickGuard {
+    pub(crate) image: PreservedClipboardImage,
+    pub(crate) press_position: (f64, f64),
+    pub(crate) suppress_terminal_mouse_click: bool,
+}
+
+/// Transient context shared between chained workflow actions.
+///
+/// Created by `ShellCommand` actions with `capture_output: true` and
+/// consumed by `Condition` checks (`ExitCode`, `OutputContains`).
+/// Never serialized to disk.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowContext {
+    /// Exit code from the last captured shell command.
+    pub(crate) last_exit_code: Option<i32>,
+    /// Captured stdout+stderr from the last shell command (capped at 64 KB).
+    pub(crate) last_output: Option<String>,
+}
+
+/// Per-window state that manages a single terminal window with multiple tabs.
+pub struct WindowState {
+    // =========================================================================
+    // Core infrastructure
+    // =========================================================================
+    /// Global configuration (QA-001: ArcSwap for zero-cost reads, atomic whole-config swaps)
+    pub(crate) config: ArcSwap<Config>,
+    /// The winit window handle
+    pub(crate) window: Option<Arc<Window>>,
+    /// GPU renderer
+    pub(crate) renderer: Option<Renderer>,
+    /// Keyboard and mouse input handler
+    pub(crate) input_handler: InputHandler,
+    /// Tokio runtime shared with async PTY tasks
+    pub(crate) runtime: Arc<Runtime>,
+
+    // =========================================================================
+    // Tab & built-in UI bars
+    // =========================================================================
+    /// Tab manager for handling multiple terminal tabs
+    pub(crate) tab_manager: TabManager,
+    /// Tab bar UI
+    pub(crate) tab_bar_ui: TabBarUI,
+    /// Custom status bar UI
+    pub(crate) status_bar_ui: StatusBarUI,
+
+    // =========================================================================
+    // Window flags
+    // =========================================================================
+    /// Whether window is currently in fullscreen mode
+    pub(crate) is_fullscreen: bool,
+    /// Whether terminal session recording is active
+    pub(crate) is_recording: bool,
+    /// Flag to indicate shutdown is in progress
+    pub(crate) is_shutting_down: bool,
+    /// Window index (1-based) for display in title bar
+    pub(crate) window_index: usize,
+
+    // =========================================================================
+    // egui overlay layer (ARC-002 extraction: EguiState)
+    // =========================================================================
+    /// egui context, input state, and lifecycle flags (see `EguiState`)
+    pub(crate) egui: EguiState,
+
+    // =========================================================================
+    // Sub-system state bundles
+    // =========================================================================
+    /// Shader hot-reload watcher, metadata caches, and reload-error state
+    pub(crate) shader_state: crate::app::window_state::shader_state::ShaderState,
+    /// Overlay / modal / side-panel UI state
+    pub(crate) overlay_ui: crate::app::window_state::overlay_ui_state::OverlayUiState,
+    /// ACP agent connection and runtime state
+    pub(crate) agent_state: agent_state::AgentState,
+    /// Cursor animation state (opacity, blink timers)
+    pub(crate) cursor_anim: crate::app::window_state::cursor_anim_state::CursorAnimState,
+    /// Debug / diagnostics state
+    pub(crate) debug: DebugState,
+    /// Per-frame render decisions and reusable scratch buffers
+    pub(crate) frame: crate::app::window_state::frame_state::FrameState,
+
+    // =========================================================================
+    // Decomposed state objects (ARC-002)
+    // =========================================================================
+    /// State for focus, redraw tracking, and render throttling
+    pub(crate) focus_state: FocusState,
+    /// State for the in-app self-update flow
+    pub(crate) update_state: UpdateState,
+    /// State for transient UI overlays and pending UI requests
+    pub(crate) overlay_state: OverlayState,
+    /// State for file and request watchers
+    pub(crate) watcher_state: WatcherState,
+    /// State for terminal triggers and their spawned processes
+    pub(crate) trigger_state: TriggerState,
+    /// Pending OSC 99 notification click-to-action registry (per-window; see
+    /// `notifications::NotificationClickState` docs for why)
+    pub(crate) notification_click_state: NotificationClickState,
+
+    // =========================================================================
+    // Render loop control & config management (ARC-002 extraction: RenderLoopState)
+    // =========================================================================
+    /// Pending-work flags for the render loop (agent config change, font rebuild, config save)
+    pub(crate) render_loop: RenderLoopState,
+
+    // =========================================================================
+    // Feature state
+    // =========================================================================
+    /// Whether keyboard input is broadcast to all panes in current tab
+    pub(crate) broadcast_input: bool,
+    /// State machine for promote/demote pane-tab operations
+    pub(crate) pane_transfer_state: crate::app::tab_ops::pane_transfer::PaneTransferState,
+    /// Badge state for session information display
+    pub(crate) badge_state: BadgeState,
+    /// Copy mode state machine
+    pub(crate) copy_mode: crate::copy_mode::CopyModeState,
+    /// File transfer UI state
+    pub(crate) file_transfer_state: crate::app::file_transfers::FileTransferState,
+    /// Snapshot of clipboard image for restore after tmux clicks
+    pub(crate) clipboard_image_click_guard: Option<ClipboardImageClickGuard>,
+    /// Last OSC 52 clipboard content applied to the system clipboard (dedup).
+    pub(crate) last_osc52_clipboard: Option<String>,
+    /// Shared transient context for chained workflow actions (Sequence / Condition / Repeat).
+    /// Written by background ShellCommand threads (capture_output=true); read by Condition checks.
+    pub(crate) last_workflow_context: std::sync::Arc<std::sync::Mutex<Option<WorkflowContext>>>,
+
+    // =========================================================================
+    // Keybinding & smart selection caches
+    // =========================================================================
+    pub(crate) keybinding_registry: KeybindingRegistry,
+    pub(crate) custom_action_prefix_combo: Option<KeyCombo>,
+    pub(crate) custom_action_prefix_state: crate::tmux::PrefixState,
+    pub(crate) smart_selection_cache: SmartSelectionCache,
+
+    // =========================================================================
+    // tmux integration
+    // =========================================================================
+    pub(crate) tmux_state: TmuxState,
+
+    // =========================================================================
+    // Window snap-to-grid
+    // =========================================================================
+    /// Tracks the last size we requested via `request_inner_size` for snap-to-grid.
+    /// Cleared once we receive a Resized event matching this size, preventing infinite re-snap.
+    pub(crate) pending_snap_size: Option<winit::dpi::PhysicalSize<u32>>,
+
+    // =========================================================================
+    // PTY grid settling
+    // =========================================================================
+    /// Last grid size actually handed to the PTY.
+    ///
+    /// Window setup reports several grids in quick succession (a restored placement,
+    /// then the real size, then the tab bar offset). Pushing each one makes a TUI
+    /// read a size that is already stale, lay out for it, and leave its input box
+    /// off-screen — so the child only ever sees a settled grid.
+    pub(crate) pty_grid_committed: Option<(usize, usize)>,
+    /// Grid seen on the previous check; a repeat means the size has settled.
+    pub(crate) pty_grid_candidate: Option<(usize, usize)>,
+    /// The window is minimized or was, so the grid it reports cannot be trusted.
+    ///
+    /// A minimized window reports its icon size (192x34 for 1300x900 at 150%), which
+    /// the renderer happily turns into a 13x1 grid. Restoring re-enables frames a few
+    /// milliseconds *before* the restored size arrives, so without this gate the settle
+    /// logic sees the same one-row grid on two consecutive frames and hands it to the
+    /// children — exactly the transient garbage the settling gate exists to prevent.
+    /// Cleared by the next real `WindowEvent::Resized`, which is the point where the
+    /// grid is derived from a size the user actually asked for.
+    pub(crate) pty_grid_suspect: bool,
+
+    /// IME composition state (preedit + caret), fed by `WindowEvent::Ime`.
+    pub(crate) ime: ImeState,
+}

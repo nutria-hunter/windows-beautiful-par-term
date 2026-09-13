@@ -1,0 +1,33 @@
+[package]
+name = "par-term-acp"
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Paul Robello <probello@gmail.com>"]
+description = "Agent Communication Protocol (ACP) implementation for par-term"
+license = "MIT"
+repository = "https://github.com/paulrobello/par-term"
+homepage = "https://github.com/paulrobello/par-term"
+keywords = ["terminal", "acp", "agent", "jsonrpc"]
+categories = ["development-tools"]
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Shell command parsing (SEC-005: direct spawn without shell for simple commands)
+shell-words.workspace = true
+
+# Logging
+log.workspace = true
+
+# Platform directories (SEC-011, SEC-014: sensitive path blocklist)
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

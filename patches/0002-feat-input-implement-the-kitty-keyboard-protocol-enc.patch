@@ -1,0 +1,631 @@
+From 0c6763424e791fab07d592ab9c759ac2ccc704e2 Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 09:11:37 +0900
+Subject: [PATCH 2/4] feat(input): implement the kitty keyboard protocol
+ encoder
+
+pi requires the kitty keyboard protocol (its docs: "Pi uses the Kitty keyboard
+protocol for reliable modifier key detection") and pushes `CSI > 7 u` at startup,
+which par-term could not honour: the core already tracks, queries and answers the
+flag stack, but nothing on the encode side read those flags, so the handler only ever
+produced modifyOtherKeys and legacy sequences.
+
+Add the encoder (`try_kitty_encoding`) with the per-flag rules for `disambiguate`,
+`report_all_keys`, `report_alternate_keys` and `report_event_types`, including the
+rule that a printable key is sent as its unshifted base codepoint with Shift
+expressed as a modifier bit. Wire the flags through TerminalLike (real type plus the
+test double), cache them per tab the way the existing mode caches are, and read them
+in the key handler ahead of the Shift+Enter path so kitty wins when it is active.
+
+Two defects found while verifying against pi's real flags (7, i.e. report_all off):
+
+* Space was encoded as CSI-u instead of a plain space, so typed text arrived with the
+  spaces missing. Plain characters, space, Enter, Tab and Backspace must stay literal
+  bytes for this flag set; only `report_all_keys` turns ordinary characters into
+  CSI-u, and Enter must keep the default event type for ConPTY compatibility.
+* The encoding path is an opt-in push/pop protocol, so no code path may assume it is
+  active: with flags at zero the encoder returns None and the existing
+  modifyOtherKeys -> legacy fallback runs unchanged.
+
+Add `input.kitty_keyboard` (default true) as an escape hatch for applications that
+request the protocol but cannot parse the result, and regression tests covering the
+flag combinations pi actually uses.
+
+Note: reading the flags is also what emits the `KITTY_KEYBOARD flags requested:` log
+line, which only appears on a key event - do not wait for it as a startup signal.
+---
+ .../src/config/config_struct/input_config.rs  |  10 ++
+ par-term-input/src/key_encoding.rs            | 126 +++++++++++++++++-
+ .../tests/kitty_regression_tests.rs           |  89 +++++++++++++
+ par-term-terminal/src/terminal/mod.rs         |  11 ++
+ src/app/input_events/key_handler/mod.rs       |  37 ++++-
+ src/tab/constructors.rs                       |  16 ++-
+ src/tab/mod.rs                                |  40 +++++-
+ src/traits.rs                                 |   6 +
+ src/traits_impl.rs                            |  13 ++
+ 9 files changed, 343 insertions(+), 5 deletions(-)
+ create mode 100644 par-term-input/tests/kitty_regression_tests.rs
+
+diff --git a/par-term-config/src/config/config_struct/input_config.rs b/par-term-config/src/config/config_struct/input_config.rs
+index 1add29c..ca8ac84 100644
+--- a/par-term-config/src/config/config_struct/input_config.rs
++++ b/par-term-config/src/config/config_struct/input_config.rs
+@@ -36,6 +36,15 @@ pub struct InputConfig {
+     /// For example, Ctrl+Z will always be the bottom-left key regardless of QWERTY/AZERTY/Dvorak.
+     #[serde(default = "crate::defaults::bool_false")]
+     pub use_physical_keys: bool,
++
++    /// Honour the Kitty keyboard protocol when an application requests it
++    ///
++    /// Applications opt in with `CSI > flags u`, and par-term then encodes key events
++    /// as `CSI code ; modifiers u`. That is the only way an application can tell
++    /// `Shift+Enter` from `Enter` — both are a bare CR otherwise. Turn this off for an
++    /// application that requests the protocol but cannot parse the result.
++    #[serde(default = "crate::defaults::bool_true")]
++    pub kitty_keyboard: bool,
+ }
+ 
+ impl Default for InputConfig {
+@@ -45,6 +54,7 @@ impl Default for InputConfig {
+             right_option_key_mode: OptionKeyMode::default(),
+             modifier_remapping: ModifierRemapping::default(),
+             use_physical_keys: crate::defaults::bool_false(),
++            kitty_keyboard: crate::defaults::bool_true(),
+         }
+     }
+ }
+diff --git a/par-term-input/src/key_encoding.rs b/par-term-input/src/key_encoding.rs
+index fc794e0..9dab5da 100644
+--- a/par-term-input/src/key_encoding.rs
++++ b/par-term-input/src/key_encoding.rs
+@@ -86,22 +86,50 @@ impl InputHandler {
+         )
+     }
+ 
++    /// Convert a keyboard event to terminal input bytes with every keyboard mode.
++    ///
++    /// `keyboard_flags` carries the Kitty keyboard protocol flags the application
++    /// pushed with `CSI > flags u`. When non-zero they select the Kitty CSI-u
++    /// encoding, which is the only way an application can tell `Shift+Enter` from
++    /// `Enter` — both are a bare CR in the legacy encoding.
++    pub fn handle_key_event_with_modes(
++        &mut self,
++        event: KeyEvent,
++        modify_other_keys_mode: u8,
++        application_cursor: bool,
++        keyboard_flags: u16,
++    ) -> Option<Vec<u8>> {
++        self.handle_key_input_with_modes(
++            &KeyInput::from(event),
++            modify_other_keys_mode,
++            application_cursor,
++            keyboard_flags,
++        )
++    }
++
+     /// Convert a [`KeyInput`] to terminal input bytes with modifyOtherKeys support.
+     ///
+     /// This is the implementation behind the [`KeyEvent`] entry points above, which
+     /// exist only to convert. Prefer this when you do not already hold a winit
+     /// event: `KeyEvent` cannot be constructed outside winit without undefined
+     /// behaviour, so callers that would otherwise forge one should use this.
+-    pub fn handle_key_input_with_mode(
++    pub fn handle_key_input_with_modes(
+         &mut self,
+         input: &KeyInput,
+         modify_other_keys_mode: u8,
+         application_cursor: bool,
++        keyboard_flags: u16,
+     ) -> Option<Vec<u8>> {
+         if input.state != ElementState::Pressed {
+             return None;
+         }
+ 
++        // Kitty keyboard protocol first: the application opted in explicitly and it
++        // carries more information than modifyOtherKeys, so it wins when both are on.
++        if let Some(bytes) = self.try_kitty_encoding(input, keyboard_flags) {
++            return Some(bytes);
++        }
++
+         let ctrl = self.modifiers.state().control_key();
+         let alt = self.modifiers.state().alt_key();
+ 
+@@ -332,6 +360,102 @@ impl InputHandler {
+     /// - 2 = Shift
+     /// - 3 = Alt
+     /// - 4 = Shift+Alt
++    /// Convert a [`KeyInput`] to terminal input bytes with modifyOtherKeys support.
++    ///
++    /// Kept for callers that do not track the Kitty keyboard protocol: it is the same
++    /// encoder with zero flags, which is exactly the pre-Kitty behaviour.
++    pub fn handle_key_input_with_mode(
++        &mut self,
++        input: &KeyInput,
++        modify_other_keys_mode: u8,
++        application_cursor: bool,
++    ) -> Option<Vec<u8>> {
++        self.handle_key_input_with_modes(input, modify_other_keys_mode, application_cursor, 0)
++    }
++
++    /// Kitty keyboard protocol flag bits.
++    const KITTY_DISAMBIGUATE_ESCAPE_CODES: u16 = 0b1;
++    const KITTY_REPORT_ALL_KEYS_AS_ESCAPE_CODES: u16 = 0b1000;
++
++    /// Encode a key event with the Kitty keyboard protocol.
++    ///
++    /// Returns `None` for keys that keep their legacy encoding, which is what makes the
++    /// protocol a progressive enhancement: an application that never pushed flags sees
++    /// exactly the bytes it saw before, while one that did gets `CSI code ; modifiers u`
++    /// and can therefore tell `Shift+Enter` (`13;2`) from `Enter` (`13`).
++    fn try_kitty_encoding(&self, input: &KeyInput, flags: u16) -> Option<Vec<u8>> {
++        if flags == 0 {
++            return None;
++        }
++
++        let mut modifier_bits = 0u16;
++        if self.modifiers.state().shift_key() {
++            modifier_bits |= 1;
++        }
++        if self.modifiers.state().alt_key() {
++            modifier_bits |= 2;
++        }
++        if self.modifiers.state().control_key() {
++            modifier_bits |= 4;
++        }
++        if self.modifiers.state().super_key() {
++            modifier_bits |= 8;
++        }
++
++        // The reported code point: a printable key reports its unshifted base, because
++        // the protocol expresses Shift as a modifier bit. The ambiguous control keys
++        // report their legacy code points so they can be told apart from Ctrl+I,
++        // Ctrl+M and Ctrl+[ (which are the same bytes in the legacy encoding).
++        let codepoint = match &input.logical_key {
++            Key::Character(text) => {
++                (self
++                    .get_base_character(input)
++                    .or_else(|| text.chars().next())?) as u32
++            }
++            Key::Named(NamedKey::Enter) => 13,
++            Key::Named(NamedKey::Tab) => 9,
++            Key::Named(NamedKey::Backspace) => 127,
++            Key::Named(NamedKey::Escape) => 27,
++            Key::Named(NamedKey::Space) => 32,
++            // Arrows, function keys and the rest are already unambiguous in their
++            // legacy form, so they keep it.
++            _ => return None,
++        };
++
++        let report_all = flags & Self::KITTY_REPORT_ALL_KEYS_AS_ESCAPE_CODES != 0;
++        let disambiguate = flags & Self::KITTY_DISAMBIGUATE_ESCAPE_CODES != 0;
++        // Text (including Shift-only text and Space) stays UTF-8 unless all-key
++        // reporting is requested. Keep the unmodified shell recovery keys legacy
++        // too: encoding them as CSI-u makes ConPTY discard ordinary input.
++        let text_key = matches!(
++            input.logical_key,
++            Key::Character(_) | Key::Named(NamedKey::Space)
++        );
++        let recovery_key = matches!(
++            input.logical_key,
++            Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
++        );
++        if !report_all
++            && ((text_key && modifier_bits & !1 == 0) || (recovery_key && modifier_bits == 0))
++        {
++            return None;
++        }
++        let ambiguous = matches!(input.logical_key, Key::Named(NamedKey::Escape)) || recovery_key;
++        if !report_all && !(disambiguate && (modifier_bits != 0 || ambiguous)) {
++            return None;
++        }
++
++        // Press is the protocol default. Omit its optional :1 subfield: ConPTY
++        // does not reliably preserve colon subparameters in keyboard input.
++        let mut sequence = format!("\x1b[{codepoint}");
++        if modifier_bits != 0 {
++            sequence.push(';');
++            sequence.push_str(&(modifier_bits + 1).to_string());
++        }
++        sequence.push('u');
++        Some(sequence.into_bytes())
++    }
++
+     /// - 5 = Ctrl
+     /// - 6 = Shift+Ctrl
+     /// - 7 = Alt+Ctrl
+diff --git a/par-term-input/tests/kitty_regression_tests.rs b/par-term-input/tests/kitty_regression_tests.rs
+new file mode 100644
+index 0000000..ad5d712
+--- /dev/null
++++ b/par-term-input/tests/kitty_regression_tests.rs
+@@ -0,0 +1,89 @@
++use par_term_input::{InputHandler, KeyInput};
++use winit::event::{ElementState, Modifiers};
++use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
++
++fn encode(key: Key, code: KeyCode, modifiers: ModifiersState, flags: u16) -> Vec<u8> {
++    let mut handler = InputHandler::new();
++    handler.modifiers = Modifiers::from(modifiers);
++    handler
++        .handle_key_input_with_modes(
++            &KeyInput {
++                logical_key: key,
++                physical_key: PhysicalKey::Code(code),
++                state: ElementState::Pressed,
++            },
++            0,
++            false,
++            flags,
++        )
++        .unwrap()
++}
++
++#[test]
++fn kitty_pi_flags_preserve_text_and_shell_recovery_keys() {
++    for (key, code, expected) in [
++        (Key::Character("a".into()), KeyCode::KeyA, "a"),
++        (Key::Named(NamedKey::Space), KeyCode::Space, " "),
++        (Key::Named(NamedKey::Enter), KeyCode::Enter, "\r"),
++        (Key::Named(NamedKey::Tab), KeyCode::Tab, "\t"),
++        (Key::Named(NamedKey::Backspace), KeyCode::Backspace, "\x7f"),
++    ] {
++        assert_eq!(
++            encode(key, code, ModifiersState::empty(), 7),
++            expected.as_bytes()
++        );
++    }
++    assert_eq!(
++        encode(
++            Key::Character("!".into()),
++            KeyCode::Digit1,
++            ModifiersState::SHIFT,
++            7
++        ),
++        b"!"
++    );
++    assert_eq!(
++        encode(
++            Key::Character("A".into()),
++            KeyCode::KeyA,
++            ModifiersState::SHIFT,
++            7
++        ),
++        b"A"
++    );
++}
++
++#[test]
++fn kitty_explicit_all_keys_still_encodes_space() {
++    assert_eq!(
++        encode(
++            Key::Named(NamedKey::Space),
++            KeyCode::Space,
++            ModifiersState::empty(),
++            8
++        ),
++        b"\x1b[32u"
++    );
++}
++
++#[test]
++fn kitty_press_uses_the_default_event_type_for_conpty_compatibility() {
++    assert_eq!(
++        encode(
++            Key::Character("c".into()),
++            KeyCode::KeyC,
++            ModifiersState::CONTROL,
++            7
++        ),
++        b"\x1b[99;5u"
++    );
++    assert_eq!(
++        encode(
++            Key::Named(NamedKey::Enter),
++            KeyCode::Enter,
++            ModifiersState::SHIFT,
++            7
++        ),
++        b"\x1b[13;2u"
++    );
++}
+diff --git a/par-term-terminal/src/terminal/mod.rs b/par-term-terminal/src/terminal/mod.rs
+index dfe229f..2b44c17 100644
+--- a/par-term-terminal/src/terminal/mod.rs
++++ b/par-term-terminal/src/terminal/mod.rs
+@@ -579,6 +579,17 @@ impl TerminalManager {
+         term.modify_other_keys_mode()
+     }
+ 
++    /// Current Kitty keyboard protocol flags (0 when the application has not opted in).
++    ///
++    /// The application opts in with `CSI > flags u`; par-term reads the flags only to
++    /// decide how to encode key events back to it.
++    pub fn keyboard_flags(&self) -> u16 {
++        let pty = self.pty_session.lock();
++        let terminal = pty.terminal();
++        let term = terminal.write();
++        term.keyboard_flags()
++    }
++
+     /// Check if application cursor key mode (DECCKM) is enabled.
+     pub fn application_cursor(&self) -> bool {
+         let pty = self.pty_session.lock();
+diff --git a/src/app/input_events/key_handler/mod.rs b/src/app/input_events/key_handler/mod.rs
+index 2c55ce8..a524a17 100644
+--- a/src/app/input_events/key_handler/mod.rs
++++ b/src/app/input_events/key_handler/mod.rs
+@@ -430,6 +430,40 @@ impl WindowState {
+                 (0, false, false)
+             };
+ 
++        // Kitty keyboard protocol flags, when the application pushed any. The focused
++        // pane is consulted first for the same reason the modes above are, and the tab
++        // cache covers the case where that read collides with the PTY reader. The
++        // config flag is an escape hatch for applications that request the protocol but
++        // cannot parse the CSI-u result.
++        let keyboard_flags = if self.config.load().input.kitty_keyboard {
++            if let Some(tab) = self.tab_manager.active_tab() {
++                tab.pane_manager
++                    .as_ref()
++                    .and_then(|pm| pm.focused_pane())
++                    .and_then(|pane| {
++                        pane.terminal
++                            .try_read()
++                            .ok()
++                            .map(|term| term.keyboard_flags())
++                    })
++                    .unwrap_or_else(|| tab.keyboard_flags_or_cached())
++            } else {
++                0
++            }
++        } else {
++            0
++        };
++
++        // Evidence for whether an application actually opted in: the flags only change
++        // when it pushes them, so this logs once per request instead of per keystroke.
++        {
++            use std::sync::atomic::{AtomicU16, Ordering};
++            static LAST_FLAGS: AtomicU16 = AtomicU16::new(0);
++            if LAST_FLAGS.swap(keyboard_flags, Ordering::Relaxed) != keyboard_flags {
++                log::info!("KITTY_KEYBOARD flags requested: {keyboard_flags:#08b}");
++            }
++        }
++
+         // Detect Shift+Enter before the event is consumed by handle_key_event_with_mode.
+         // Par-term follows the iTerm2 convention: regular Enter emits CR (\r) so
+         // shells submit the command line, Shift+Enter emits LF (\n) so chat-style
+@@ -450,10 +484,11 @@ impl WindowState {
+             && matches!(event.logical_key, Key::Named(NamedKey::Enter));
+ 
+         // Normal key handling - send to terminal (or via tmux if connected)
+-        if let Some(mut bytes) = self.input_handler.handle_key_event_with_mode(
++        if let Some(mut bytes) = self.input_handler.handle_key_event_with_modes(
+             event,
+             modify_other_keys_mode,
+             application_cursor,
++            keyboard_flags,
+         ) {
+             if is_shift_enter {
+                 // Gateway path: route raw LF via send-keys -H so it bypasses
+diff --git a/src/tab/constructors.rs b/src/tab/constructors.rs
+index 5aca9a1..577f733 100644
+--- a/src/tab/constructors.rs
++++ b/src/tab/constructors.rs
+@@ -20,7 +20,7 @@ use par_term_config::TabId;
+ use par_term_terminal::TerminalManager;
+ use par_term_terminal::conversion::to_core_restart_policy;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU8};
++use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8};
+ use tokio::runtime::Runtime;
+ use tokio::sync::RwLock;
+ 
+@@ -235,12 +235,16 @@ impl Tab {
+             profile: TabProfileState::default(),
+             scripting,
+             was_alt_screen: false,
++            was_modify_other_keys: false,
++            was_mouse_tracking: false,
++            pending_resize_pulse: false,
+             is_active,
+             shutdown_fast: false,
+             is_hidden: false,
+             cached_modify_other_keys_mode: AtomicU8::new(0),
+             cached_application_cursor: AtomicBool::new(false),
+             cached_alt_screen_active: AtomicBool::new(false),
++            cached_keyboard_flags: AtomicU16::new(0),
+             cached_has_tmux_child: AtomicBool::new(false),
+         })
+     }
+@@ -370,7 +374,7 @@ impl Tab {
+         if profile.command.is_none() && !is_ssh_profile {
+             let use_login_shell = profile.login_shell.unwrap_or(config.shell.login_shell);
+             if use_login_shell {
+-                let args = shell_args.get_or_insert_with(Vec::new);
++                let _args = shell_args.get_or_insert_with(Vec::new);
+                 #[cfg(not(target_os = "windows"))]
+                 if !args.iter().any(|a| a == "-l" || a == "--login") {
+                     args.insert(0, "-l".to_string());
+@@ -467,12 +471,16 @@ impl Tab {
+             profile: TabProfileState::default(),
+             scripting: TabScriptingState::default(),
+             was_alt_screen: false,
++            was_modify_other_keys: false,
++            was_mouse_tracking: false,
++            pending_resize_pulse: false,
+             is_active,
+             shutdown_fast: false,
+             is_hidden: false,
+             cached_modify_other_keys_mode: AtomicU8::new(0),
+             cached_application_cursor: AtomicBool::new(false),
+             cached_alt_screen_active: AtomicBool::new(false),
++            cached_keyboard_flags: AtomicU16::new(0),
+             cached_has_tmux_child: AtomicBool::new(false),
+         }
+     }
+@@ -513,12 +521,16 @@ impl Tab {
+             profile: TabProfileState::default(),
+             scripting: TabScriptingState::default(),
+             was_alt_screen: false,
++            was_modify_other_keys: false,
++            was_mouse_tracking: false,
++            pending_resize_pulse: false,
+             is_active,
+             shutdown_fast: false,
+             is_hidden: false,
+             cached_modify_other_keys_mode: AtomicU8::new(0),
+             cached_application_cursor: AtomicBool::new(false),
+             cached_alt_screen_active: AtomicBool::new(false),
++            cached_keyboard_flags: AtomicU16::new(0),
+             cached_has_tmux_child: AtomicBool::new(false),
+         }
+     }
+diff --git a/src/tab/mod.rs b/src/tab/mod.rs
+index e949261..ee112ce 100644
+--- a/src/tab/mod.rs
++++ b/src/tab/mod.rs
+@@ -33,7 +33,7 @@ pub(crate) use setup::{
+     apply_login_shell_flag, build_shell_env, configure_terminal_from_config, get_shell_command,
+ };
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+ use tokio::runtime::Runtime;
+ use tokio::sync::RwLock;
+ use tokio::task::JoinHandle;
+@@ -119,6 +119,22 @@ pub struct Tab {
+     pub(crate) scripting: TabScriptingState,
+     /// Whether the terminal was on the alt screen last frame (for detecting transitions)
+     pub(crate) was_alt_screen: bool,
++    /// Whether modifyOtherKeys was enabled last frame.
++    ///
++    /// Inline TUIs announce themselves by enabling terminal modes rather than
++    /// switching to the alternate screen, so these transitions are what mark "an
++    /// interactive app just started" for them.
++    pub(crate) was_modify_other_keys: bool,
++    /// Whether mouse tracking was enabled last frame (another TUI start signal).
++    pub(crate) was_mouse_tracking: bool,
++    /// Set when the tab entered the alt screen and the PTY still needs a size
++    /// re-asserted (Windows only, see [`crate::app::render_pipeline::frame_setup`]).
++    ///
++    /// The Unix equivalent is a `SIGWINCH` pulse sent from the emulator core;
++    /// Windows has no such out-of-band channel, so the size has to be re-applied
++    /// through the PTY. Kept as a pending flag rather than fired once so a
++    /// contended terminal lock cannot silently swallow it.
++    pub(crate) pending_resize_pulse: bool,
+     /// Whether this tab is the currently active (visible) tab.
+     /// Used by the refresh task to dynamically choose polling interval.
+     /// Managed exclusively within the `crate::tab` module.
+@@ -139,6 +155,10 @@ pub struct Tab {
+     /// Last-known alt-screen state. See cache rationale on
+     /// `cached_modify_other_keys_mode`.
+     pub(crate) cached_alt_screen_active: AtomicBool,
++    /// Last-known Kitty keyboard protocol flags (0 when the application has not opted
++    /// in). Cached for the same reason as the modes above: the key path must not block
++    /// when the PTY reader holds the terminal lock.
++    pub(crate) cached_keyboard_flags: AtomicU16,
+     /// Last-known result of "is a `tmux*` process running under this tab's
+     /// shell?", populated by [`crate::app::WindowState::shell_has_tmux_child`].
+     /// Used to disambiguate Shift+Enter encoding when a `try_read` collision
+@@ -155,6 +175,10 @@ impl Tab {
+     ///
+     /// Returns `(modify_other_keys_mode, application_cursor, alt_screen_active)`.
+     ///
++    /// Also refreshes the cached Kitty keyboard flags as a side effect, so a later
++    /// [`Tab::keyboard_flags_or_cached`] call under lock contention still sees a recent
++    /// value.
++    ///
+     /// Used by the keyboard input path to keep modifier-aware encoding
+     /// correct when the renderer's `try_write` collides with our `try_read`
+     /// — see field-level docs on `cached_modify_other_keys_mode`.
+@@ -167,6 +191,8 @@ impl Tab {
+                 .store(m, Ordering::Relaxed);
+             self.cached_application_cursor.store(a, Ordering::Relaxed);
+             self.cached_alt_screen_active.store(s, Ordering::Relaxed);
++            self.cached_keyboard_flags
++                .store(term.keyboard_flags(), Ordering::Relaxed);
+             (m, a, s)
+         } else {
+             (
+@@ -176,6 +202,18 @@ impl Tab {
+             )
+         }
+     }
++
++    /// Kitty keyboard protocol flags, read from the terminal when the lock is free and
++    /// from the cache otherwise, so the key path never blocks on the PTY.
++    pub(crate) fn keyboard_flags_or_cached(&self) -> u16 {
++        if let Ok(term) = self.terminal.try_read() {
++            let flags = term.keyboard_flags();
++            self.cached_keyboard_flags.store(flags, Ordering::Relaxed);
++            flags
++        } else {
++            self.cached_keyboard_flags.load(Ordering::Relaxed)
++        }
++    }
+ }
+ 
+ /// Parameters that differ between `Tab::new()` and `Tab::new_from_profile()`.
+diff --git a/src/traits.rs b/src/traits.rs
+index fd5afea..dab04a4 100644
+--- a/src/traits.rs
++++ b/src/traits.rs
+@@ -52,6 +52,12 @@ pub trait TerminalAccess {
+     /// Controls how modifier-key combinations are encoded in key sequences.
+     fn modify_other_keys_mode(&self) -> u8;
+ 
++    /// Current Kitty keyboard protocol flags (0 when the application has not opted in).
++    ///
++    /// The application enables them with `CSI > flags u`, and par-term uses them to
++    /// choose the Kitty CSI-u encoding for the key events it sends back.
++    fn keyboard_flags(&self) -> u16;
++
+     /// Returns `true` if DECCKM (application cursor key) mode is active.
+     ///
+     /// In application mode, cursor keys send `\x1bO[ABCD]` instead of `\x1b[ABCD]`.
+diff --git a/src/traits_impl.rs b/src/traits_impl.rs
+index 35b6117..574bcb9 100644
+--- a/src/traits_impl.rs
++++ b/src/traits_impl.rs
+@@ -60,6 +60,13 @@ impl TerminalAccess for TerminalManager {
+         self.modify_other_keys_mode()
+     }
+ 
++    /// Current Kitty keyboard protocol flags (0 when the application has not opted in).
++    ///
++    /// Delegates to [`TerminalManager::keyboard_flags`].
++    fn keyboard_flags(&self) -> u16 {
++        self.keyboard_flags()
++    }
++
+     /// Returns `true` if DECCKM (application cursor key) mode is active.
+     ///
+     /// Delegates to [`TerminalManager::application_cursor`].
+@@ -182,6 +189,7 @@ mod tests {
+         mouse_any_event: bool,
+         modify_other_keys: u8,
+         app_cursor: bool,
++        keyboard_flags: u16,
+     }
+ 
+     impl MockTerminal {
+@@ -191,6 +199,7 @@ mod tests {
+                 mouse_any_event: false,
+                 modify_other_keys: 0,
+                 app_cursor: false,
++                keyboard_flags: 0,
+             }
+         }
+ 
+@@ -228,6 +237,10 @@ mod tests {
+             self.modify_other_keys
+         }
+ 
++        fn keyboard_flags(&self) -> u16 {
++            self.keyboard_flags
++        }
++
+         fn application_cursor(&self) -> bool {
+             self.app_cursor
+         }

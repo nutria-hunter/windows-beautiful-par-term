@@ -1,0 +1,1621 @@
+From de9cd29b88e109484e3562b45a7aeb39f9d39e21 Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 09:11:57 +0900
+Subject: [PATCH 4/4] feat(chrome): tab pills, window controls and a tab width
+ cap
+
+Bring the tab strip and window frame in line with the Kanagawa Wave look:
+
+* Translucent tab bar (tab_bar_bg_alpha) so the background shader reads through it,
+  plus the active tab's bottom indicator inset to the flat span of the pill.
+* macOS-style window controls drawn at the right of the strip when the native frame
+  is off, reserving their width out of the tab budget and out of the drag region.
+* Drag a borderless window by the empty part of the tab strip (titlebar_drag
+  subclasses the window proc and answers WM_NCHITTEST with HTCAPTION there), with a
+  6px edge band for resize hit-testing, disabled while maximised.
+* Rounded corners and a 1px border via DWM (window_effects).
+* Kanagawa Wave theme. Its `background` must stay equal to ANSI black: par-term
+  decides "this cell is the default background" by exact RGB match and reads the
+  console default as `theme.black`, so any difference paints an opaque quad per cell
+  over the background shader.
+* Cap a tab at half the width available to the strip, so a single tab no longer spans
+  the whole title row and the height is untouched.
+
+Also folds in two incidental clippy cleanups (let-chain in shell_detection, `Ok(())`
+rather than `return Ok(())` in menu).
+---
+ .../config_struct/tab_bar_colors_config.rs    |  36 +++
+ .../src/config/config_struct/window_config.rs |  22 ++
+ par-term-config/src/defaults/colors.rs        |  35 +++
+ par-term-config/src/defaults/mod.rs           |  10 +-
+ par-term-config/src/defaults/window.rs        |  24 ++
+ par-term-config/src/shell_detection.rs        |   8 +-
+ par-term-config/src/themes.rs                 |  41 +++
+ src/app/window_manager/mod.rs                 |   3 +
+ src/app/window_manager/titlebar_drag.rs       | 262 ++++++++++++++++++
+ src/app/window_manager/window_controls.rs     |  50 ++++
+ src/app/window_manager/window_effects.rs      | 137 +++++++++
+ src/app/window_manager/window_lifecycle.rs    |  27 ++
+ .../window_state/action_handlers/tab_bar.rs   |  22 ++
+ src/menu/mod.rs                               |   2 +-
+ src/tab_bar_ui/caption_buttons.rs             | 126 +++++++++
+ src/tab_bar_ui/horizontal.rs                  |  74 ++++-
+ src/tab_bar_ui/mod.rs                         |  18 +-
+ src/tab_bar_ui/tab_painter.rs                 | 138 ++++++---
+ src/tab_bar_ui/tab_rendering.rs               |  56 +++-
+ src/ui_constants.rs                           |  40 ++-
+ 20 files changed, 1061 insertions(+), 70 deletions(-)
+ create mode 100644 src/app/window_manager/titlebar_drag.rs
+ create mode 100644 src/app/window_manager/window_controls.rs
+ create mode 100644 src/app/window_manager/window_effects.rs
+ create mode 100644 src/tab_bar_ui/caption_buttons.rs
+
+diff --git a/par-term-config/src/config/config_struct/tab_bar_colors_config.rs b/par-term-config/src/config/config_struct/tab_bar_colors_config.rs
+index e640d79..84c3c3f 100644
+--- a/par-term-config/src/config/config_struct/tab_bar_colors_config.rs
++++ b/par-term-config/src/config/config_struct/tab_bar_colors_config.rs
+@@ -93,6 +93,38 @@ pub struct TabBarColorsConfig {
+     /// Hovered inactive tabs brighten the outline instead of filling.
+     #[serde(default = "crate::defaults::bool_true")]
+     pub tab_inactive_outline_only: bool,
++
++    /// Tab bar background opacity (0.0-1.0)
++    ///
++    /// 1.0 keeps the bar opaque. Below 1.0 the bar blends over what the window
++    /// already rendered behind it (terminal cells, background image, custom
++    /// shader), so the bar stops reading as a separate surface floating above the
++    /// terminal. Mirrors `status_bar_bg_alpha`.
++    #[serde(default = "crate::defaults::tab_bar_bg_alpha")]
++    pub tab_bar_bg_alpha: f32,
++
++    /// Height of the active tab's bottom indicator bar in pixels (0 = no indicator)
++    ///
++    /// This is the accent that marks the active tab. The pill itself keeps the
++    /// normal `tab_border_color` hairline, so the accent colour is spent in
++    /// exactly one place.
++    #[serde(default = "crate::defaults::tab_indicator_height")]
++    pub tab_indicator_height: f32,
++
++    /// Vertical inset of a tab pill inside the tab bar strip, in pixels
++    ///
++    /// The pill is sized as `tab_bar_height - 2 * tab_pill_inset_y`, so this is the
++    /// air above and below it. Raising `tab_bar_height` on its own grows the pill
++    /// with the bar and leaves the clearance unchanged; raise this instead.
++    #[serde(default = "crate::defaults::tab_pill_inset_y")]
++    pub tab_pill_inset_y: f32,
++
++    /// Render tab titles in bold
++    ///
++    /// The strip sits behind the terminal, so heavier text keeps titles readable
++    /// over a translucent bar without needing a brighter colour.
++    #[serde(default = "crate::defaults::tab_text_bold")]
++    pub tab_text_bold: bool,
+ }
+ 
+ impl Default for TabBarColorsConfig {
+@@ -117,6 +149,10 @@ impl Default for TabBarColorsConfig {
+             tab_border_color: crate::defaults::tab_border_color(),
+             tab_border_width: crate::defaults::tab_border_width(),
+             tab_inactive_outline_only: crate::defaults::bool_true(),
++            tab_bar_bg_alpha: crate::defaults::tab_bar_bg_alpha(),
++            tab_indicator_height: crate::defaults::tab_indicator_height(),
++            tab_pill_inset_y: crate::defaults::tab_pill_inset_y(),
++            tab_text_bold: crate::defaults::tab_text_bold(),
+         }
+     }
+ }
+diff --git a/par-term-config/src/config/config_struct/window_config.rs b/par-term-config/src/config/config_struct/window_config.rs
+index 595d65d..fddb0a4 100644
+--- a/par-term-config/src/config/config_struct/window_config.rs
++++ b/par-term-config/src/config/config_struct/window_config.rs
+@@ -59,6 +59,25 @@ pub struct WindowConfig {
+     /// eliminating blank background gaps. Disabled automatically in split-pane mode.
+     #[serde(default = "crate::defaults::snap_window_to_grid")]
+     pub snap_window_to_grid: bool,
++
++    /// Ask Windows to round the window's corners (Windows 11 only).
++    ///
++    /// Decorated windows are rounded by the OS; a borderless window has to opt in
++    /// through DWM. Ignored harmlessly on other platforms and on Windows 10.
++    #[serde(default = "crate::defaults::window_rounded_corners")]
++    pub window_rounded_corners: bool,
++
++    /// Draw DWM's thin border around the window (Windows 11 only).
++    ///
++    /// Only useful with `window_decorations: false`, where the OS otherwise draws
++    /// no frame at all.
++    #[serde(default = "crate::defaults::window_border_enabled")]
++    pub window_border_enabled: bool,
++
++    /// DWM window border colour [R, G, B] (0-255), used when `window_border_enabled`
++    /// is true.
++    #[serde(default = "crate::defaults::window_border_color")]
++    pub window_border_color: [u8; 3],
+ }
+ 
+ impl Default for WindowConfig {
+@@ -72,6 +91,9 @@ impl Default for WindowConfig {
+             window_padding: crate::defaults::window_padding(),
+             hide_window_padding_on_split: crate::defaults::bool_true(),
+             snap_window_to_grid: crate::defaults::snap_window_to_grid(),
++            window_rounded_corners: crate::defaults::window_rounded_corners(),
++            window_border_enabled: crate::defaults::window_border_enabled(),
++            window_border_color: crate::defaults::window_border_color(),
+         }
+     }
+ }
+diff --git a/par-term-config/src/defaults/colors.rs b/par-term-config/src/defaults/colors.rs
+index 4424fd3..7e61fb0 100644
+--- a/par-term-config/src/defaults/colors.rs
++++ b/par-term-config/src/defaults/colors.rs
+@@ -30,6 +30,41 @@ pub fn tab_bar_background() -> [u8; 3] {
+     [40, 40, 40] // Dark gray background
+ }
+ 
++/// Default tab bar background opacity (0.0–1.0).
++///
++/// 1.0 keeps the bar fully opaque. Below 1.0 the bar blends over whatever the
++/// window already rendered there (terminal cells, background image, or a custom
++/// shader), which is how the bar stops reading as a separate surface — the same
++/// approach the status bar takes with `status_bar_bg_alpha`.
++pub fn tab_bar_bg_alpha() -> f32 {
++    1.0
++}
++
++/// Default vertical inset of a tab pill inside the tab bar strip, in pixels.
++///
++/// This is the air above and below the pill. `tab_bar_height` alone cannot change
++/// it: the pill is derived as `tab_bar_height - 2 * inset`, so raising the bar
++/// grows the pill with it and the clearance stays the same. Raise this instead.
++pub fn tab_pill_inset_y() -> f32 {
++    3.0
++}
++
++/// Default flag rendering tab titles in bold.
++///
++/// The tab strip sits behind the terminal, so heavier text keeps the titles
++/// readable over a translucent bar without needing a brighter colour.
++pub fn tab_text_bold() -> bool {
++    false
++}
++
++/// Default height of the active tab's bottom indicator bar, in pixels.
++///
++/// 0.0 disables the indicator entirely; the active tab is then marked only by
++/// its background fill and border.
++pub fn tab_indicator_height() -> f32 {
++    2.0
++}
++
+ /// Default active tab background color as RGB bytes.
+ pub fn tab_active_background() -> [u8; 3] {
+     [60, 60, 60] // Slightly lighter for active tab
+diff --git a/par-term-config/src/defaults/mod.rs b/par-term-config/src/defaults/mod.rs
+index 4745553..ab40631 100644
+--- a/par-term-config/src/defaults/mod.rs
++++ b/par-term-config/src/defaults/mod.rs
+@@ -24,7 +24,8 @@ pub use window::{
+     inactive_tab_fps, inactive_tab_opacity, light_theme, max_fps, pane_background_darken, rows,
+     screenshot_format, snap_window_to_grid, tab_bar_height, tab_bar_width, tab_border_width,
+     tab_html_titles, tab_min_width, tab_stretch_to_fill, text_opacity, theme, unfocused_fps,
+-    use_background_as_channel0, window_opacity, window_padding, window_title,
++    use_background_as_channel0, window_border_color, window_border_enabled, window_opacity,
++    window_padding, window_rounded_corners, window_title,
+ };
+ 
+ // ── Terminal behaviour ─────────────────────────────────────────────────────
+@@ -56,9 +57,10 @@ pub use colors::{
+     progress_bar_indeterminate_color, progress_bar_normal_color, progress_bar_warning_color,
+     scrollbar_thumb_color, scrollbar_track_color, search_current_highlight_color,
+     search_highlight_color, tab_active_background, tab_active_indicator, tab_active_text,
+-    tab_activity_indicator, tab_bar_background, tab_bell_indicator, tab_border_color,
+-    tab_close_button, tab_close_button_hover, tab_hover_background, tab_inactive_background,
+-    tab_inactive_text, visual_bell_color,
++    tab_activity_indicator, tab_bar_background, tab_bar_bg_alpha, tab_bell_indicator,
++    tab_border_color, tab_close_button, tab_close_button_hover, tab_hover_background,
++    tab_inactive_background, tab_indicator_height, tab_inactive_text, tab_pill_inset_y,
++    tab_text_bold, visual_bell_color,
+ };
+ 
+ // ── Miscellaneous ──────────────────────────────────────────────────────────
+diff --git a/par-term-config/src/defaults/window.rs b/par-term-config/src/defaults/window.rs
+index 02ac34a..d3dcba5 100644
+--- a/par-term-config/src/defaults/window.rs
++++ b/par-term-config/src/defaults/window.rs
+@@ -129,3 +129,27 @@ pub fn snap_window_to_grid() -> bool {
+ pub fn use_background_as_channel0() -> bool {
+     false // By default, use configured channel0 texture, not background image
+ }
++
++/// Default flag asking Windows to round the window's corners.
++///
++/// Windows 11 rounds decorated windows by itself; a borderless window has to ask
++/// via DWM (`DWMWA_WINDOW_CORNER_PREFERENCE`). A no-op on other platforms and on
++/// Windows 10, where the request simply fails and the window stays square.
++pub fn window_rounded_corners() -> bool {
++    true
++}
++
++/// Default flag drawing a thin DWM border around the window.
++///
++/// With `window_decorations: false` Windows draws no frame at all, which leaves
++/// the window as a raw rectangle. Enabling this asks DWM for its 1px border so
++/// the window reads as a finished surface. Off by default because it only has an
++/// effect on Windows 11.
++pub fn window_border_enabled() -> bool {
++    false
++}
++
++/// Default DWM window border colour as RGB bytes.
++pub fn window_border_color() -> [u8; 3] {
++    [80, 80, 80]
++}
+diff --git a/par-term-config/src/shell_detection.rs b/par-term-config/src/shell_detection.rs
+index 82811f2..246e7ea 100644
+--- a/par-term-config/src/shell_detection.rs
++++ b/par-term-config/src/shell_detection.rs
+@@ -144,16 +144,14 @@ fn detect_shells() -> Vec<ShellInfo> {
+     let mut shells = Vec::new();
+ 
+     // PowerShell 7+ (pwsh)
+-    if let Ok(output) = std::process::Command::new("where").arg("pwsh.exe").output() {
+-        if output.status.success() {
+-            if let Ok(path) = String::from_utf8(output.stdout) {
++    if let Ok(output) = std::process::Command::new("where").arg("pwsh.exe").output()
++        && output.status.success()
++            && let Ok(path) = String::from_utf8(output.stdout) {
+                 let path = path.lines().next().unwrap_or("").trim();
+                 if !path.is_empty() && Path::new(path).exists() {
+                     shells.push(ShellInfo::new("PowerShell 7", path));
+                 }
+             }
+-        }
+-    }
+ 
+     // Windows PowerShell (5.1)
+     let ps_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+diff --git a/par-term-config/src/themes.rs b/par-term-config/src/themes.rs
+index 5ac8784..907013d 100644
+--- a/par-term-config/src/themes.rs
++++ b/par-term-config/src/themes.rs
+@@ -548,6 +548,45 @@ impl Theme {
+         }
+     }
+ 
++    /// Kanagawa Wave (matches the Windows Terminal "Kanagawa Wave" scheme:
++    /// rebelot/kanagawa.nvim wave variant).
++    ///
++    /// `background` MUST equal `black` (#090618). par-term decides whether a cell
++    /// keeps the default background by exact RGB equality against the theme's
++    /// `background`, and skips those quads so the custom background shader shows
++    /// through. Console apps paint their default-attribute background with the
++    /// ANSI black entry, so any theme where `background != black` (nord, dracula,
++    /// solarized, ...) emits an opaque black quad over every cell and hides the
++    /// galaxy. The stock `dark-background` theme is unaffected only because it
++    /// happens to define `background == black == #000000`. All 16 ANSI colors
++    /// below are the untouched Windows Terminal values.
++    pub fn kanagawa_wave() -> Self {
++        Self {
++            name: "Kanagawa Wave".to_string(),
++            foreground: Color::new(220, 215, 186),
++            background: Color::new(9, 6, 24),
++            cursor: Color::new(220, 215, 186),
++            selection_bg: Color::new(45, 79, 103),
++            selection_fg: Color::new(220, 215, 186),
++            black: Color::new(9, 6, 24),
++            red: Color::new(195, 64, 67),
++            green: Color::new(118, 148, 106),
++            yellow: Color::new(192, 163, 110),
++            blue: Color::new(126, 156, 216),
++            magenta: Color::new(149, 127, 184),
++            cyan: Color::new(106, 149, 137),
++            white: Color::new(200, 192, 147),
++            bright_black: Color::new(114, 113, 105),
++            bright_red: Color::new(232, 36, 36),
++            bright_green: Color::new(152, 187, 108),
++            bright_yellow: Color::new(230, 195, 132),
++            bright_blue: Color::new(127, 180, 202),
++            bright_magenta: Color::new(147, 138, 169),
++            bright_cyan: Color::new(122, 168, 159),
++            bright_white: Color::new(220, 215, 186),
++        }
++    }
++
+     /// Get theme by name
+     pub fn by_name(name: &str) -> Option<Self> {
+         let normalized = name.trim().to_lowercase().replace(['_', ' '], "-");
+@@ -562,6 +601,7 @@ impl Theme {
+             "one-dark" | "onedark" => Some(Self::one_dark()),
+             "default-dark" | "default" => Some(Self::default_dark()),
+             "dark-background" => Some(Self::dark_background()),
++            "kanagawa-wave" | "kanagawa" => Some(Self::kanagawa_wave()),
+             "high-contrast" => Some(Self::high_contrast()),
+             "light-background" => Some(Self::light_background()),
+             "pastel-dark" => Some(Self::pastel_dark()),
+@@ -581,6 +621,7 @@ impl Theme {
+             "Default Dark",
+             "Dracula",
+             "High Contrast",
++            "Kanagawa Wave",
+             "iTerm2 Dark",
+             "Light Background",
+             "Monokai",
+diff --git a/src/app/window_manager/mod.rs b/src/app/window_manager/mod.rs
+index 005f6f4..3792c0a 100644
+--- a/src/app/window_manager/mod.rs
++++ b/src/app/window_manager/mod.rs
+@@ -25,8 +25,11 @@ mod coprocess;
+ mod menu_actions;
+ mod scripting;
+ mod settings_actions;
++pub(crate) mod titlebar_drag;
+ mod update_checker;
+ mod window_close;
++pub(crate) mod window_controls;
++mod window_effects;
+ mod window_lifecycle;
+ mod window_session;
+ 
+diff --git a/src/app/window_manager/titlebar_drag.rs b/src/app/window_manager/titlebar_drag.rs
+new file mode 100644
+index 0000000..98a487f
+--- /dev/null
++++ b/src/app/window_manager/titlebar_drag.rs
+@@ -0,0 +1,262 @@
++//! Drag-from-the-tab-bar support for borderless windows.
++//!
++//! `window_decorations: false` removes the native title bar, and with it the
++//! only place the user could grab to move the window. WezTerm solves this inside
++//! its own window procedure (handling `WM_NCCALCSIZE` and `WM_NCHITTEST` so the
++//! empty area of its tab bar behaves like a native title bar — see wezterm
++//! PR #1675 / #1677, and its `window_decorations = "RESIZE"` mode).
++//!
++//! par-term has no equivalent, so this module implements the same idea from
++//! inside the process: it subclasses the window and answers `WM_NCHITTEST` with
++//! `HTCAPTION` when the cursor is over the empty part of the tab bar. Windows
++//! then runs its own modal move loop, so dragging behaves exactly like a native
++//! title bar, and the resize borders keep working because `WS_THICKFRAME` is
++//! still set by winit when the window is resizable.
++//!
++//! The tab bar renderer publishes the current strip geometry every frame through
++//! [`publish_region`]. Rendering and window messages both run on the event-loop
++//! thread, so a thread-local is enough and the message path never takes a lock.
++//!
++//! The FFI is declared by hand rather than pulling in the `windows` crate, so
++//! this patch adds no new dependency.
++
++use std::cell::Cell;
++
++/// Geometry of the draggable strip, in egui logical points.
++///
++/// `rect` is `(left, top, right, bottom)` of the tab bar row; `free_from_x` is
++/// the x where the tabs and the `+` / chevron buttons end, so anything to the
++/// right of it inside the row is empty space that can act as a title bar.
++#[derive(Clone, Copy, Default)]
++struct Region {
++    rect: (f32, f32, f32, f32),
++    free_from_x: f32,
++    scale: f32,
++    valid: bool,
++}
++
++thread_local! {
++    static REGION: Cell<Region> = const { Cell::new(Region {
++        rect: (0.0, 0.0, 0.0, 0.0),
++        free_from_x: 0.0,
++        scale: 1.0,
++        valid: false,
++    }) };
++}
++
++/// Publish the tab bar's draggable strip for this frame.
++///
++/// Called by the tab bar renderer every frame. `scale` is egui's
++/// `pixels_per_point`, used to convert the physical pixel coordinates that
++/// Windows reports in `WM_NCHITTEST` into the logical points egui lays out in.
++pub fn publish_region(rect: (f32, f32, f32, f32), free_from_x: f32, scale: f32) {
++    REGION.with(|cell| {
++        cell.set(Region {
++            rect,
++            free_from_x,
++            scale,
++            valid: true,
++        })
++    });
++}
++
++/// Forget the strip, e.g. when the tab bar is hidden so the whole bar would
++/// otherwise stay draggable.
++pub fn clear_region() {
++    REGION.with(|cell| {
++        cell.set(Region {
++            rect: (0.0, 0.0, 0.0, 0.0),
++            free_from_x: 0.0,
++            scale: 1.0,
++            valid: false,
++        })
++    });
++}
++
++/// True when a window-local physical point falls in the empty part of the strip.
++#[cfg(target_os = "windows")]
++fn hits_free_tab_strip(local_x: f64, local_y: f64) -> bool {
++    REGION.with(|cell| {
++        let r = cell.get();
++        if !r.valid || r.scale <= 0.0 {
++            return false;
++        }
++        let x = (local_x / r.scale as f64) as f32;
++        let y = (local_y / r.scale as f64) as f32;
++        let (left, top, right, bottom) = r.rect;
++        y >= top && y < bottom && x >= left && x < right && x >= r.free_from_x
++    })
++}
++
++#[cfg(target_os = "windows")]
++mod imp {
++    use super::hits_free_tab_strip;
++    use std::collections::HashMap;
++    use std::ffi::c_void;
++    use std::sync::{Mutex, OnceLock};
++    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
++
++    const GWLP_WNDPROC: i32 = -4;
++    const WM_NCHITTEST: u32 = 0x0084;
++    const WM_NCDESTROY: u32 = 0x0082;
++
++    // WM_NCHITTEST results we hand back ourselves.
++    const HTCAPTION: isize = 2;
++    const HTLEFT: isize = 10;
++    const HTRIGHT: isize = 11;
++    const HTTOP: isize = 12;
++    const HTTOPLEFT: isize = 13;
++    const HTTOPRIGHT: isize = 14;
++    const HTBOTTOM: isize = 15;
++    const HTBOTTOMLEFT: isize = 16;
++    const HTBOTTOMRIGHT: isize = 17;
++
++    /// Width of the invisible resize border, in physical pixels. A borderless
++    /// window has no non-client frame, so without this the window cannot be
++    /// resized by dragging its edge at all.
++    const BORDER: f64 = 6.0;
++
++    type LResult = isize;
++
++    /// Resize-border hit test. Corners win over edges.
++    fn border_hit(local_x: f64, local_y: f64, w: f64, h: f64) -> Option<isize> {
++        // Too small to carve borders out of; let it be all client area.
++        if w < 3.0 * BORDER || h < 3.0 * BORDER {
++            return None;
++        }
++        let left = local_x < BORDER;
++        let right = local_x >= w - BORDER;
++        let top = local_y < BORDER;
++        let bottom = local_y >= h - BORDER;
++        let ht = match (top, bottom, left, right) {
++            (true, _, true, _) => HTTOPLEFT,
++            (true, _, _, true) => HTTOPRIGHT,
++            (_, true, true, _) => HTBOTTOMLEFT,
++            (_, true, _, true) => HTBOTTOMRIGHT,
++            (true, _, _, _) => HTTOP,
++            (_, true, _, _) => HTBOTTOM,
++            (_, _, true, _) => HTLEFT,
++            (_, _, _, true) => HTRIGHT,
++            _ => return None,
++        };
++        Some(ht)
++    }
++
++    #[repr(C)]
++    struct Rect {
++        left: i32,
++        top: i32,
++        right: i32,
++        bottom: i32,
++    }
++
++    #[link(name = "user32")]
++    unsafe extern "system" {
++        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
++        fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, wp: usize, lp: isize) -> LResult;
++        fn GetWindowRect(hwnd: isize, out: *mut Rect) -> i32;
++        fn IsZoomed(hwnd: isize) -> i32;
++    }
++
++    /// Previous window procedures, keyed by HWND, so subclassing composes with
++    /// winit's own procedure instead of replacing it.
++    fn previous() -> &'static Mutex<HashMap<isize, isize>> {
++        static PREV: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
++        PREV.get_or_init(|| Mutex::new(HashMap::new()))
++    }
++
++    unsafe extern "system" fn subclass_proc(
++        hwnd: isize,
++        msg: u32,
++        wp: usize,
++        lp: isize,
++    ) -> LResult {
++        if msg == WM_NCHITTEST {
++            // lParam carries screen coordinates as two i16 halves.
++            let screen_x = (lp & 0xFFFF) as i16 as f64;
++            let screen_y = ((lp >> 16) & 0xFFFF) as i16 as f64;
++            let mut r = Rect {
++                left: 0,
++                top: 0,
++                right: 0,
++                bottom: 0,
++            };
++            // SAFETY: hwnd is the window we are subclassing and r is a live local.
++            if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
++                // A borderless window's window rect equals its client rect, so
++                // subtracting the origin is enough to get window-local pixels.
++                let local_x = screen_x - r.left as f64;
++                let local_y = screen_y - r.top as f64;
++                let w = (r.right - r.left) as f64;
++                let h = (r.bottom - r.top) as f64;
++
++                // A maximized window has no draggable border; offering one would
++                // let the user "resize" an edge that is pinned to the screen.
++                // SAFETY: hwnd is valid for the duration of this message.
++                let maximized = unsafe { IsZoomed(hwnd) } != 0;
++                if !maximized
++                    && let Some(ht) = border_hit(local_x, local_y, w, h)
++                {
++                    return ht;
++                }
++                if hits_free_tab_strip(local_x, local_y) {
++                    return HTCAPTION;
++                }
++            }
++        }
++
++        let prev = previous()
++            .lock()
++            .ok()
++            .and_then(|m| m.get(&hwnd).copied())
++            .unwrap_or(0);
++        if prev == 0 {
++            return 0;
++        }
++        if msg == WM_NCDESTROY
++            && let Ok(mut m) = previous().lock() {
++                m.remove(&hwnd);
++            }
++        // SAFETY: prev is the procedure this window had before we subclassed it.
++        unsafe { CallWindowProcW(prev, hwnd, msg, wp, lp) }
++    }
++
++    /// Subclass `window` so the empty tab bar strip drags the window.
++    ///
++    /// Safe to call once per window. A no-op if the handle is unavailable.
++    pub fn install(window: &winit::window::Window) {
++        let Ok(handle) = window.window_handle() else {
++            log::warn!("titlebar drag: no window handle; tab bar drag disabled");
++            return;
++        };
++        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
++            return;
++        };
++        let hwnd = win32.hwnd.get();
++
++        // SAFETY: hwnd comes from winit for this window and stays valid while the
++        // window lives; the procedure is a 'static fn with the expected ABI.
++        unsafe {
++            let prev = SetWindowLongPtrW(
++                hwnd,
++                GWLP_WNDPROC,
++                subclass_proc as *const c_void as isize,
++            );
++            if prev == 0 {
++                log::warn!("titlebar drag: SetWindowLongPtrW failed for hwnd {hwnd}");
++                return;
++            }
++            if let Ok(mut m) = previous().lock() {
++                m.insert(hwnd, prev);
++            }
++        }
++        log::info!("titlebar drag installed for hwnd {hwnd}");
++    }
++}
++
++#[cfg(target_os = "windows")]
++pub use imp::install;
++
++/// Non-Windows builds have no borderless drag problem to solve here.
++#[cfg(not(target_os = "windows"))]
++pub fn install(_window: &winit::window::Window) {}
+diff --git a/src/app/window_manager/window_controls.rs b/src/app/window_manager/window_controls.rs
+new file mode 100644
+index 0000000..56d7a46
+--- /dev/null
++++ b/src/app/window_manager/window_controls.rs
+@@ -0,0 +1,50 @@
++//! Window control actions that need platform support.
++//!
++//! Minimize and maximize map straight onto winit, so they need nothing here.
++//! Closing does: the tab bar's close control has to reach the same code path as the
++//! OS close button, because that path is where the `prompt_on_quit` confirmation
++//! lives (`WindowEvent::CloseRequested`). On Windows that means posting the native
++//! `WM_CLOSE` rather than shutting down directly, so the custom control cannot
++//! quietly skip a prompt the native frame would have shown.
++
++/// Ask the platform to close `window` the way its own close button would.
++///
++/// Returns `true` when the platform accepted the request. A `false` return means
++/// the caller should fall back to shutting the window down itself.
++#[cfg(not(target_os = "windows"))]
++pub fn request_close(_window: &winit::window::Window) -> bool {
++    false
++}
++
++#[cfg(target_os = "windows")]
++pub use imp::request_close;
++
++#[cfg(target_os = "windows")]
++mod imp {
++    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
++
++    const WM_CLOSE: u32 = 0x0010;
++
++    #[link(name = "user32")]
++    unsafe extern "system" {
++        fn PostMessageW(hwnd: isize, msg: u32, wp: usize, lp: isize) -> i32;
++    }
++
++    pub fn request_close(window: &winit::window::Window) -> bool {
++        let Ok(handle) = window.window_handle() else {
++            log::warn!("window controls: no window handle; close falls back to shutdown");
++            return false;
++        };
++        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
++            return false;
++        };
++        let hwnd = win32.hwnd.get();
++        // SAFETY: hwnd comes from winit for this window and stays valid for as long
++        // as the window lives; WM_CLOSE carries no payload, so both params are 0.
++        let posted = unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } != 0;
++        if !posted {
++            log::warn!("window controls: PostMessageW(WM_CLOSE) failed for hwnd {hwnd}");
++        }
++        posted
++    }
++}
+diff --git a/src/app/window_manager/window_effects.rs b/src/app/window_manager/window_effects.rs
+new file mode 100644
+index 0000000..e376c4d
+--- /dev/null
++++ b/src/app/window_manager/window_effects.rs
+@@ -0,0 +1,137 @@
++//! Native window effects delegated to the compositor (Windows).
++//!
++//! A borderless window (`window_decorations: false`) gives up everything the
++//! native frame used to provide: rounded corners, the thin accent border, and the
++//! system shadow. par-term does not hand-draw any of that. Instead it asks the
++//! desktop compositor, which keeps the result consistent with every other window
++//! on the system and costs no rendering code of our own.
++//!
++//! Everything here is best-effort: DWM attributes only exist on Windows 11, and an
++//! unsupported attribute makes `DwmSetWindowAttribute` return a failure HRESULT
++//! rather than doing anything. We log at debug level and carry on, so the window
++//! simply keeps its square, borderless appearance. No attribute affects window
++//! behaviour, size, or input, so a failure cannot break the window.
++//!
++//! The FFI is declared by hand, matching `titlebar_drag`, so this adds no
++//! dependency.
++
++/// Window effects resolved from config, so this module stays free of config types.
++#[derive(Debug, Clone, Copy)]
++pub struct WindowEffects {
++    /// Ask DWM to round the window corners.
++    pub rounded_corners: bool,
++    /// Draw DWM's 1px border, and the colour to draw it in.
++    pub border_color: Option<[u8; 3]>,
++}
++
++/// Applies [`WindowEffects`] to `window`. A no-op on non-Windows platforms.
++#[cfg(not(target_os = "windows"))]
++pub fn install(_window: &winit::window::Window, _effects: WindowEffects) {}
++
++#[cfg(target_os = "windows")]
++pub use imp::install;
++
++#[cfg(target_os = "windows")]
++mod imp {
++    use super::WindowEffects;
++    use std::ffi::c_void;
++    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
++
++    /// `DWMWA_USE_IMMERSIVE_DARK_MODE` — dark title bar / border, for the case
++    /// where decorations are on.
++    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
++    /// `DWMWA_WINDOW_CORNER_PREFERENCE`.
++    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
++    /// `DWMWA_BORDER_COLOR`.
++    const DWMWA_BORDER_COLOR: u32 = 34;
++
++    /// `DWMWCP_ROUND` — the standard Windows 11 corner radius.
++    const DWMWCP_ROUND: i32 = 2;
++
++    /// `DWMWA_COLOR_NONE` is `0xFFFFFFFE`; DWM draws no border at all.
++    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
++
++    /// A DWM colour is a `COLORREF`-style `0x00BBGGRR`.
++    fn colorref(rgb: [u8; 3]) -> u32 {
++        (rgb[0] as u32) | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16)
++    }
++
++    #[link(name = "dwmapi")]
++    unsafe extern "system" {
++        fn DwmSetWindowAttribute(
++            hwnd: isize,
++            attribute: u32,
++            value: *const c_void,
++            value_size: u32,
++        ) -> i32;
++    }
++
++    /// Set one DWM attribute, logging (not failing) when the OS rejects it.
++    ///
++    /// # Safety
++    /// `value` must point to `size` readable bytes.
++    unsafe fn set_attribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32, name: &str) {
++        // SAFETY: forwarded directly to DWM; the caller guarantees `value`/`size`.
++        let hr = unsafe { DwmSetWindowAttribute(hwnd, attribute, value, size) };
++        if hr != 0 {
++            // Windows 10 and earlier have no such attribute; this is expected.
++            log::debug!("window effects: {name} unavailable (hr=0x{hr:08X})");
++        } else {
++            log::debug!("window effects: {name} applied");
++        }
++    }
++
++    pub fn install(window: &winit::window::Window, effects: WindowEffects) {
++        let Ok(handle) = window.window_handle() else {
++            log::warn!("window effects: no window handle; native effects skipped");
++            return;
++        };
++        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
++            return;
++        };
++        let hwnd = win32.hwnd.get();
++
++        // Immersive dark mode only matters while the native frame is visible.
++        let dark: i32 = 1;
++        // SAFETY: `dark` is a live local matching the size we pass, and DWMWA takes
++        // a BOOL for this attribute.
++        unsafe {
++            set_attribute(
++                hwnd,
++                DWMWA_USE_IMMERSIVE_DARK_MODE,
++                std::ptr::from_ref(&dark).cast(),
++                std::mem::size_of_val(&dark) as u32,
++                "dark mode",
++            );
++        }
++
++        if effects.rounded_corners {
++            let preference = DWMWCP_ROUND;
++            // SAFETY: `preference` is a live local and the attribute takes an int.
++            unsafe {
++                set_attribute(
++                    hwnd,
++                    DWMWA_WINDOW_CORNER_PREFERENCE,
++                    std::ptr::from_ref(&preference).cast(),
++                    std::mem::size_of_val(&preference) as u32,
++                    "rounded corners",
++                );
++            }
++        }
++
++        // A `COLORREF`-free sentinel means "leave the border as the OS decides".
++        let border = effects
++            .border_color
++            .map_or(DWMWA_COLOR_NONE, colorref);
++        // SAFETY: `border` is a live local and the attribute takes a COLORREF.
++        unsafe {
++            set_attribute(
++                hwnd,
++                DWMWA_BORDER_COLOR,
++                std::ptr::from_ref(&border).cast(),
++                std::mem::size_of_val(&border) as u32,
++                "window border",
++            );
++        }
++    }
++}
+diff --git a/src/app/window_manager/window_lifecycle.rs b/src/app/window_manager/window_lifecycle.rs
+index 193fe0f..ec16974 100644
+--- a/src/app/window_manager/window_lifecycle.rs
++++ b/src/app/window_manager/window_lifecycle.rs
+@@ -120,6 +120,33 @@ impl WindowManager {
+             Ok(window) => {
+                 let window_id = window.id();
+ 
++                // A borderless window has no title bar to grab, so let the empty
++                // part of the tab bar drag it (see titlebar_drag).
++                #[cfg(target_os = "windows")]
++                if !self.config.load().window.window_decorations {
++                    crate::app::window_manager::titlebar_drag::install(&window);
++                }
++
++                // Borderless also means no frame, so ask the compositor for the
++                // corners and the 1px border instead of drawing them ourselves.
++                // Best-effort: a no-op off Windows and on Windows 10.
++                {
++                    // Bind the Arc first: `&self.config.load().window` would borrow a
++                    // temporary that is dropped at the end of the statement.
++                    let config = self.config.load();
++                    let window_cfg = &config.window;
++                    let border_color = window_cfg
++                        .window_border_enabled
++                        .then_some(window_cfg.window_border_color);
++                    crate::app::window_manager::window_effects::install(
++                        &window,
++                        crate::app::window_manager::window_effects::WindowEffects {
++                            rounded_corners: window_cfg.window_rounded_corners,
++                            border_color,
++                        },
++                    );
++                }
++
+                 // Initialize menu BEFORE the blocking GPU init so that macOS
+                 // menu accelerators (Cmd+, for Settings, Cmd+Q for Quit) are
+                 // registered immediately. Without this, there is a multi-second
+diff --git a/src/app/window_state/action_handlers/tab_bar.rs b/src/app/window_state/action_handlers/tab_bar.rs
+index eadbce9..3fc5b6d 100644
+--- a/src/app/window_state/action_handlers/tab_bar.rs
++++ b/src/app/window_state/action_handlers/tab_bar.rs
+@@ -143,6 +143,28 @@ impl WindowState {
+                 }
+                 self.request_redraw();
+             }
++            TabBarAction::MinimizeWindow => {
++                if let Some(window) = &self.window {
++                    window.set_minimized(true);
++                }
++            }
++            TabBarAction::ToggleMaximizeWindow => {
++                if let Some(window) = &self.window {
++                    window.set_maximized(!window.is_maximized());
++                }
++                self.request_redraw();
++            }
++            TabBarAction::CloseWindow => {
++                // Route through the platform's own close so the OS path runs, which is
++                // where the `prompt_on_quit` confirmation lives. Only fall back to a
++                // direct shutdown when the platform could not deliver the request.
++                let posted = self.window.as_ref().is_some_and(|window| {
++                    crate::app::window_manager::window_controls::request_close(window)
++                });
++                if !posted {
++                    self.perform_shutdown();
++                }
++            }
+             TabBarAction::None => {}
+             TabBarAction::MoveTabToNewWindow(tab_id) => {
+                 self.overlay_ui.pending_move_tab_request =
+diff --git a/src/menu/mod.rs b/src/menu/mod.rs
+index a456b14..e59b660 100644
+--- a/src/menu/mod.rs
++++ b/src/menu/mod.rs
+@@ -161,7 +161,7 @@ impl MenuManager {
+                 }
+                 log::info!("Initialized Windows menu bar for window");
+             }
+-            return Ok(());
++            Ok(())
+         }
+ 
+         #[cfg(any(
+diff --git a/src/tab_bar_ui/caption_buttons.rs b/src/tab_bar_ui/caption_buttons.rs
+new file mode 100644
+index 0000000..775ec55
+--- /dev/null
++++ b/src/tab_bar_ui/caption_buttons.rs
+@@ -0,0 +1,126 @@
++//! macOS-style window controls drawn at the right end of the tab strip.
++//!
++//! With `window_decorations: false` the OS draws no frame, so nothing offers
++//! minimize / maximize / close. Rather than hand-rolling a whole title bar, this
++//! only draws the three controls and reuses the strip the tab bar already has.
++//!
++//! Two details make that work:
++//!
++//! * The group sits in strip width the tab layout never receives, so tabs cannot
++//!   render underneath it and it needs no clipping.
++//! * That same reservation keeps the group outside the drag region published to
++//!   [`crate::app::window_manager::titlebar_drag`] (the region's right edge is the
++//!   tab area's right edge). Without it, `WM_NCHITTEST` would answer `HTCAPTION`
++//!   over the buttons and every click would start a window move.
++//!
++//! The colours come from the active theme rather than being hard-coded, so the
++//! controls read as part of the terminal instead of a separate widget set.
++
++use super::TabBarAction;
++use crate::ui_constants::{
++    CAPTION_BUTTON_DIAMETER, CAPTION_BUTTON_GAP, CAPTION_BUTTON_GLYPH_SIZE, CAPTION_BUTTON_MARGIN,
++};
++
++/// Colours for the three controls, resolved from the active theme.
++pub(super) struct CaptionColors {
++    pub close: [u8; 3],
++    pub minimize: [u8; 3],
++    pub maximize: [u8; 3],
++}
++
++/// Strip width that has to stay free for the controls, including their leading gap.
++///
++/// The tab layout subtracts this from its budget so tabs stop before the group.
++pub(super) fn reserved_width() -> f32 {
++    CAPTION_BUTTON_DIAMETER * 3.0
++        + CAPTION_BUTTON_GAP * 2.0
++        + CAPTION_BUTTON_MARGIN
++        + crate::ui_constants::CAPTION_BUTTON_LEADING_GAP
++}
++
++/// Lighter shade used while a control is hovered, matching how the tab controls
++/// brighten under the pointer.
++fn hover_tint(rgb: [u8; 3]) -> egui::Color32 {
++    let lift = |v: u8| v.saturating_add(45);
++    egui::Color32::from_rgb(lift(rgb[0]), lift(rgb[1]), lift(rgb[2]))
++}
++
++/// Draw the controls at the right end of `strip_rect` and report a click.
++///
++/// Returns [`TabBarAction::None`] when nothing was clicked.
++pub(super) fn show(
++    ui: &mut egui::Ui,
++    strip_rect: egui::Rect,
++    colors: &CaptionColors,
++) -> TabBarAction {
++    let diameter = CAPTION_BUTTON_DIAMETER;
++    let radius = diameter / 2.0;
++    let center_y = strip_rect.center().y;
++
++    // Right to left: close sits outermost, then maximize, then minimize — the
++    // order Windows users expect from the right edge, and the mirror of macOS
++    // putting close nearest the corner.
++    let controls = [
++        (TabBarAction::CloseWindow, colors.close, "×"),
++        (TabBarAction::ToggleMaximizeWindow, colors.maximize, "+"),
++        (TabBarAction::MinimizeWindow, colors.minimize, "-"),
++    ];
++
++    let right_edge = strip_rect.right() - CAPTION_BUTTON_MARGIN;
++    let mut centers = Vec::with_capacity(controls.len());
++    for index in 0..controls.len() {
++        centers.push(egui::pos2(
++            right_edge - radius - index as f32 * (diameter + CAPTION_BUTTON_GAP),
++            center_y,
++        ));
++    }
++
++    // macOS keeps the glyphs hidden until the pointer is over the group, which is
++    // what makes the controls read as quiet dots rather than three labelled buttons.
++    let group_rect = egui::Rect::from_min_max(
++        egui::pos2(centers[controls.len() - 1].x - radius, center_y - radius),
++        egui::pos2(centers[0].x + radius, center_y + radius),
++    );
++    let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
++    let group_hovered = pointer.is_some_and(|p| group_rect.contains(p));
++    let hovered_index = pointer.and_then(|p| {
++        centers.iter().position(|center| {
++            egui::Rect::from_center_size(*center, egui::vec2(diameter, diameter)).contains(p)
++        })
++    });
++
++    let mut action = TabBarAction::None;
++    for (index, (click_action, rgb, glyph)) in controls.iter().enumerate() {
++        let center = centers[index];
++        let rect = egui::Rect::from_center_size(center, egui::vec2(diameter, diameter));
++        let response = ui.interact(
++            rect,
++            egui::Id::new(("caption_button", index)),
++            egui::Sense::click(),
++        );
++        if response.clicked_by(egui::PointerButton::Primary) {
++            action = click_action.clone();
++        }
++
++        let fill = if hovered_index == Some(index) {
++            hover_tint(*rgb)
++        } else {
++            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
++        };
++        ui.painter().circle_filled(center, radius, fill);
++
++        if group_hovered {
++            ui.painter().text(
++                center,
++                egui::Align2::CENTER_CENTER,
++                *glyph,
++                egui::FontId::proportional(CAPTION_BUTTON_GLYPH_SIZE),
++                // Dark ink reads on every theme accent; the controls are the only
++                // place in the strip where the fill is the bright colour.
++                egui::Color32::from_rgb(24, 24, 28),
++            );
++        }
++    }
++
++    action
++}
+diff --git a/src/tab_bar_ui/horizontal.rs b/src/tab_bar_ui/horizontal.rs
+index dcd697e..24a1fa0 100644
+--- a/src/tab_bar_ui/horizontal.rs
++++ b/src/tab_bar_ui/horizontal.rs
+@@ -5,7 +5,7 @@
+ use crate::config::{Config, TabBarPosition};
+ use crate::tab::TabManager;
+ use crate::ui_constants::{
+-    TAB_DRAW_SHRINK_Y, TAB_LEFT_PADDING, TAB_NEW_BTN_BASE_WIDTH, TAB_SCROLL_BTN_WIDTH, TAB_SPACING,
++    TAB_LEFT_PADDING, TAB_NEW_BTN_BASE_WIDTH, TAB_SCROLL_BTN_WIDTH, TAB_SPACING,
+ };
+ 
+ use super::CHEVRON_RESERVED;
+@@ -29,13 +29,19 @@ impl TabBarUI {
+         // Clear per-frame tab rect cache
+         self.tab_rects.clear();
+ 
++        // Read the scale factor here: `ctx` is borrowed for the whole panel
++        // closure below, so it cannot be read from inside it.
++        let ppp = ctx.ctx().pixels_per_point();
++
+         let mut action = TabBarAction::None;
+         let active_tab_id = tabs.active_tab_id();
+ 
+         // Layout constants
+         let tab_spacing = TAB_SPACING;
+         let left_padding = TAB_LEFT_PADDING;
+-        let btn_h = config.tabs.tab_bar_height - TAB_DRAW_SHRINK_Y * 2.0;
++        // The row fills the strip so `Align::Center` puts the pill in the middle of
++        // it; the pill's own `TAB_DRAW_SHRINK_Y` inset creates the air on both sides.
++        let btn_h = config.tabs.tab_bar_height;
+         // Show the chevron dropdown when there's menu content:
+         // profiles to pick from, or the AI assistant toggle.
+         let show_chevron = !profiles.is_empty() || config.ai_inspector.ai_inspector_enabled;
+@@ -52,8 +58,16 @@ impl TabBarUI {
+         };
+ 
+         let bar_bg = config.tab_colors.tab_bar_background;
+-        let frame =
+-            egui::Frame::NONE.fill(egui::Color32::from_rgb(bar_bg[0], bar_bg[1], bar_bg[2]));
++        // The OS draws its own window controls whenever the native frame is on, so a
++        // second set would duplicate them.
++        let show_caption_buttons = !config.window.window_decorations;
++        // Translucent bar: egui renders on top of the terminal with LoadOp::Load, so
++        // an alpha below 1.0 lets the cells / background image / custom shader show
++        // through instead of the bar reading as its own floating surface.
++        let bar_alpha = (config.tab_colors.tab_bar_bg_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
++        let frame = egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(
++            bar_bg[0], bar_bg[1], bar_bg[2], bar_alpha,
++        ));
+ 
+         let panel = if config.tabs.tab_bar_position == TabBarPosition::Bottom {
+             egui::Panel::bottom("tab_bar").exact_size(config.tabs.tab_bar_height)
+@@ -63,8 +77,16 @@ impl TabBarUI {
+ 
+         panel.frame(frame).show(ctx, |ui| {
+             // Reserve space on the right for overlay panels (e.g. AI inspector Area)
+-            // so tabs/buttons don't render underneath them.
+-            let total_bar_width = (ui.available_width() - right_reserved_width.max(0.0)).max(0.0);
++            // so tabs/buttons don't render underneath them, plus the window controls.
++            // Keeping the controls out of the tab budget is also what keeps them out of
++            // the drag region published to `titlebar_drag` further down.
++            let caption_width = if show_caption_buttons {
++                super::caption_buttons::reserved_width()
++            } else {
++                0.0
++            };
++            let total_bar_width =
++                (ui.available_width() - right_reserved_width.max(0.0) - caption_width).max(0.0);
+ 
+             // Calculate minimum total width needed for all tabs at min_width
+             let min_total_tabs_width = if tab_count > 0 {
+@@ -98,7 +120,11 @@ impl TabBarUI {
+             } else if config.tab_colors.tab_stretch_to_fill {
+                 let total_spacing = (tab_count - 1) as f32 * tab_spacing;
+                 let stretched = (tabs_area_width - total_spacing) / tab_count as f32;
+-                stretched.max(config.tab_colors.tab_min_width)
++                // A lone tab must not consume the entire title strip. Keep its
++                // height unchanged and leave room to drag the window.
++                stretched
++                    .max(config.tab_colors.tab_min_width)
++                    .min((tabs_area_width * 0.5).max(config.tab_colors.tab_min_width))
+             } else {
+                 config.tab_colors.tab_min_width
+             };
+@@ -119,6 +145,7 @@ impl TabBarUI {
+                 egui::vec2(total_bar_width, btn_h),
+                 egui::Layout::left_to_right(egui::Align::Center),
+                 |ui| {
++                    let row_rect = ui.max_rect();
+                     ui.spacing_mut().item_spacing = egui::vec2(tab_spacing, 0.0);
+                     ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
+                     // Small left padding so the first tab's border isn't clipped by the panel edge
+@@ -271,6 +298,8 @@ impl TabBarUI {
+                         egui::vec2(TAB_NEW_BTN_BASE_WIDTH, btn_h),
+                         egui::Sense::click(),
+                     );
++                    // Everything right of the buttons is empty bar = drag handle.
++                    let mut free_from_x = plus_rect.right();
+                     if plus_resp.clicked_by(egui::PointerButton::Primary) {
+                         action = TabBarAction::NewTab;
+                     }
+@@ -299,6 +328,7 @@ impl TabBarUI {
+                             egui::vec2(CHEVRON_RESERVED / 2.0, btn_h),
+                             egui::Sense::click(),
+                         );
++                        free_from_x = chev_rect.right();
+                         if chev_resp.clicked_by(egui::PointerButton::Primary) {
+                             self.show_new_tab_profile_menu = !self.show_new_tab_profile_menu;
+                         }
+@@ -319,11 +349,41 @@ impl TabBarUI {
+                         }
+                     }
+ 
++                    // Publish the empty part of the strip so a borderless window
++                    // can be dragged by it (see window_manager::titlebar_drag).
++                    crate::app::window_manager::titlebar_drag::publish_region(
++                        (
++                            row_rect.left(),
++                            row_rect.top(),
++                            row_rect.left() + total_bar_width,
++                            row_rect.bottom(),
++                        ),
++                        free_from_x,
++                        ppp,
++                    );
++
+                     // Restore original spacing
+                     ui.spacing_mut().item_spacing.x = prev_spacing;
+                 },
+             );
+ 
++            // macOS-style window controls, drawn in the panel rather than inside the
++            // tab row so they own their footprint outright.
++            if show_caption_buttons {
++                let theme = config.load_theme();
++                let colors = super::caption_buttons::CaptionColors {
++                    close: [theme.red.r, theme.red.g, theme.red.b],
++                    minimize: [theme.yellow.r, theme.yellow.g, theme.yellow.b],
++                    maximize: [theme.green.r, theme.green.g, theme.green.b],
++                };
++                // Read the rect before `show` borrows `ui` mutably for the interaction.
++                let strip_rect = ui.max_rect();
++                let caption_action = super::caption_buttons::show(ui, strip_rect, &colors);
++                if caption_action != TabBarAction::None {
++                    action = caption_action;
++                }
++            }
++
+             // Handle drag feedback and drop detection (outside horizontal layout
+             // so we can paint over the tab bar)
+             if self.drag_in_progress {
+diff --git a/src/tab_bar_ui/mod.rs b/src/tab_bar_ui/mod.rs
+index 650d884..532379f 100644
+--- a/src/tab_bar_ui/mod.rs
++++ b/src/tab_bar_ui/mod.rs
+@@ -14,6 +14,7 @@
+ //! - `title_utils`: HTML title parsing, emoji sanitization, and styled segment rendering.
+ 
+ mod context_menu;
++mod caption_buttons;
+ mod drag_drop;
+ mod horizontal;
+ mod profile_menu;
+@@ -69,6 +70,12 @@ pub enum TabBarAction {
+     PromotePaneToTab(TabId),
+     /// Start demote pick mode for this tab
+     DemoteTabToPane(TabId),
++    /// Minimize the window (tab bar window controls)
++    MinimizeWindow,
++    /// Toggle maximize / restore for the window (tab bar window controls)
++    ToggleMaximizeWindow,
++    /// Close the window (tab bar window controls)
++    CloseWindow,
+ }
+ 
+ impl TabBarUI {
+@@ -107,6 +114,9 @@ impl TabBarUI {
+             return TabBarAction::None;
+         }
+ 
++        // Only the horizontal strip acts as a drag handle; forget any stale region
++        // so a hidden or left-docked bar cannot be grabbed.
++        crate::app::window_manager::titlebar_drag::clear_region();
+         match config.tabs.tab_bar_position {
+             TabBarPosition::Left => self.render_vertical(ctx, tabs, config, profiles),
+             _ => self.render_horizontal(ctx, tabs, config, profiles, right_reserved_width),
+@@ -130,12 +140,18 @@ impl TabBarUI {
+         let active_tab_id = tabs.active_tab_id();
+ 
+         let bar_bg = config.tab_colors.tab_bar_background;
++        let bar_alpha = (config.tab_colors.tab_bar_bg_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+         let tab_spacing = TAB_SPACING;
+         let tab_height = config.tabs.tab_bar_height; // Reuse height config for per-tab row height
+ 
+         egui::Panel::left("tab_bar")
+             .exact_size(config.tabs.tab_bar_width)
+-            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(bar_bg[0], bar_bg[1], bar_bg[2])))
++            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(
++                bar_bg[0],
++                bar_bg[1],
++                bar_bg[2],
++                bar_alpha,
++            )))
+             .show(ctx, |ui| {
+                 egui::ScrollArea::vertical()
+                     .scroll_bar_visibility(
+diff --git a/src/tab_bar_ui/tab_painter.rs b/src/tab_bar_ui/tab_painter.rs
+index 31b46ac..b914997 100644
+--- a/src/tab_bar_ui/tab_painter.rs
++++ b/src/tab_bar_ui/tab_painter.rs
+@@ -7,7 +7,7 @@
+ 
+ use crate::ui_constants::{
+     TAB_CLOSE_BTN_MARGIN, TAB_CLOSE_BTN_SIZE_V, TAB_CONTENT_PAD_X, TAB_CONTENT_PAD_Y,
+-    TAB_CONTEXT_PADDING, TAB_DRAW_SHRINK_Y, TAB_HOTKEY_LABEL_WIDTH,
++    TAB_CONTEXT_PADDING, TAB_HOTKEY_LABEL_WIDTH, TAB_INDICATOR_INSET_X, TAB_INDICATOR_LIFT_Y,
+ };
+ use egui::emath::GuiRounding as _;
+ 
+@@ -50,19 +50,21 @@ impl TabBarUI {
+         // Whether this inactive tab should render as outline-only (no fill)
+         let outline_only = config.tab_colors.tab_inactive_outline_only && !is_active;
+ 
+-        // Tab frame - allocate space for the tab.
+-        // Subtract TAB_DRAW_SHRINK_Y from each side to stay within the panel's
+-        // clip rect (which can be slightly smaller than tab_bar_height at
+-        // non-integer DPI scale factors due to pixel rounding).
+-        let tab_height = config.tabs.tab_bar_height - TAB_DRAW_SHRINK_Y * 2.0;
++        // Tab frame - allocate the pill's full slot, then inset once when drawing.
++        // Insetting twice (once here, once in `shrink2`) made the pill shorter than
++        // the strip's centred row, so all the leftover space landed below the pill and
++        // the tabs read as top-heavy.
++        let tab_height = config.tabs.tab_bar_height;
+         let (tab_rect, _) =
+             ui.allocate_exact_size(egui::vec2(tab_width, tab_height), egui::Sense::hover());
+ 
+         // Draw tab background with pill shape
+         // Use rounding based on tab height for a smooth pill appearance
+-        // Shrink vertically so borders are fully visible within tab bar
++        // The pill's vertical clearance is configurable: raising `tab_bar_height`
++        // alone would grow the pill alongside the bar and leave the air unchanged.
++        let pill_inset_y = config.tab_colors.tab_pill_inset_y.max(0.0);
+         let tab_draw_rect = tab_rect
+-            .shrink2(egui::vec2(0.0, TAB_DRAW_SHRINK_Y))
++            .shrink2(egui::vec2(0.0, pill_inset_y))
+             .round_to_pixels(ui.pixels_per_point());
+         let tab_rounding = tab_draw_rect.height() / 2.0;
+         if ui.is_rect_visible(tab_rect) {
+@@ -70,21 +72,14 @@ impl TabBarUI {
+                 .rect_filled(tab_draw_rect, tab_rounding, bg_color);
+ 
+             // Draw border around tab
+-            // Active tabs get a highlighted border using the indicator color
++            // The active tab is marked by the bottom indicator bar drawn below, so its
++            // pill keeps the same hairline as every other tab. Painting the indicator
++            // colour around the whole pill as well would spend the accent twice and
++            // leave the chrome carrying more accent than the content does.
+             // Outline-only inactive tabs always get a border (brightened on hover)
+             let is_hovered = self.hovered_tab == Some(id);
+-            if config.tab_colors.tab_border_width > 0.0 || is_active || outline_only {
+-                let (border_color, border_width) = if is_active {
+-                    // Active tab: use indicator color and slightly thicker border
+-                    let c = if let Some(custom) = custom_color {
+-                        // Lighten the custom color for the indicator
+-                        let lighten = |v: u8| v.saturating_add(50);
+-                        [lighten(custom[0]), lighten(custom[1]), lighten(custom[2])]
+-                    } else {
+-                        config.tab_colors.tab_active_indicator
+-                    };
+-                    (c, config.tab_colors.tab_border_width.max(1.5))
+-                } else if outline_only {
++            if config.tab_colors.tab_border_width > 0.0 || outline_only {
++                let (border_color, border_width) = if outline_only {
+                     // Outline-only inactive tab: use border color, brighten on hover
+                     let base = if let Some(custom) = custom_color {
+                         custom
+@@ -123,6 +118,38 @@ impl TabBarUI {
+                 }
+             }
+ 
++            // Active-tab accent: a thin bar along the bottom edge. Inset and lifted so
++            // it stays inside the pill's rounded bottom, since a stadium pill is only
++            // flat across the middle of that edge.
++            let indicator_height = config.tab_colors.tab_indicator_height;
++            if is_active && indicator_height > 0.0 {
++                let c = if let Some(custom) = custom_color {
++                    // Lighten the custom color for the indicator
++                    let lighten = |v: u8| v.saturating_add(50);
++                    [lighten(custom[0]), lighten(custom[1]), lighten(custom[2])]
++                } else {
++                    config.tab_colors.tab_active_indicator
++                };
++                let inset = TAB_INDICATOR_INSET_X
++                    .min(tab_draw_rect.width() / 2.0 - 1.0)
++                    .max(0.0);
++                let bar = egui::Rect::from_min_max(
++                    egui::pos2(
++                        tab_draw_rect.left() + inset,
++                        tab_draw_rect.bottom() - TAB_INDICATOR_LIFT_Y - indicator_height,
++                    ),
++                    egui::pos2(
++                        tab_draw_rect.right() - inset,
++                        tab_draw_rect.bottom() - TAB_INDICATOR_LIFT_Y,
++                    ),
++                );
++                ui.painter().rect_filled(
++                    bar,
++                    indicator_height / 2.0,
++                    egui::Color32::from_rgb(c[0], c[1], c[2]),
++                );
++            }
++
+             // Create a child UI for the tab content
+             let mut content_ui = ui.new_child(
+                 egui::UiBuilder::new()
+@@ -133,15 +160,33 @@ impl TabBarUI {
+             );
+ 
+             content_ui.horizontal(|ui| {
++                // Indicators, sized explicitly and capped at half the strip height.
++                //
++                // Emoji render noticeably larger than their nominal font size, so an
++                // uncapped bell or dot can outgrow the pill it sits in — the same
++                // reason the profile icon is capped. The horizontal guard matches the
++                // icon's: never more than half of this tab's width.
++                let indicator_size = (config.tabs.tab_bar_height * 0.5)
++                    .max(8.0)
++                    .min((tab_width * 0.5).max(8.0));
++
+                 // Bell indicator (takes priority over activity indicator)
+                 if is_bell_active {
+                     let c = config.tab_colors.tab_bell_indicator;
+-                    ui.colored_label(egui::Color32::from_rgb(c[0], c[1], c[2]), "🔔");
++                    ui.label(
++                        egui::RichText::new("🔔")
++                            .size(indicator_size)
++                            .color(egui::Color32::from_rgb(c[0], c[1], c[2])),
++                    );
+                     ui.add_space(4.0);
+                 } else if has_activity && !is_active {
+                     // Activity indicator
+                     let c = config.tab_colors.tab_activity_indicator;
+-                    ui.colored_label(egui::Color32::from_rgb(c[0], c[1], c[2]), "•");
++                    ui.label(
++                        egui::RichText::new("•")
++                            .size(indicator_size)
++                            .color(egui::Color32::from_rgb(c[0], c[1], c[2])),
++                    );
+                     ui.add_space(4.0);
+                 }
+ 
+@@ -150,12 +195,39 @@ impl TabBarUI {
+                     // We'd need to get the index, skip for now
+                 }
+ 
+-                // Profile icon (from auto-applied directory/hostname profile)
++                // Tab text colour, shared by the icon and the title.
++                let text_color = if is_active {
++                    let c = config.tab_colors.tab_active_text;
++                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255)
++                } else {
++                    let c = config.tab_colors.tab_inactive_text;
++                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], opacity)
++                };
++
++                // Profile icon (from auto-applied directory/hostname profile).
++                //
++                // The width is capped at half of *this tab's* width, so a wide glyph
++                // can never take over a narrow tab. The height cap is unchanged — only
++                // the horizontal extent is limited. A text glyph advances roughly one
++                // em, so bounding the font size bounds the drawn width with it.
+                 let icon_width = if let Some(icon) = profile_icon {
+                     let icon = sanitize_egui_title_text(icon);
+-                    ui.label(icon.as_ref());
++                    let icon_height = (config.tabs.tab_bar_height * 0.5).max(8.0);
++                    let icon_max_width = (tab_width * 0.5).max(8.0);
++                    let icon_size = (icon_height * 0.9).min(icon_max_width);
++                    let (icon_rect, _) = ui.allocate_exact_size(
++                        egui::vec2(icon_size, icon_height),
++                        egui::Sense::hover(),
++                    );
++                    ui.painter().text(
++                        icon_rect.center(),
++                        egui::Align2::CENTER_CENTER,
++                        icon.as_ref(),
++                        egui::FontId::proportional(icon_size),
++                        text_color,
++                    );
+                     ui.add_space(2.0);
+-                    18.0
++                    icon_size + 2.0
+                 } else {
+                     0.0
+                 };
+@@ -190,14 +262,6 @@ impl TabBarUI {
+ 
+                 let max_chars = estimate_max_chars(ui, &base_font_id, title_available_width);
+ 
+-                let text_color = if is_active {
+-                    let c = config.tab_colors.tab_active_text;
+-                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255)
+-                } else {
+-                    let c = config.tab_colors.tab_inactive_text;
+-                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], opacity)
+-                };
+-
+                 if config.tab_colors.tab_html_titles {
+                     let segments = sanitize_styled_segments_for_egui(parse_html_title(title));
+                     let truncated = truncate_segments(&segments, max_chars);
+@@ -205,7 +269,11 @@ impl TabBarUI {
+                 } else {
+                     let safe_title = sanitize_egui_title_text(title);
+                     let display_title = truncate_plain(safe_title.as_ref(), max_chars);
+-                    ui.label(egui::RichText::new(display_title).color(text_color));
++                    let mut label = egui::RichText::new(display_title).color(text_color);
++                    if config.tab_colors.tab_text_bold {
++                        label = label.strong();
++                    }
++                    ui.label(label);
+                 }
+ 
+                 // Hotkey indicator (only for tabs 1-9) - show on right side, leave space for close button
+diff --git a/src/tab_bar_ui/tab_rendering.rs b/src/tab_bar_ui/tab_rendering.rs
+index aab9a36..b250dfd 100644
+--- a/src/tab_bar_ui/tab_rendering.rs
++++ b/src/tab_bar_ui/tab_rendering.rs
+@@ -195,26 +195,29 @@ impl TabBarUI {
+             );
+ 
+             content_ui.horizontal(|ui| {
++                // Same caps as the horizontal strip: indicators never exceed half the
++                // bar's height, nor half of this tab's width.
++                let indicator_size = (config.tabs.tab_bar_height * 0.5)
++                    .max(8.0)
++                    .min((full_width * 0.5).max(8.0));
+                 if is_bell_active {
+                     let c = config.tab_colors.tab_bell_indicator;
+-                    ui.colored_label(egui::Color32::from_rgb(c[0], c[1], c[2]), "🔔");
++                    ui.label(
++                        egui::RichText::new("🔔")
++                            .size(indicator_size)
++                            .color(egui::Color32::from_rgb(c[0], c[1], c[2])),
++                    );
+                     ui.add_space(2.0);
+                 } else if has_activity && !is_active {
+                     let c = config.tab_colors.tab_activity_indicator;
+-                    ui.colored_label(egui::Color32::from_rgb(c[0], c[1], c[2]), "•");
++                    ui.label(
++                        egui::RichText::new("•")
++                            .size(indicator_size)
++                            .color(egui::Color32::from_rgb(c[0], c[1], c[2])),
++                    );
+                     ui.add_space(2.0);
+                 }
+ 
+-                // Profile icon
+-                let icon_width = if let Some(icon) = profile_icon {
+-                    let icon = sanitize_egui_title_text(icon);
+-                    ui.label(icon.as_ref());
+-                    ui.add_space(2.0);
+-                    18.0
+-                } else {
+-                    0.0
+-                };
+-
+                 let text_color = if is_active {
+                     let c = config.tab_colors.tab_active_text;
+                     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], 255)
+@@ -223,6 +226,29 @@ impl TabBarUI {
+                     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], opacity)
+                 };
+ 
++                // Profile icon: width capped at half of this tab's width, height as-is.
++                let icon_width = if let Some(icon) = profile_icon {
++                    let icon = sanitize_egui_title_text(icon);
++                    let icon_height = (config.tabs.tab_bar_height * 0.5).max(8.0);
++                    let icon_max_width = (full_width * 0.5).max(8.0);
++                    let icon_size = (icon_height * 0.9).min(icon_max_width);
++                    let (icon_rect, _) = ui.allocate_exact_size(
++                        egui::vec2(icon_size, icon_height),
++                        egui::Sense::hover(),
++                    );
++                    ui.painter().text(
++                        icon_rect.center(),
++                        egui::Align2::CENTER_CENTER,
++                        icon.as_ref(),
++                        egui::FontId::proportional(icon_size),
++                        text_color,
++                    );
++                    ui.add_space(2.0);
++                    icon_size + 2.0
++                } else {
++                    0.0
++                };
++
+                 // Truncate title to fit available width
+                 let close_width = if config.tabs.tab_show_close_button {
+                     TAB_CLOSE_BTN_SIZE_H + TAB_CLOSE_BTN_MARGIN
+@@ -235,7 +261,11 @@ impl TabBarUI {
+                 let max_chars = estimate_max_chars(ui, &base_font_id, available);
+                 let safe_title = sanitize_egui_title_text(title);
+                 let display_title = truncate_plain(safe_title.as_ref(), max_chars);
+-                ui.label(egui::RichText::new(display_title).color(text_color));
++                let mut label = egui::RichText::new(display_title).color(text_color);
++                if config.tab_colors.tab_text_bold {
++                    label = label.strong();
++                }
++                ui.label(label);
+             });
+ 
+             // Close button at right edge
+diff --git a/src/ui_constants.rs b/src/ui_constants.rs
+index c80e78c..cfbbbeb 100644
+--- a/src/ui_constants.rs
++++ b/src/ui_constants.rs
+@@ -137,7 +137,11 @@ pub const FILE_TRANSFERS_ANCHOR_OFFSET: f32 = 10.0;
+ /// Horizontal spacing between tabs.
+ pub const TAB_SPACING: f32 = 4.0;
+ /// Left padding before the first tab in the horizontal tab bar.
+-pub const TAB_LEFT_PADDING: f32 = 2.0;
++///
++/// This is what keeps the first pill off the window's left border.
++///`window_decorations: false` means there is no frame around it, so a pill flush
++/// against the edge reads as clipped rather than placed.
++pub const TAB_LEFT_PADDING: f32 = 8.0;
+ /// Width of each scroll navigation button.
+ pub const TAB_SCROLL_BTN_WIDTH: f32 = 24.0;
+ /// Width of the "new tab" (+) button (without chevron).
+@@ -146,12 +150,25 @@ pub const TAB_NEW_BTN_BASE_WIDTH: f32 = 28.0;
+ pub const TAB_ROUNDING: f32 = 4.0;
+ /// Shrink margin applied to a tab rect before drawing (horizontal, vertical).
+ pub const TAB_DRAW_SHRINK_X: f32 = 2.0;
+-pub const TAB_DRAW_SHRINK_Y: f32 = 1.0;
++/// Vertical inset of a tab pill inside the tab bar strip.
++///
++/// The pill is a stadium, so this is the air above and below it. It has to be more
++/// than the 1px needed for the border to stay visible: at 1px the pills read as
++/// crammed into the strip rather than floating in it.
++pub const TAB_DRAW_SHRINK_Y: f32 = 3.0;
+ /// Horizontal content padding inside each tab (left+right, top+bottom).
+-pub const TAB_CONTENT_PAD_X: f32 = 8.0;
+-pub const TAB_CONTENT_PAD_Y: f32 = 2.0;
++pub const TAB_CONTENT_PAD_X: f32 = 11.0;
++pub const TAB_CONTENT_PAD_Y: f32 = 3.0;
+ /// Width of the active-tab indicator bar (left edge vertical stripe).
+ pub const TAB_ACTIVE_INDICATOR_WIDTH: f32 = 3.0;
++/// Horizontal inset of the active tab's bottom indicator bar.
++///
++/// The tab pill is a stadium (rounding = height / 2), so only the middle of its
++/// bottom edge is flat. Insetting the bar keeps both ends inside that flat span
++/// for every supported tab bar height instead of poking out past the corner arc.
++pub const TAB_INDICATOR_INSET_X: f32 = 10.0;
++/// Distance the active tab's bottom indicator bar sits above the pill's bottom edge.
++pub const TAB_INDICATOR_LIFT_Y: f32 = 2.0;
+ /// Size (width and height) of the close button in the horizontal tab bar.
+ pub const TAB_CLOSE_BTN_SIZE_H: f32 = 16.0;
+ /// Margin between the close button and the right edge of the tab.
+@@ -162,6 +179,21 @@ pub const TAB_CLOSE_BTN_SIZE_V: f32 = 20.0;
+ pub const TAB_HOTKEY_LABEL_WIDTH: f32 = 26.0;
+ /// Padding between content and edges in the vertical tab context menu.
+ pub const TAB_CONTEXT_PADDING: f32 = 12.0;
++
++// ---------------------------------------------------------------------------
++// Window controls (tab bar caption buttons)
++// ---------------------------------------------------------------------------
++
++/// Diameter of each window-control button drawn at the right end of the strip.
++pub const CAPTION_BUTTON_DIAMETER: f32 = 12.0;
++/// Gap between adjacent window-control buttons.
++pub const CAPTION_BUTTON_GAP: f32 = 8.0;
++/// Distance from the strip's right edge to the outermost window-control button.
++pub const CAPTION_BUTTON_MARGIN: f32 = 12.0;
++/// Gap kept between the last tab control (`+` / chevron) and the button group.
++pub const CAPTION_BUTTON_LEADING_GAP: f32 = 10.0;
++/// Font size of the glyph drawn inside a window-control button on hover.
++pub const CAPTION_BUTTON_GLYPH_SIZE: f32 = 9.0;
+ /// Width of the drop-zone diamond indicator drawn during tab drag.
+ pub const TAB_DROP_DIAMOND_SIZE: f32 = 4.0;
+ /// Minimum width of the "New Tab" profile picker window.

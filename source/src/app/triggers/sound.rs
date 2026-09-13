@@ -1,0 +1,90 @@
+//! Sound playback for trigger actions.
+//!
+//! Provides `play_sound_file` (fire-and-forget audio) and `sounds_dir`
+//! (path resolution for sound files installed with par-term).
+//!
+//! When the `audio` feature is disabled, `play_sound_file` logs a warning
+//! and returns without playing anything.
+
+use std::path::PathBuf;
+
+use par_term_config::Config;
+
+use crate::app::window_state::WindowState;
+
+// ---- audio feature enabled -------------------------------------------------
+
+#[cfg(feature = "audio")]
+impl WindowState {
+    /// Play a sound file. Absolute paths are used directly; relative names
+    /// are resolved against the par-term sounds directory.
+    pub(super) fn play_sound_file(sound_id: &str, volume: u8) {
+        use std::io::BufReader;
+
+        let candidate = std::path::Path::new(sound_id);
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            Self::sounds_dir().join(sound_id)
+        };
+
+        if !path.exists() {
+            log::warn!("Sound file not found: {}", path.display());
+            return;
+        }
+
+        let volume_f32 = (volume as f32 / 100.0).clamp(0.0, 1.0);
+
+        std::thread::spawn(move || {
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("Failed to open sound file '{}': {}", path.display(), e);
+                    return;
+                }
+            };
+            let stream = match rodio::DeviceSinkBuilder::open_default_sink() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to open audio output: {}", e);
+                    return;
+                }
+            };
+            let sink = rodio::Player::connect_new(stream.mixer());
+            let source = match rodio::Decoder::new(BufReader::new(file)) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to decode sound file '{}': {}", path.display(), e);
+                    return;
+                }
+            };
+            sink.set_volume(volume_f32);
+            sink.append(source);
+            sink.sleep_until_end();
+        });
+    }
+
+    /// Get the sounds directory path.
+    pub(super) fn sounds_dir() -> PathBuf {
+        Config::config_dir().join("sounds")
+    }
+}
+
+// ---- audio feature disabled (no-op) ----------------------------------------
+
+#[cfg(not(feature = "audio"))]
+impl WindowState {
+    /// No-op — audio feature is disabled at compile time.
+    pub(super) fn play_sound_file(sound_id: &str, _volume: u8) {
+        log::warn!(
+            "PlaySound trigger ignored for '{}': audio feature disabled at compile time",
+            sound_id
+        );
+    }
+
+    /// Get the sounds directory path (still useful for path resolution even
+    /// when audio playback is disabled).
+    pub(super) fn sounds_dir() -> PathBuf {
+        Config::config_dir().join("sounds")
+    }
+}

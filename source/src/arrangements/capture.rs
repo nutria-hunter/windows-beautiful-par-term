@@ -1,0 +1,132 @@
+//! Capture current window arrangement from live windows
+
+use super::{MonitorInfo, TabSnapshot, WindowArrangement, WindowSnapshot};
+use crate::app::window_state::WindowState;
+use std::collections::HashMap;
+use uuid::Uuid;
+use winit::event_loop::ActiveEventLoop;
+use winit::window::WindowId;
+
+/// Build a MonitorInfo from a winit MonitorHandle
+fn monitor_info_from_handle(handle: &winit::monitor::MonitorHandle, index: usize) -> MonitorInfo {
+    let pos = handle.position();
+    let size = handle.size();
+    MonitorInfo {
+        name: handle.name(),
+        index,
+        position: (pos.x, pos.y),
+        size: (size.width, size.height),
+        scale_factor: handle.scale_factor(),
+    }
+}
+
+/// Capture the current window arrangement
+///
+/// Enumerates all monitors and windows, capturing their positions (relative to
+/// their monitor), sizes, and tab CWDs.
+pub fn capture_arrangement(
+    name: String,
+    windows: &HashMap<WindowId, WindowState>,
+    event_loop: &ActiveEventLoop,
+) -> WindowArrangement {
+    // Enumerate all monitors
+    let monitors: Vec<_> = event_loop.available_monitors().collect();
+    let monitor_layout: Vec<MonitorInfo> = monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| monitor_info_from_handle(m, i))
+        .collect();
+
+    // Capture each window
+    let mut window_snapshots = Vec::new();
+    for window_state in windows.values() {
+        let Some(window) = &window_state.window else {
+            continue;
+        };
+
+        // Determine which monitor this window is on
+        let current_monitor = window.current_monitor();
+        let monitor_info = if let Some(ref mon) = current_monitor {
+            // Find the index of this monitor in our list
+            let index = monitors
+                .iter()
+                .position(|m| m.name() == mon.name() && m.position() == mon.position())
+                .unwrap_or(0);
+            monitor_info_from_handle(mon, index)
+        } else {
+            // Fallback to primary/first monitor
+            monitor_layout.first().cloned().unwrap_or(MonitorInfo {
+                name: None,
+                index: 0,
+                position: (0, 0),
+                size: (1920, 1080),
+                scale_factor: 1.0,
+            })
+        };
+
+        // Compute position relative to monitor origin in logical pixels.
+        //
+        // On macOS with mixed-DPI displays, monitor.position() and
+        // window.outer_position() both scale by their respective monitor's
+        // backingScaleFactor, so they live in per-monitor "physical" spaces
+        // that are NOT unified across monitors.  Dividing by scale_factor
+        // converts them into scale-factor-independent logical (point) pixels,
+        // which winit then handles correctly via LogicalPosition on restore.
+        let scale = window.scale_factor();
+        let window_pos = window.outer_position().unwrap_or_default();
+        let position_relative = (
+            ((window_pos.x - monitor_info.position.0) as f64 / scale) as i32,
+            ((window_pos.y - monitor_info.position.1) as f64 / scale) as i32,
+        );
+
+        // Use inner_size (content area only, not including decorations) so
+        // the restored window matches the original content size exactly.
+        let inner_size = window.inner_size();
+        let size = (
+            (inner_size.width as f64 / scale) as u32,
+            (inner_size.height as f64 / scale) as u32,
+        );
+
+        // Capture visible tabs only — hidden tabs (e.g. tmux gateway) are
+        // transient control-mode connections that should not be persisted.
+        let visible_tabs = window_state.tab_manager.visible_tabs();
+        let tabs: Vec<TabSnapshot> = visible_tabs
+            .iter()
+            .map(|tab| TabSnapshot {
+                cwd: tab.get_cwd(),
+                title: tab.title.clone(),
+                custom_color: tab.custom_color,
+                user_title: if tab.user_named {
+                    Some(tab.title.clone())
+                } else {
+                    None
+                },
+                custom_icon: tab.custom_icon.clone(),
+            })
+            .collect();
+
+        // active_tab_index must be relative to the visible-only list
+        let active_tab_id = window_state.tab_manager.active_tab_id();
+        let active_tab_index = active_tab_id
+            .and_then(|id| visible_tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+
+        window_snapshots.push(WindowSnapshot {
+            monitor: monitor_info,
+            position_relative,
+            size,
+            tabs,
+            active_tab_index,
+            tmux_session_name: window_state.tmux_state.tmux_session_name.clone(),
+        });
+    }
+
+    WindowArrangement {
+        id: Uuid::new_v4(),
+        name,
+        monitor_layout,
+        windows: window_snapshots,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        order: 0,
+    }
+}

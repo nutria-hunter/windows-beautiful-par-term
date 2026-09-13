@@ -1,0 +1,628 @@
+//! Per-frame update logic for WindowState (`about_to_wait`).
+//!
+//! Contains:
+//! - `about_to_wait`: per-frame polling for notifications, tmux, config reload,
+//!   cursor blink, smooth scrolling, power saving, flicker reduction, throughput mode,
+//!   resize/toast overlay timers, shader animation, file transfers, anti-idle keep-alive.
+
+use crate::app::handler::wake::WakeRequest;
+use crate::app::window_state::WindowState;
+
+/// Longest explicit sleep taken per idle iteration when the window is focused.
+const FOCUSED_IDLE_SPIN_SLEEP_MS: u64 = 50;
+/// Longest explicit sleep taken per idle iteration when the window is unfocused.
+const UNFOCUSED_IDLE_SPIN_SLEEP_MS: u64 = 100;
+
+impl WindowState {
+    /// Process per-window updates in about_to_wait.
+    ///
+    /// Returns what this window wants from the event loop, or `None` when it is
+    /// shutting down and wants nothing. Nothing here touches `ControlFlow`:
+    /// there is one event loop and many windows, so the requests are reduced to
+    /// a single decision by `WindowManager::about_to_wait`. Setting it here made
+    /// the last window iterated decide the cadence for every window.
+    #[must_use]
+    pub(crate) fn about_to_wait(&mut self) -> Option<WakeRequest> {
+        // Skip all processing if shutting down
+        if self.is_shutting_down {
+            return None;
+        }
+
+        // Track inter-frame gap to detect event loop stalls.
+        let _atw_t0 = std::time::Instant::now();
+        if let Some(prev) = self.debug.last_about_to_wait {
+            let gap_ms = prev.elapsed().as_millis();
+            if gap_ms > 100 {
+                crate::debug_info!(
+                    "EVENT_LOOP",
+                    "about_to_wait gap: {}ms since last call",
+                    gap_ms
+                );
+            }
+        }
+        self.debug.last_about_to_wait = Some(_atw_t0);
+
+        // Emit a periodic telemetry summary when try_lock() failures have occurred.
+        // The call is cheap (two atomic loads) when no new failures happened.
+        crate::debug::maybe_log_try_lock_telemetry();
+
+        // Drain the ACP agent queue.
+        //
+        // This must not be gated on a frame being drawn: two of the three
+        // inbound message variants are synchronous RPCs the agent subprocess is
+        // blocked on, and nothing ties "an agent is connected" to a redraw. Every
+        // `needs_redraw = true` in the handler sits *after* the drain, so a
+        // render-path-only drain could never start itself — an idle or unfocused
+        // window stalled the agent instead. Draining here also keeps the
+        // (unbounded) queue from growing precisely when nothing consumes it.
+        self.process_agent_messages_tick();
+
+        // Apply a finished background integrations install (shaders / shell
+        // integration). Polled here rather than from the render path for the
+        // same reason as the agent queue above.
+        let integrations_install_running = self.poll_integrations_install();
+
+        // Check for and deliver notifications (OSC 9/777/99)
+        self.check_notifications();
+
+        // Check for clicked OSC 99 notifications and perform their focus/report actions
+        self.check_notification_clicks();
+
+        // Check for file transfer events (downloads, uploads, progress)
+        self.check_file_transfers();
+
+        // Check for bell events and play audio/visual feedback
+        self.check_bell();
+
+        // Withdraw queued confirmations whose target tab has been closed, then
+        // perform the writes the user already approved for a specific tab.
+        // Both run before `check_trigger_actions`, which resolves everything
+        // against the active tab and gives up early when that tab has no
+        // terminal lock to spare — neither condition applies to a targeted
+        // action.
+        self.prune_orphaned_pending_actions();
+        self.execute_approved_targeted_actions();
+
+        // Check for trigger action results and dispatch them
+        self.check_trigger_actions();
+
+        // Bridge OSC 52 clipboard writes from programs to the system clipboard
+        self.check_clipboard_sync();
+
+        // Check for activity/idle notifications
+        self.check_activity_idle_notifications();
+
+        // Check for session exit notifications
+        self.check_session_exit_notifications();
+
+        // Check for shader hot reload events
+        if self.check_shader_reload() {
+            log::debug!("Shader hot reload triggered redraw");
+        }
+
+        // Check for config file changes (e.g., from ACP agent)
+        self.check_config_reload();
+
+        // Check for MCP server config updates (.config-update.json)
+        self.check_config_update_file();
+
+        // Check for MCP screenshot requests (.screenshot-request.json)
+        self.check_screenshot_request_file();
+
+        // Check for MCP shader diagnostics requests (.shader-diagnostics-request.json)
+        self.check_shader_diagnostics_request_file();
+
+        // Check for tmux control mode notifications
+        if self.check_tmux_notifications() {
+            self.focus_state.needs_redraw = true;
+        }
+
+        // Update window title with shell integration info (CWD, exit code)
+        self.update_window_title_with_shell_integration();
+
+        // Sync shell integration data to badge variables
+        self.sync_badge_shell_integration();
+
+        // Check for automatic profile switching based on hostname detection (OSC 7)
+        if self.check_auto_profile_switch() {
+            self.focus_state.needs_redraw = true;
+        }
+
+        // --- POWER SAVING & SMART REDRAW LOGIC ---
+        // We use ControlFlow::WaitUntil to sleep until the next expected event.
+        // This drastically reduces CPU/GPU usage compared to continuous polling (ControlFlow::Poll).
+        // The loop calculates the earliest time any component needs to update.
+
+        let now = std::time::Instant::now();
+        let mut next_wake = now + std::time::Duration::from_secs(1); // Default sleep for 1s of inactivity
+
+        // Calculate frame interval based on focus state for power saving
+        // When pause_refresh_on_blur is enabled and window is unfocused, use slower refresh rate
+        let frame_interval_ms =
+            if self.config.load().power.pause_refresh_on_blur && !self.focus_state.is_focused {
+                // Use unfocused FPS (e.g., 10 FPS = 100ms interval)
+                1000 / self.config.load().power.unfocused_fps.max(1)
+            } else {
+                // Use normal animation rate based on max_fps
+                1000 / self.config.load().rendering.max_fps.max(1)
+            };
+        let frame_interval = std::time::Duration::from_millis(frame_interval_ms as u64);
+
+        // Check if enough time has passed since last render for FPS throttling
+        let time_since_last_render = self
+            .focus_state
+            .last_render_time
+            .map(|t| now.duration_since(t))
+            .unwrap_or(frame_interval); // If no last render, allow immediate render
+        let can_render = time_since_last_render >= frame_interval;
+
+        // --- FLICKER REDUCTION LOGIC ---
+        // When reduce_flicker is enabled and cursor is hidden, delay rendering
+        // to batch updates and reduce visual flicker during bulk terminal operations.
+        let should_delay_for_flicker = if self.config.load().rendering.reduce_flicker {
+            // try_lock: intentional — flicker check runs in about_to_wait (sync event loop).
+            // On miss: assume cursor is visible (false) so rendering is not delayed.
+            // Slightly conservative but never causes stale frames.
+            let cursor_hidden = self
+                .tab_manager
+                .active_tab()
+                .and_then(|tab| {
+                    tab.try_with_terminal_mut(|term| {
+                        !term.is_cursor_visible()
+                            && !self.config.load().cursor.lock_cursor_visibility
+                    })
+                })
+                .unwrap_or(false);
+
+            if cursor_hidden {
+                // Track when cursor was first hidden
+                if self.focus_state.cursor_hidden_since.is_none() {
+                    self.focus_state.cursor_hidden_since = Some(now);
+                }
+
+                // Check bypass conditions
+                let delay_expired = self
+                    .focus_state
+                    .cursor_hidden_since
+                    .map(|t| {
+                        now.duration_since(t)
+                            >= std::time::Duration::from_millis(
+                                self.config.load().rendering.reduce_flicker_delay_ms as u64,
+                            )
+                    })
+                    .unwrap_or(false);
+
+                // Bypass for UI interactions (modals + resize overlay)
+                let any_ui_visible =
+                    self.any_modal_ui_visible() || self.overlay_state.resize_overlay_visible;
+
+                // Delay unless bypass conditions met
+                !delay_expired && !any_ui_visible
+            } else {
+                // Cursor visible - clear tracking and allow render
+                if self.focus_state.cursor_hidden_since.is_some() {
+                    self.focus_state.cursor_hidden_since = None;
+                    self.focus_state.flicker_pending_render = false;
+                    self.focus_state.needs_redraw = true; // Render accumulated updates
+                }
+                false
+            }
+        } else {
+            false
+        };
+
+        // Schedule wake at delay expiry if delaying
+        if should_delay_for_flicker {
+            self.focus_state.flicker_pending_render = true;
+            if let Some(hidden_since) = self.focus_state.cursor_hidden_since {
+                let delay = std::time::Duration::from_millis(
+                    self.config.load().rendering.reduce_flicker_delay_ms as u64,
+                );
+                let render_time = hidden_since + delay;
+                if render_time < next_wake {
+                    next_wake = render_time;
+                }
+            }
+        } else if self.focus_state.flicker_pending_render {
+            // Delay ended - trigger accumulated render
+            self.focus_state.flicker_pending_render = false;
+            if can_render {
+                self.focus_state.needs_redraw = true;
+            }
+        }
+
+        // --- THROUGHPUT MODE LOGIC ---
+        // When maximize_throughput is enabled, always batch renders regardless of cursor state.
+        // Uses a longer interval than flicker reduction for better throughput during bulk output.
+        let should_delay_for_throughput = if self.config.load().rendering.maximize_throughput {
+            // Initialize batch start time if not set
+            if self.focus_state.throughput_batch_start.is_none() {
+                self.focus_state.throughput_batch_start = Some(now);
+            }
+
+            let interval = std::time::Duration::from_millis(
+                self.config.load().rendering.throughput_render_interval_ms as u64,
+            );
+            let batch_start = self
+                .focus_state
+                .throughput_batch_start
+                .expect("throughput_batch_start is Some: set to Some on the line above when None");
+
+            // Check if interval has elapsed
+            if now.duration_since(batch_start) >= interval {
+                self.focus_state.throughput_batch_start = Some(now); // Reset for next batch
+                false // Allow render
+            } else {
+                true // Delay render
+            }
+        } else {
+            // Clear tracking when disabled
+            if self.focus_state.throughput_batch_start.is_some() {
+                self.focus_state.throughput_batch_start = None;
+            }
+            false
+        };
+
+        // Schedule wake for throughput mode
+        if should_delay_for_throughput
+            && let Some(batch_start) = self.focus_state.throughput_batch_start
+        {
+            let interval = std::time::Duration::from_millis(
+                self.config.load().rendering.throughput_render_interval_ms as u64,
+            );
+            let render_time = batch_start + interval;
+            if render_time < next_wake {
+                next_wake = render_time;
+            }
+        }
+
+        // Combine delays: throughput mode OR flicker delay
+        let should_delay_render = should_delay_for_throughput || should_delay_for_flicker;
+
+        // 1. Cursor Blinking
+        // Wake up exactly when the cursor needs to toggle visibility or fade.
+        // Skip cursor blinking when unfocused with pause_refresh_on_blur to save power.
+        if self.config.load().cursor.cursor_blink
+            && (self.focus_state.is_focused || !self.config.load().power.pause_refresh_on_blur)
+        {
+            if self.cursor_anim.cursor_blink_timer.is_none() {
+                let blink_interval = std::time::Duration::from_millis(
+                    self.config.load().cursor.cursor_blink_interval,
+                );
+                self.cursor_anim.cursor_blink_timer = Some(now + blink_interval);
+            }
+
+            if let Some(next_blink) = self.cursor_anim.cursor_blink_timer {
+                if now >= next_blink {
+                    // Time to toggle: trigger redraw (if throttle allows) and schedule next phase
+                    if can_render {
+                        self.focus_state.needs_redraw = true;
+                    }
+                    let blink_interval = std::time::Duration::from_millis(
+                        self.config.load().cursor.cursor_blink_interval,
+                    );
+                    self.cursor_anim.cursor_blink_timer = Some(now + blink_interval);
+                } else if next_blink < next_wake {
+                    // Schedule wake-up for the next toggle
+                    next_wake = next_blink;
+                }
+            }
+        }
+
+        // 2. Smooth Scrolling & Animations
+        // If a scroll interpolation or terminal animation is active, use calculated frame interval.
+        if let Some(tab) = self.tab_manager.active_tab() {
+            if tab.active_scroll_state().animation_start.is_some() {
+                if can_render {
+                    self.focus_state.needs_redraw = true;
+                }
+                let next_frame = now + frame_interval;
+                if next_frame < next_wake {
+                    next_wake = next_frame;
+                }
+            }
+
+            // 3. Visual Bell Feedback
+            // Maintain frame rate during the visual flash fade-out.
+            if tab.active_bell().visual_flash.is_some() {
+                if can_render {
+                    self.focus_state.needs_redraw = true;
+                }
+                let next_frame = now + frame_interval;
+                if next_frame < next_wake {
+                    next_wake = next_frame;
+                }
+            }
+
+            // 4. Interactive UI Elements
+            // Ensure high responsiveness during mouse dragging (text selection or scrollbar).
+            // Always allow these for responsiveness, even if throttled.
+            let sm = tab.selection_mouse();
+            if (sm.is_selecting || sm.selection.is_some() || tab.active_scroll_state().dragging)
+                && tab.active_mouse().button_pressed
+            {
+                self.focus_state.needs_redraw = true;
+            }
+        }
+
+        // 5. Resize Overlay
+        // Check if the resize overlay should be hidden (timer expired).
+        if self.overlay_state.resize_overlay_visible
+            && let Some(hide_time) = self.overlay_state.resize_overlay_hide_time
+        {
+            if now >= hide_time {
+                // Hide the overlay
+                self.overlay_state.resize_overlay_visible = false;
+                self.overlay_state.resize_overlay_hide_time = None;
+                self.focus_state.needs_redraw = true;
+            } else {
+                // Overlay still visible - request redraw and schedule wake
+                if can_render {
+                    self.focus_state.needs_redraw = true;
+                }
+                if hide_time < next_wake {
+                    next_wake = hide_time;
+                }
+            }
+        }
+
+        // 5b. Toast Notification
+        // Check if the toast notification should be hidden (timer expired).
+        if self.overlay_state.toast_message.is_some()
+            && let Some(hide_time) = self.overlay_state.toast_hide_time
+        {
+            if now >= hide_time {
+                // Hide the toast
+                self.overlay_state.toast_message = None;
+                self.overlay_state.toast_hide_time = None;
+                self.focus_state.needs_redraw = true;
+            } else {
+                // Toast still visible - request redraw and schedule wake
+                if can_render {
+                    self.focus_state.needs_redraw = true;
+                }
+                if hide_time < next_wake {
+                    next_wake = hide_time;
+                }
+            }
+        }
+
+        // 5c. Pane Identification Overlay
+        // Check if the pane index overlay should be hidden (timer expired).
+        if let Some(hide_time) = self.overlay_state.pane_identify_hide_time {
+            if now >= hide_time {
+                self.overlay_state.pane_identify_hide_time = None;
+                self.focus_state.needs_redraw = true;
+            } else {
+                if can_render {
+                    self.focus_state.needs_redraw = true;
+                }
+                if hide_time < next_wake {
+                    next_wake = hide_time;
+                }
+            }
+        }
+
+        // 5b. Session undo expiry: prune closed tab metadata that has timed out
+        if !self.overlay_state.closed_tabs.is_empty()
+            && self.config.load().session_restore.session_undo_timeout_secs > 0
+        {
+            let timeout = std::time::Duration::from_secs(
+                self.config.load().session_restore.session_undo_timeout_secs as u64,
+            );
+            self.overlay_state
+                .closed_tabs
+                .retain(|info| now.duration_since(info.closed_at) < timeout);
+        }
+
+        // 6. Custom Background Shaders
+        // If a custom shader is animated, render at the calculated frame interval.
+        // When unfocused with pause_refresh_on_blur, this uses the slower unfocused_fps rate.
+        if let Some(renderer) = &self.renderer
+            && renderer.needs_continuous_render()
+        {
+            if can_render {
+                self.focus_state.needs_redraw = true;
+            }
+            // Schedule next frame at the appropriate interval
+            let next_frame = self
+                .focus_state
+                .last_render_time
+                .map(|t| t + frame_interval)
+                .unwrap_or(now);
+            // Ensure we don't schedule in the past
+            let next_frame = if next_frame <= now {
+                now + frame_interval
+            } else {
+                next_frame
+            };
+            if next_frame < next_wake {
+                next_wake = next_frame;
+            }
+        }
+
+        // 7. Shader Install Dialog
+        // Force continuous redraws when shader install dialog is visible (for spinner animation)
+        // and when installation is in progress (to check for completion)
+        if self.overlay_ui.shader_install_ui.visible || integrations_install_running {
+            self.focus_state.needs_redraw = true;
+            // Schedule frequent redraws for smooth spinner animation
+            let next_frame = now + std::time::Duration::from_millis(16); // ~60fps
+            if next_frame < next_wake {
+                next_wake = next_frame;
+            }
+        }
+
+        // 7b. ACP Agent Queue
+        // The drain at the top of this function only runs when the event loop
+        // wakes, and the idle default is a full second. Two message variants are
+        // synchronous RPCs the agent is blocked on, so bound that wait while an
+        // agent is live. Only the first message after a quiet period pays this
+        // latency: each drained message re-arms `needs_redraw`, so an actively
+        // streaming agent already keeps the loop at frame rate.
+        //
+        // This is a full extra `about_to_wait` pass, not just a `try_recv` — the
+        // request-file checks above stat the filesystem. The interval therefore
+        // matches the existing unfocused idle-spin cadence rather than beating
+        // it, so a connected agent never drives the loop faster than an idle
+        // focused window already runs.
+        //
+        // `agent_rx` stays `Some` after an agent exits on its own (only an
+        // explicit disconnect clears it), so gate on the status too — otherwise
+        // one Assistant-panel session would hold the faster cadence for the
+        // remaining life of the window.
+        let agent_is_live = self.agent_state.agent_rx.is_some()
+            && !matches!(
+                self.overlay_ui.ai_inspector.agent_status,
+                par_term_acp::AgentStatus::Disconnected | par_term_acp::AgentStatus::Error(_)
+            );
+        if agent_is_live {
+            let next_poll = now + std::time::Duration::from_millis(UNFOCUSED_IDLE_SPIN_SLEEP_MS);
+            if next_poll < next_wake {
+                next_wake = next_poll;
+            }
+        }
+
+        // 7c. Script Command Queue
+        // `WindowManager::about_to_wait` drives the script command loop once per
+        // event-loop wake, and the idle default is a full second. A script that
+        // sends a command while nothing else is happening would therefore wait up
+        // to that long to be serviced. Bound the wait while a script is live, for
+        // the same reason and at the same cadence as the ACP block above: the
+        // reactive half is already covered (every command that produces on-screen
+        // state calls `request_redraw`, which wakes the loop regardless of
+        // `WaitUntil`), but nothing schedules the wake that *looks* for a new
+        // command.
+        //
+        // Gate on the process actually running, not merely on a script having
+        // been started — otherwise one exited script would hold the faster
+        // cadence for the remaining life of the tab.
+        //
+        // Every tab counts, and focus does not: `sync_script_running_state`
+        // services every tab of every window, so a script in a background tab
+        // or an unfocused window has real work waiting on this wake. Checking
+        // the running flag rather than merely the presence of a script keeps an
+        // idle window idle.
+        let script_is_live = self.tab_manager.tabs_mut().iter_mut().any(|tab| {
+            (0..tab.scripting.script_ids.len()).any(|i| match tab.scripting.script_ids[i] {
+                Some(id) => tab.scripting.script_manager.is_running(id),
+                None => false,
+            })
+        });
+        if script_is_live {
+            let next_poll = now + std::time::Duration::from_millis(UNFOCUSED_IDLE_SPIN_SLEEP_MS);
+            if next_poll < next_wake {
+                next_wake = next_poll;
+            }
+        }
+
+        // 8. File Transfer Progress
+        // Ensure rendering during active file transfers so the progress overlay
+        // updates. Uses 1-second interval since progress doesn't need smooth animation.
+        // Bypasses render delays (flicker/throughput) for responsive UI feedback.
+        let has_active_file_transfers = !self.file_transfer_state.active_uploads.is_empty()
+            || !self.file_transfer_state.recent_transfers.is_empty();
+        if has_active_file_transfers {
+            self.focus_state.needs_redraw = true;
+            // Schedule 1 FPS rendering for progress bar updates
+            let next_frame = now + std::time::Duration::from_secs(1);
+            if next_frame < next_wake {
+                next_wake = next_frame;
+            }
+        }
+
+        // 9. Anti-idle Keep-alive
+        // Periodically send keep-alive codes to prevent SSH/connection timeouts.
+        if let Some(next_anti_idle) = self.handle_anti_idle(now)
+            && next_anti_idle < next_wake
+        {
+            next_wake = next_anti_idle;
+        }
+
+        // --- FLUSH PENDING RENDERER DIRTY STATE OR EGUI INPUT ---
+        // Two self-heal cases:
+        //
+        // 1. Renderer dirty state: when a window event (e.g. Focused(false)) sets
+        //    renderer dirty state but the FPS gate previously skipped that render,
+        //    needs_redraw may have been cleared without the frame ever reaching the
+        //    GPU (no cursor blink, no terminal output, no animated shader to re-arm
+        //    it).
+        //
+        // 2. Pending egui input: when `should_render_frame()` rejects a
+        //    `RedrawRequested` because the FPS gate hasn't elapsed, any events that
+        //    were already fed into `egui_winit`'s `raw_input` (e.g. a tab click's
+        //    press+release) are stranded — no frame runs `take_egui_input()`, so
+        //    egui never sees them. Without re-arming, the stall persists until an
+        //    unrelated wake — the "click tab twice to switch" bug.
+        //
+        // Re-arm needs_redraw when the FPS gate allows, or schedule a wake-up at
+        // the earliest renderable time so the gap self-heals.
+        //
+        // 3. Stale-cell retry: the last render served cells older than the live
+        //    terminal because the core lock was contended. The edge-triggered output
+        //    heartbeat has already moved past this generation, so re-arm here until a
+        //    fresh gather catches up (self-clears once it does).
+        let renderer_dirty = self.renderer.as_ref().is_some_and(|r| r.is_dirty());
+        if !self.focus_state.needs_redraw
+            && (renderer_dirty
+                || self.focus_state.pending_egui_repaint
+                || self.focus_state.stale_cells_pending_retry)
+        {
+            if can_render {
+                self.focus_state.needs_redraw = true;
+            } else if let Some(last_render) = self.focus_state.last_render_time {
+                let retry_time = last_render + frame_interval;
+                if retry_time < next_wake {
+                    next_wake = retry_time;
+                }
+            } else {
+                self.focus_state.needs_redraw = true;
+            }
+        }
+
+        // --- TRIGGER REDRAW ---
+        // Request a redraw if any of the logic above determined an update is due.
+        // Respect combined delay (throughput mode OR flicker reduction),
+        // but bypass delays for active file transfers that need UI feedback.
+        let mut redraw_requested = false;
+        if self.focus_state.needs_redraw && (!should_delay_render || has_active_file_transfers) {
+            self.request_redraw();
+            self.focus_state.needs_redraw = false;
+            redraw_requested = true;
+        }
+
+        // Report the calculated cadence. The reduction and the single
+        // `set_control_flow` happen in `WindowManager::about_to_wait`.
+        //
+        // Poll is requested during active file transfers — WaitUntil prevents
+        // RedrawRequested events from being delivered on macOS when PTY data
+        // events keep the event loop busy.
+        //
+        // On macOS, ControlFlow::WaitUntil doesn't always prevent the event loop
+        // from spinning (CVDisplayLink and NSRunLoop interactions), so an
+        // explicit sleep is offered when no render is needed, to guarantee low
+        // CPU usage when idle. It is only a cap: the loop sleeps once, for the
+        // shortest span any window will tolerate, and not at all if some other
+        // window has a frame in flight.
+        //
+        // Important: keep the cap independent from max_fps. Using frame interval
+        // here causes idle focused windows to wake at render cadence (e.g.,
+        // 60Hz), which burns CPU even when nothing is changing.
+        let idle_sleep_cap = if !self.focus_state.needs_redraw && !redraw_requested {
+            let max_idle_spin_sleep = if self.focus_state.is_focused {
+                FOCUSED_IDLE_SPIN_SLEEP_MS
+            } else {
+                UNFOCUSED_IDLE_SPIN_SLEEP_MS
+            };
+            Some(now + std::time::Duration::from_millis(max_idle_spin_sleep))
+        } else {
+            None
+        };
+
+        Some(WakeRequest {
+            needs_poll: has_active_file_transfers,
+            wake_at: next_wake,
+            idle_sleep_cap,
+        })
+    }
+}

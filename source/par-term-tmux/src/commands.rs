@@ -1,0 +1,445 @@
+//! tmux command builders for control mode
+//!
+//! This module provides type-safe builders for tmux commands that can be
+//! sent through control mode. Commands are formatted as newline-terminated
+//! strings.
+
+use crate::types::{TmuxPaneId, TmuxWindowId};
+
+/// A tmux command ready to be sent
+#[derive(Debug, Clone)]
+pub struct TmuxCommand {
+    /// The command string (without trailing newline)
+    command: String,
+}
+
+/// Render `arg` as a single POSIX single-quoted control-mode argument.
+///
+/// Every builder that interpolates caller-supplied text goes through this, so no
+/// argument can terminate its quoted region and be read as further tmux words.
+/// Embedded single-quotes use the `'\''` idiom (end quote, escaped literal quote,
+/// reopen quote).
+///
+/// Null bytes are stripped rather than quoted: tmux's control-mode protocol is
+/// newline-framed and a null byte inside a quoted argument truncates or mis-frames
+/// the command.
+fn quote(arg: &str) -> String {
+    let sanitized = arg.replace('\x00', "");
+    format!("'{}'", sanitized.replace('\'', "'\\''"))
+}
+
+impl TmuxCommand {
+    /// Create a new command from a raw string
+    fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+
+    /// Get the command string with trailing newline for sending
+    pub fn as_str(&self) -> &str {
+        &self.command
+    }
+
+    /// Get the command as bytes for writing to the control mode session
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.command.as_bytes().to_vec();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    // =========================================================================
+    // Session Commands
+    // =========================================================================
+
+    /// List all sessions
+    pub fn list_sessions() -> Self {
+        Self::new(
+            "list-sessions -F '#{session_id}:#{session_name}:#{session_attached}:#{session_windows}'",
+        )
+    }
+
+    /// Attach to a session
+    pub fn attach_session(session: &str) -> Self {
+        Self::new(format!("attach-session -t {}", quote(session)))
+    }
+
+    /// Create a new session
+    pub fn new_session(name: Option<&str>) -> Self {
+        match name {
+            Some(n) => Self::new(format!("new-session -d -s {}", quote(n))),
+            None => Self::new("new-session -d"),
+        }
+    }
+
+    /// Kill a session
+    pub fn kill_session(session: &str) -> Self {
+        Self::new(format!("kill-session -t {}", quote(session)))
+    }
+
+    // =========================================================================
+    // Window Commands
+    // =========================================================================
+
+    /// List windows in the current session
+    pub fn list_windows() -> Self {
+        Self::new(
+            "list-windows -F '#{window_id}:#{window_name}:#{window_index}:#{window_active}:#{window_layout}'",
+        )
+    }
+
+    /// Create a new window
+    pub fn new_window(name: Option<&str>) -> Self {
+        match name {
+            Some(n) => Self::new(format!("new-window -n {}", quote(n))),
+            None => Self::new("new-window"),
+        }
+    }
+
+    /// Select a window by ID
+    pub fn select_window(window_id: TmuxWindowId) -> Self {
+        Self::new(format!("select-window -t @{}", window_id))
+    }
+
+    /// Kill a window
+    pub fn kill_window(window_id: TmuxWindowId) -> Self {
+        Self::new(format!("kill-window -t @{}", window_id))
+    }
+
+    /// Rename a window
+    pub fn rename_window(window_id: TmuxWindowId, name: &str) -> Self {
+        Self::new(format!("rename-window -t @{} {}", window_id, quote(name)))
+    }
+
+    // =========================================================================
+    // Pane Commands
+    // =========================================================================
+
+    /// List panes in the current window
+    pub fn list_panes() -> Self {
+        Self::new(
+            "list-panes -F '#{pane_id}:#{pane_active}:#{pane_width}:#{pane_height}:#{pane_left}:#{pane_top}:#{pane_current_command}:#{pane_title}'",
+        )
+    }
+
+    /// Split pane vertically (creates side-by-side panes)
+    pub fn split_vertical(pane_id: Option<TmuxPaneId>) -> Self {
+        match pane_id {
+            Some(id) => Self::new(format!("split-window -h -t %{}", id)),
+            None => Self::new("split-window -h"),
+        }
+    }
+
+    /// Split pane horizontally (creates stacked panes)
+    pub fn split_horizontal(pane_id: Option<TmuxPaneId>) -> Self {
+        match pane_id {
+            Some(id) => Self::new(format!("split-window -v -t %{}", id)),
+            None => Self::new("split-window -v"),
+        }
+    }
+
+    /// Select a pane by ID
+    pub fn select_pane(pane_id: TmuxPaneId) -> Self {
+        Self::new(format!("select-pane -t %{}", pane_id))
+    }
+
+    /// Kill a pane
+    pub fn kill_pane(pane_id: TmuxPaneId) -> Self {
+        Self::new(format!("kill-pane -t %{}", pane_id))
+    }
+
+    /// Resize a pane
+    pub fn resize_pane(pane_id: TmuxPaneId, width: Option<usize>, height: Option<usize>) -> Self {
+        let mut cmd = format!("resize-pane -t %{}", pane_id);
+        if let Some(w) = width {
+            cmd.push_str(&format!(" -x {}", w));
+        }
+        if let Some(h) = height {
+            cmd.push_str(&format!(" -y {}", h));
+        }
+        Self::new(cmd)
+    }
+
+    // =========================================================================
+    // Input/Output Commands
+    // =========================================================================
+
+    /// Send keys to a pane, interpreting tmux key names (e.g. `Enter`, `Escape`).
+    ///
+    /// # Escaping strategy
+    ///
+    /// The key string is wrapped in POSIX single-quotes and every embedded
+    /// single-quote is replaced with the `'\''` idiom (end quote, escaped
+    /// literal quote, reopen quote).  This is sufficient for all printable
+    /// characters.
+    ///
+    /// # Known edge cases
+    ///
+    /// - **Null bytes (`\x00`)**: tmux's control-mode protocol is newline-framed;
+    ///   a null byte inside a quoted argument may cause the parser to truncate
+    ///   or mis-frame the command.  Null bytes are stripped before quoting as a
+    ///   defensive measure.
+    /// - **Newlines (`\n`)**: A literal newline inside the single-quoted region
+    ///   will prematurely terminate the control-mode command.  Callers that need
+    ///   to send actual newline *characters* should use `send_literal` instead,
+    ///   which adds the `-l` flag so tmux treats the text as literal input
+    ///   rather than a key name sequence.
+    /// - **Tmux key name interpretation**: Without `-l`, tmux interprets special
+    ///   tokens such as `Enter`, `Escape`, `Up`, etc.  If you want the literal
+    ///   string "Enter" to appear in the terminal, use `send_literal`.
+    pub fn send_keys(pane_id: TmuxPaneId, keys: &str) -> Self {
+        Self::new(format!("send-keys -t %{} {}", pane_id, quote(keys)))
+    }
+
+    /// Send literal text to a pane without tmux key-name interpretation.
+    ///
+    /// Uses the `-l` (literal) flag so that tmux sends the text byte-for-byte
+    /// without interpreting special tokens like `Enter` or `Escape`.  This is
+    /// the preferred variant for pasting user-supplied text.
+    ///
+    /// # Escaping strategy
+    ///
+    /// Single-quotes are escaped with the `'\''` idiom.  Null bytes are stripped
+    /// because they cannot be encoded in tmux's control-mode framing protocol.
+    ///
+    /// # Remaining edge cases
+    ///
+    /// Even with `-l`, an embedded newline in the argument will terminate the
+    /// control-mode command prematurely.  Callers must split multi-line text into
+    /// one `send_literal` call per line, or replace `\n` with an `Enter`
+    /// key-name call via `send_keys`.
+    pub fn send_literal(pane_id: TmuxPaneId, text: &str) -> Self {
+        Self::new(format!("send-keys -t %{} -l {}", pane_id, quote(text)))
+    }
+
+    /// Send keys to a window (sends to the active pane in that window).
+    ///
+    /// See [`Self::send_keys`] for the full escaping strategy and edge cases.
+    pub fn send_keys_to_window(window_id: TmuxWindowId, keys: &str) -> Self {
+        Self::new(format!("send-keys -t @{} {}", window_id, quote(keys)))
+    }
+
+    /// Send literal text to a window (sends to the active pane in that window).
+    ///
+    /// Uses the `-l` (literal) flag.  See [`Self::send_literal`] for the full
+    /// escaping strategy and edge cases.
+    pub fn send_literal_to_window(window_id: TmuxWindowId, text: &str) -> Self {
+        Self::new(format!("send-keys -t @{} -l {}", window_id, quote(text)))
+    }
+
+    /// Capture pane contents
+    pub fn capture_pane(
+        pane_id: TmuxPaneId,
+        start_line: Option<i32>,
+        end_line: Option<i32>,
+    ) -> Self {
+        let mut cmd = format!("capture-pane -t %{} -p", pane_id);
+        if let Some(start) = start_line {
+            cmd.push_str(&format!(" -S {}", start));
+        }
+        if let Some(end) = end_line {
+            cmd.push_str(&format!(" -E {}", end));
+        }
+        Self::new(cmd)
+    }
+
+    // =========================================================================
+    // Clipboard Commands
+    // =========================================================================
+
+    /// Set the tmux paste buffer
+    pub fn set_buffer(content: &str) -> Self {
+        Self::new(format!("set-buffer {}", quote(content)))
+    }
+
+    /// Get the tmux paste buffer
+    pub fn get_buffer() -> Self {
+        Self::new("show-buffer")
+    }
+
+    // =========================================================================
+    // Status Bar Commands
+    // =========================================================================
+
+    /// Get the left side of the status bar (raw format string)
+    ///
+    /// Uses display-message with -p flag to print to stdout.
+    /// The format uses tmux's status-left format string.
+    pub fn get_status_left() -> Self {
+        Self::new("display-message -p '#{status-left}'")
+    }
+
+    /// Get the right side of the status bar (raw format string)
+    ///
+    /// Uses display-message with -p flag to print to stdout.
+    /// The format uses tmux's status-right format string.
+    pub fn get_status_right() -> Self {
+        Self::new("display-message -p '#{status-right}'")
+    }
+
+    /// Get the expanded left side of the status bar
+    ///
+    /// Uses `#{T:status-left}` which expands the status-left format string
+    /// to its actual content (variables resolved, shell commands executed).
+    /// This is the iTerm2 approach for native tmux format support.
+    pub fn get_status_left_expanded() -> Self {
+        Self::new("display-message -p '#{T:status-left}'")
+    }
+
+    /// Get the expanded right side of the status bar
+    ///
+    /// Uses `#{T:status-right}` which expands the status-right format string
+    /// to its actual content (variables resolved, shell commands executed).
+    /// This is the iTerm2 approach for native tmux format support.
+    pub fn get_status_right_expanded() -> Self {
+        Self::new("display-message -p '#{T:status-right}'")
+    }
+
+    /// Get the status bar refresh interval from tmux config
+    ///
+    /// Returns the `status-interval` option value in seconds.
+    pub fn get_status_interval() -> Self {
+        Self::new("display-message -p '#{status-interval}'")
+    }
+
+    /// Get the full status bar content (formatted)
+    ///
+    /// Returns: session_name | window_list | date/time
+    /// This provides a simpler status bar that doesn't require parsing tmux formats.
+    pub fn get_status_bar() -> Self {
+        Self::new(
+            "display-message -p '#{session_name} | #(tmux list-windows -F \"##I:##W#{?window_active,*,}\" | tr \"\\n\" \" \") | %H:%M'",
+        )
+    }
+
+    /// Get status bar with custom format
+    ///
+    /// Allows specifying a custom format string for the status bar.
+    /// Uses tmux format variables like #{session_name}, #{window_index}, etc.
+    pub fn get_status_formatted(format: &str) -> Self {
+        Self::new(format!("display-message -p {}", quote(format)))
+    }
+
+    // =========================================================================
+    // Control Mode Specific
+    // =========================================================================
+
+    /// Refresh client (request full state update)
+    pub fn refresh_client() -> Self {
+        Self::new("refresh-client")
+    }
+
+    /// Subscribe to notifications
+    pub fn subscribe_notifications() -> Self {
+        // Control mode automatically receives notifications
+        // This is a no-op but included for documentation
+        Self::new("refresh-client -S")
+    }
+
+    /// Set the control client size
+    ///
+    /// In control mode, tmux doesn't know the terminal size unless we tell it.
+    /// This command sets the size for the control client, which affects pane sizing.
+    pub fn set_client_size(cols: usize, rows: usize) -> Self {
+        // Note: tmux requires -C XxY format (lowercase x), not comma
+        Self::new(format!("refresh-client -C {}x{}", cols, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_list_sessions() {
+        let cmd = TmuxCommand::list_sessions();
+        assert!(cmd.as_str().starts_with("list-sessions"));
+    }
+
+    #[test]
+    fn test_split_vertical() {
+        let cmd = TmuxCommand::split_vertical(Some(5));
+        assert_eq!(cmd.as_str(), "split-window -h -t %5");
+    }
+
+    #[test]
+    fn test_send_keys_escaping() {
+        let cmd = TmuxCommand::send_keys(1, "echo 'hello'");
+        assert!(cmd.as_str().contains("echo"));
+        // Single-quotes in the input must be escaped with the '\''-idiom.
+        assert!(cmd.as_str().contains("'\\''"));
+    }
+
+    #[test]
+    fn test_send_keys_strips_null_bytes() {
+        // Null bytes must be stripped: they truncate control-mode commands.
+        let cmd = TmuxCommand::send_keys(1, "hel\x00lo");
+        assert_eq!(cmd.as_str(), "send-keys -t %1 'hello'");
+    }
+
+    #[test]
+    fn test_send_literal_strips_null_bytes() {
+        let cmd = TmuxCommand::send_literal(2, "te\x00xt");
+        assert_eq!(cmd.as_str(), "send-keys -t %2 -l 'text'");
+    }
+
+    /// A single-quote in a session/window name must not be able to close the
+    /// quoted region and turn the rest of the name into further tmux words.
+    #[test]
+    fn name_arguments_are_quoted() {
+        assert_eq!(
+            TmuxCommand::attach_session("it's mine").as_str(),
+            "attach-session -t 'it'\\''s mine'"
+        );
+        assert_eq!(
+            TmuxCommand::new_session(Some("a'; kill-server; '")).as_str(),
+            "new-session -d -s 'a'\\''; kill-server; '\\'''"
+        );
+        assert_eq!(
+            TmuxCommand::kill_session("it's mine").as_str(),
+            "kill-session -t 'it'\\''s mine'"
+        );
+        assert_eq!(
+            TmuxCommand::new_window(Some("it's mine")).as_str(),
+            "new-window -n 'it'\\''s mine'"
+        );
+        assert_eq!(
+            TmuxCommand::rename_window(3, "it's mine").as_str(),
+            "rename-window -t @3 'it'\\''s mine'"
+        );
+    }
+
+    #[test]
+    fn name_arguments_strip_null_bytes() {
+        assert_eq!(
+            TmuxCommand::attach_session("se\x00ss").as_str(),
+            "attach-session -t 'sess'"
+        );
+    }
+
+    /// Inside the quoted region every single-quote must be part of the `'\''`
+    /// idiom — a bare one would close the region early and expose the remainder
+    /// of the argument to tmux as further words.
+    #[test]
+    fn quoted_body_contains_no_bare_quote() {
+        for input in [
+            "plain",
+            "it's",
+            "''",
+            "a'b'c",
+            "'",
+            "\x00'",
+            "a'; kill-server",
+        ] {
+            let quoted = quote(input);
+            let body = quoted
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{input:?} produced an unwrapped argument: {quoted}"));
+            assert!(
+                !body.replace("'\\''", "").contains('\''),
+                "bare quote survived for {input:?}: {quoted}"
+            );
+        }
+    }
+}

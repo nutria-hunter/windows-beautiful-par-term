@@ -1,0 +1,21 @@
+{
+  "renderer": "NVIDIA GeForce RTX 5090/PCIe/SSE2",
+  "resolution": [
+    3840,
+    2160
+  ],
+  "overrides": {},
+  "results": {
+    "tilted-spiral": {
+      "gpu_ms_median": 0.31630400000000003,
+      "gpu_ms_p95": 0.3189264,
+      "gpu_ms_min": 0.314016,
+      "black_fraction": 0.684482421875,
+      "luma_median": 0.0,
+      "luma_p95": 43.3036,
+      "luma_p99": 72.6848,
+      "luma_max": 254.85559999999998,
+      "brightness_zero_is_black": true
+    }
+  }
+}
