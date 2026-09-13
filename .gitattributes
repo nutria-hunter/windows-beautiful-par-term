@@ -1,0 +1,35 @@
+# 줄바꿈 정책.
+#
+# `source/** text eol=lf` 같은 포괄 규칙은 쓰지 않습니다. 그것은 PNG/TTF 같은 바이너리까지
+# "텍스트"로 취급해서 체크인 시 CRLF 를 LF 로 바꿔버리고, 바이너리 안에 우연히 들어 있는
+# 0x0D 0x0A 를 지워 파일을 손상시킵니다. (실제로 한 번 `git add --renormalize` 가 PNG 91개와
+# TTF 5개를 변환 대상으로 잡아냈습니다.)
+#
+# `text=auto` 는 내용에 NUL 바이트가 있으면 바이너리로 판단해 건너뜁니다. 그 위에 확장자를
+# 명시해 자동 감지가 놓칠 수 있는 경우까지 막습니다.
+
+* text=auto
+
+# 바이너리: 절대 변환하지 않습니다.
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+
+# patch 는 LF 로 고정합니다. CRLF 가 섞이면 `git am patches/*.patch` 가 실패합니다.
+*.patch -text
+
+# 소스 텍스트는 LF 로 고정합니다 (Rust 워크스페이스 기준).
+*.rs text eol=lf
+*.toml text eol=lf
+*.glsl text eol=lf
+*.wgsl text eol=lf
