@@ -102,6 +102,34 @@ cargo build --release
 
 ---
 
+### 배경 셰이더 (`config/shaders/tilted-spiral.glsl`)
+
+Kanagawa Wave 테마 위에 나선은하를 그리는 커스텀 셰이더입니다. 현재 **v3.6.0**
+("Continuum – Pearl Spiral").
+
+- **은하핵**: 중심에 2px 픽셀 별 하나가 고정되어 있고(설정에서 크기 조절), 그 주변은
+  spheroid 프레임으로 측정한 부피감 있는 코어입니다.
+- **별**: 원판 별은 3px 격자(5×5 탐색), 하늘 별은 3개 레이어(23 / 47 / 16px). 전부 **각진 픽셀
+  사각형**이라 안티앨리어싱이 없습니다.
+- **반짝임**: 모든 별에 적용되며, 별마다 **주기(1.2~3.9초) · 진폭(40~80%) · 위상이 독립**입니다
+  (인접 별 상관계수 -0.004).
+- **조절**: 설정 UI에 슬라이더 **22개**가 노출됩니다 — `Galaxy Scale`, `Star Density`,
+  `Sky Star Density`, `Star Cell (px)`, `Twinkle`, `Nucleus Star (px)`, `Core Gain` 등.
+  `Twinkle`은 반짝임 전체 진폭의 **마스터 배율**이라 과하면 0.5 정도로 낮추면 됩니다.
+- **성능**: 4K에서 **0.407ms/프레임** (60fps 예산의 **2.4%**).
+
+셰이더를 고쳐 쓰려면 `%APPDATA%\par-term\shaders\tilted-spiral.glsl` 을 직접 수정하고
+par-term에서 새 창을 열면 됩니다(파일 변경을 자동 감지합니다). 문법 확인은:
+
+```powershell
+& "$env:USERPROFILE\par-term\par-term.exe" shader-lint "$env:APPDATA\par-term\shaders\tilted-spiral.glsl"
+```
+
+`tools/` 의 `shader_shot.ps1`(실제 창 캡처), `shader_series.ps1`(반짝임 시계열),
+`render_check.py`(4K GPU 시간)로 육안·수치 검증을 할 수 있습니다.
+
+---
+
 ## 5. 검증 상태 (정직한 기록)
 
 | 항목 | 상태 | 근거 |
@@ -112,6 +140,7 @@ cargo build --release
 | 회귀 테스트 | ✅ 통과 | `par-term-input` 26 · `par-term-terminal` 19 · `par-term-render` 98, 실패 0 |
 | **한글 IME** | ✅ **검증 (실제 IME로 확인)** | 조합이 정상 동작합니다. 터미널이 받은 값이 완성형 음절입니다: `commit "호" (0xD638)`, `commit "안" (0xC548)`, `commit "녕" (0xB155)`. 조합을 거쳐 확정된 음절이 그대로 전달되는 것을 로그로 확인 — `U+AC00~U+D7A3` 영역 |
 | clippy CI 게이트 | ✅ 통과 | `cargo clippy --all-targets --all-features -- -D warnings` 기준. `clippy::doc_lazy_continuation` 1건과 Windows에서만 나오던 upstream `dead_code` 1건을 수정 |
+| 배경 셰이더 | ✅ 검증 | 4K 0.407ms/프레임, 빈 배경 순검정(0.0), 반짝임 주기·진폭을 코드 이식과 시계열 캡처 양쪽으로 확인 |
 
 한글 입력이 여전히 안 되면 `%TEMP%\par_term_debug.log`에서 `IME:` 로 시작하는 줄을 보세요.
 `--log-level info`로 실행하면 됩니다:
