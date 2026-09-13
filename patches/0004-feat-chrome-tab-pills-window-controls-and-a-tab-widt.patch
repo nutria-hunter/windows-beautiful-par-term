@@ -1,7 +1,7 @@
 From de9cd29b88e109484e3562b45a7aeb39f9d39e21 Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 09:11:57 +0900
-Subject: [PATCH 4/4] feat(chrome): tab pills, window controls and a tab width
+Subject: [PATCH 4/5] feat(chrome): tab pills, window controls and a tab width
  cap
 
 Bring the tab strip and window frame in line with the Kanagawa Wave look:

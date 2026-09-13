@@ -1,0 +1,461 @@
+From 6e022d8b89353b918339ac30ce0b1a28c6724666 Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 09:50:36 +0900
+Subject: [PATCH 5/5] feat(input): handle IME composition so
+ Korean/Japanese/Chinese can be typed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+par-term calls `set_ime_allowed(true)` but the event loop had no `WindowEvent::Ime` arm
+at all, so composed text had no path to a PTY: the IME consumes the physical keys while
+composing and par-term builds characters from physical keys, so typing Korean did
+nothing - not even the physical letters arrived.
+
+Add the missing handler:
+
+* `Ime::Commit(text)` writes the text to the focused pane (or the tab terminal) the same
+  way key input does. Not `paste_text`: that goes through `TerminalManager::paste`, which
+  applies paste semantics (bracketed paste, newline handling) that typing must not have.
+* `Ime::Preedit(text, cursor)` is kept in a new `ImeState` and drawn inline on the cursor
+  cell, since composing text is not part of the grid and the child knows nothing about it
+  until the commit.
+* `set_ime_cursor_area` follows the composing caret so the candidate window stays put, and
+  a modal egui UI keeps ownership of text input exactly as the key path does.
+
+Verified with a real Korean IME: the log shows composed syllables arriving
+(`commit "안" (0xC548)`, `commit "녕" (0xB155)`). Note that consonant-only runs such as
+ㅎㅇㅎㅇ commit one jamo at a time (0x314E, 0x3147) - that is correct, not a bug, and
+reading those as "composition is broken" is an easy mistake.
+
+Also fix two lint failures that make the CI gate (`cargo clippy --all-targets
+--all-features -- -D warnings`) fail:
+
+* `par-term-input`: a doc list item ran into the next paragraph without a blank line
+  (`clippy::doc_lazy_continuation`).
+* `src/platform/notify.rs`: `ClickChannel::sender` is unread on Windows because every
+  definition of `click_sender()` is Unix/macOS-only. Allow it there rather than leave the
+  Windows clippy gate red.
+---
+ par-term-input/src/key_encoding.rs            |   1 +
+ .../window_state_impl/handle_window_event.rs  |   7 +
+ src/app/input_events/ime.rs                   | 122 ++++++++++++++++++
+ src/app/input_events/mod.rs                   |   1 +
+ src/app/render_pipeline/egui_overlays.rs      |  53 ++++++++
+ src/app/render_pipeline/egui_submit.rs        |  53 ++++++++
+ src/app/window_state/ime_state.rs             |  41 ++++++
+ src/app/window_state/impl_init.rs             |   2 +
+ src/app/window_state/mod.rs                   |   5 +
+ src/platform/notify.rs                        |   4 +
+ 10 files changed, 289 insertions(+)
+ create mode 100644 src/app/input_events/ime.rs
+ create mode 100644 src/app/window_state/ime_state.rs
+
+diff --git a/par-term-input/src/key_encoding.rs b/par-term-input/src/key_encoding.rs
+index 9dab5da..ffa5ec0 100644
+--- a/par-term-input/src/key_encoding.rs
++++ b/par-term-input/src/key_encoding.rs
+@@ -360,6 +360,7 @@ impl InputHandler {
+     /// - 2 = Shift
+     /// - 3 = Alt
+     /// - 4 = Shift+Alt
++    ///
+     /// Convert a [`KeyInput`] to terminal input bytes with modifyOtherKeys support.
+     ///
+     /// Kept for callers that do not track the Kitty keyboard protocol: it is the same
+diff --git a/src/app/handler/window_state_impl/handle_window_event.rs b/src/app/handler/window_state_impl/handle_window_event.rs
+index 4ae00d1..c8b7686 100644
+--- a/src/app/handler/window_state_impl/handle_window_event.rs
++++ b/src/app/handler/window_state_impl/handle_window_event.rs
+@@ -303,6 +303,13 @@ impl WindowState {
+                 self.handle_key_event(event, event_loop);
+             }
+ 
++            // Composed text (Korean/Japanese/Chinese) never reaches the key path: the IME
++            // consumes the physical keys and reports text instead. Without this arm the text
++            // was dropped and typing Korean did nothing at all.
++            WindowEvent::Ime(ime) => {
++                self.handle_ime_event(ime);
++            }
++
+             WindowEvent::ModifiersChanged(modifiers) => {
+                 self.input_handler.update_modifiers(modifiers);
+             }
+diff --git a/src/app/input_events/ime.rs b/src/app/input_events/ime.rs
+new file mode 100644
+index 0000000..c8e1d06
+--- /dev/null
++++ b/src/app/input_events/ime.rs
+@@ -0,0 +1,122 @@
++//! IME (input method) event handling.
++//!
++//! Composition is a separate path from `key_handler`: the IME consumes the physical keys and
++//! reports text instead, so composed Korean/Japanese/Chinese can only reach a child from
++//! `Ime::Commit`. See `window_state::ime_state` for what the missing handler did.
++
++use winit::dpi::{PhysicalPosition, PhysicalSize};
++use winit::event::Ime;
++
++impl crate::app::window_state::WindowState {
++    /// Handle a `WindowEvent::Ime`.
++    ///
++    /// `Enabled`/`Disabled` only track state, `Preedit` is what gets drawn inline at the
++    /// cursor, and `Commit` is the only variant carrying finished text - it is the reason this
++    /// handler exists at all.
++    pub(crate) fn handle_ime_event(&mut self, event: Ime) {
++        match event {
++            Ime::Enabled => {
++                self.ime.enabled = true;
++                log::info!("IME: enabled");
++                self.publish_ime_cursor_area();
++            }
++            Ime::Disabled => {
++                self.ime.enabled = false;
++                self.ime.clear_preedit();
++                self.ime.published_cell = None;
++                log::info!("IME: disabled");
++                self.request_redraw();
++            }
++            Ime::Preedit(text, cursor) => {
++                self.ime.preedit = text;
++                self.ime.preedit_cursor = cursor;
++                // Chatty - one per keystroke while composing - so debug, not info.
++                crate::debug_info!("IME", "preedit: {:?}", self.ime.preedit);
++                self.publish_ime_cursor_area();
++                // The preedit is an overlay on top of the grid, so the frame has to be rebuilt
++                // for it to appear or disappear.
++                self.request_redraw();
++            }
++            Ime::Commit(text) => {
++                // winit sends an empty `Preedit` immediately before a commit, but clearing here
++                // too keeps the overlay correct if that ever changes.
++                let was_composing = self.ime.is_composing();
++                self.ime.clear_preedit();
++                self.publish_ime_cursor_area();
++                // info level: this is the line that proves composed input reached par-term at
++                // all, and it is the only evidence available when the composed glyphs render
++                // wrongly in some application.
++                log::info!("IME: commit {:?} ({} bytes)", text, text.len());
++                // A modal egui UI owns text input while it is up, and `handle_window_event`
++                // blocks the key path for it. Match that rather than typing into a terminal the
++                // user cannot see.
++                if !text.is_empty() && !self.any_modal_ui_visible() {
++                    self.send_ime_text(&text);
++                }
++                if was_composing || !text.is_empty() {
++                    self.request_redraw();
++                }
++            }
++        }
++    }
++
++    /// Write composed text to the terminal the keyboard would target.
++    ///
++    /// Deliberately not `paste_text`: that path goes through `TerminalManager::paste`, which
++    /// applies paste semantics (bracketed paste, trailing newline handling). Typing a composed
++    /// syllable is not a paste, so the bytes go out the way key input sends them.
++    fn send_ime_text(&mut self, text: &str) {
++        let Some(tab) = self.tab_manager.active_tab() else {
++            return;
++        };
++        // Same target as key input: the focused pane when split, otherwise the tab terminal.
++        let terminal = tab
++            .pane_manager
++            .as_ref()
++            .and_then(|pm| pm.focused_pane())
++            .map(|pane| std::sync::Arc::clone(&pane.terminal))
++            .unwrap_or_else(|| std::sync::Arc::clone(&tab.terminal));
++        let bytes = text.as_bytes().to_vec();
++        crate::debug_info!("IME", "composed text to PTY: {} bytes", bytes.len());
++        // read() not write(), for the same reason the key handler documents: holding the outer
++        // RwLock exclusively while blocked on the inner mutex starves the refresh task
++        // (try_read) and the render pipeline (try_write) of their generation checks.
++        self.runtime.spawn(async move {
++            let term = terminal.read().await;
++            if let Err(e) = term.write(&bytes) {
++                crate::debug_error!("IME", "PTY write failed (composed text): {e}");
++            }
++        });
++    }
++
++    /// Keep the IME candidate window next to the composing caret.
++    ///
++    /// Only called on IME events, so the position is re-published as the caret moves through a
++    /// composition; `published_cell` keeps repeat publishes of the same cell off the wire.
++    fn publish_ime_cursor_area(&mut self) {
++        if !self.ime.enabled {
++            return;
++        }
++        let Some(cell) = self
++            .tab_manager
++            .active_tab()
++            .and_then(|tab| tab.active_cache().cursor_pos)
++        else {
++            return;
++        };
++        if self.ime.published_cell == Some(cell) {
++            return;
++        }
++        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_ref()) else {
++            return;
++        };
++        let (col, row) = cell;
++        let x = renderer.content_offset_x() + col as f32 * renderer.cell_width();
++        let y = renderer.content_offset_y() + row as f32 * renderer.cell_height();
++        window.set_ime_cursor_area(
++            PhysicalPosition::new(x, y),
++            PhysicalSize::new(renderer.cell_width(), renderer.cell_height()),
++        );
++        self.ime.published_cell = Some(cell);
++    }
++}
+diff --git a/src/app/input_events/mod.rs b/src/app/input_events/mod.rs
+index 0ef8d85..46eecc7 100644
+--- a/src/app/input_events/mod.rs
++++ b/src/app/input_events/mod.rs
+@@ -21,6 +21,7 @@
+ 
+ #[cfg(test)]
+ mod dispatch_tests;
++mod ime;
+ mod key_handler;
+ mod keybinding_actions;
+ mod keybinding_display_actions;
+diff --git a/src/app/render_pipeline/egui_overlays.rs b/src/app/render_pipeline/egui_overlays.rs
+index 73e95f2..fab2bb1 100644
+--- a/src/app/render_pipeline/egui_overlays.rs
++++ b/src/app/render_pipeline/egui_overlays.rs
+@@ -81,6 +81,59 @@ pub(super) fn render_resize_overlay(
+         });
+ }
+ 
++/// Draw the IME preedit inline at the terminal cursor.
++///
++/// Composing text is not part of the grid - the child learns nothing about it until the IME
++/// commits - so it is painted over the cursor cell, which is how a native terminal shows a
++/// syllable being composed. The caller passes the renderer's physical-pixel metrics while egui
++/// works in logical points, hence the `scale` division.
++#[allow(clippy::too_many_arguments)] // Each value comes from a different owner (IME state, terminal cache, renderer sizing, theme); a struct for one call site would be worse
++pub(super) fn render_ime_preedit(
++    ctx: &egui::Context,
++    preedit: &str,
++    cell: Option<(usize, usize)>,
++    cell_width_px: f32,
++    cell_height_px: f32,
++    content_offset_px: (f32, f32),
++    scale: f32,
++    fg: egui::Color32,
++    bg: egui::Color32,
++) {
++    let Some((col, row)) = cell else {
++        return;
++    };
++    if preedit.is_empty() || scale <= 0.0 || cell_width_px <= 0.0 || cell_height_px <= 0.0 {
++        return;
++    }
++    let pos = egui::pos2(
++        (content_offset_px.0 + col as f32 * cell_width_px) / scale,
++        (content_offset_px.1 + row as f32 * cell_height_px) / scale,
++    );
++    let font = egui::FontId::monospace(cell_height_px / scale);
++    egui::Area::new(egui::Id::new("ime_preedit"))
++        .order(egui::Order::Foreground)
++        .fixed_pos(pos)
++        .show(ctx, |ui| {
++            let galley = ui.painter().layout_no_wrap(preedit.to_owned(), font, fg);
++            // At least one cell wide, so an empty preedit still shows where composition is.
++            let (rect, _) = ui.allocate_exact_size(
++                egui::vec2(galley.size().x.max(cell_width_px / scale), galley.size().y),
++                egui::Sense::hover(),
++            );
++            ui.painter().rect_filled(rect, 0.0, bg);
++            ui.painter().galley(rect.min, galley, fg);
++            // Underline, so a composition is distinguishable from committed text.
++            ui.painter().rect_filled(
++                egui::Rect::from_min_size(
++                    egui::pos2(rect.left(), rect.bottom() - 1.0),
++                    egui::vec2(rect.width(), 1.0),
++                ),
++                0.0,
++                fg,
++            );
++        });
++}
++
+ /// Render the toast notification overlay (top-center) for transient status messages.
+ ///
+ /// Only renders when `message` is `Some`.
+diff --git a/src/app/render_pipeline/egui_submit.rs b/src/app/render_pipeline/egui_submit.rs
+index 1e886c5..bbc74c3 100644
+--- a/src/app/render_pipeline/egui_submit.rs
++++ b/src/app/render_pipeline/egui_submit.rs
+@@ -161,6 +161,44 @@ impl WindowState {
+             _ => None,
+         };
+ 
++        // IME preedit overlay inputs, hoisted for the same reason as the demote snapshot above:
++        // the egui closure cannot read the renderer or the tab manager. Skipped entirely when no
++        // composition is in progress, so the common path costs one bool.
++        let ime_active = self.ime.is_composing();
++        let ime_preedit = if ime_active {
++            self.ime.preedit.clone()
++        } else {
++            String::new()
++        };
++        let ime_cell = if ime_active {
++            self.tab_manager
++                .active_tab()
++                .and_then(|tab| tab.active_cache().cursor_pos)
++        } else {
++            None
++        };
++        let ime_metrics = if ime_active {
++            self.renderer.as_ref().map(|renderer| {
++                (
++                    renderer.cell_width(),
++                    renderer.cell_height(),
++                    (renderer.content_offset_x(), renderer.content_offset_y()),
++                    renderer.scale_factor(),
++                )
++            })
++        } else {
++            None
++        };
++        let ime_colors = if ime_active {
++            let theme = self.config.load().load_theme();
++            (
++                egui::Color32::from_rgb(theme.foreground.r, theme.foreground.g, theme.foreground.b),
++                egui::Color32::from_rgb(theme.background.r, theme.background.g, theme.background.b),
++            )
++        } else {
++            (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
++        };
++
+         let result = if let Some(window) = self.window.as_ref() {
+             if let (Some(egui_ctx), Some(egui_state)) = (&self.egui.ctx, &mut self.egui.state) {
+                 let mut raw_input = egui_state.take_egui_input(window);
+@@ -193,6 +231,21 @@ impl WindowState {
+                         self.overlay_state.resize_dimensions,
+                     );
+ 
++                    // IME preedit, drawn inline on the cursor cell while a composition is open.
++                    if let Some((cell_width, cell_height, content_offset, scale)) = ime_metrics {
++                        egui_overlays::render_ime_preedit(
++                            ctx,
++                            &ime_preedit,
++                            ime_cell,
++                            cell_width,
++                            cell_height,
++                            content_offset,
++                            scale,
++                            ime_colors.0,
++                            ime_colors.1,
++                        );
++                    }
++
+                     // Copy mode status bar overlay (bottom-left)
+                     {
+                         let mode_text = if self.copy_mode.is_searching {
+diff --git a/src/app/window_state/ime_state.rs b/src/app/window_state/ime_state.rs
+new file mode 100644
+index 0000000..8de8f6c
+--- /dev/null
++++ b/src/app/window_state/ime_state.rs
+@@ -0,0 +1,41 @@
++//! IME (input method) state for a window.
++//!
++//! Extracted from `WindowState` as part of the God Object decomposition (ARC-001).
++//!
++//! par-term asks the platform for IME events (`set_ime_allowed(true)` in `impl_init`) and
++//! winit then reports composition as `WindowEvent::Ime`. The event loop had no arm for that
++//! variant, so the composed text was discarded before it could reach a PTY: par-term builds
++//! character input from physical keys and escape sequences, and the IME consumes those keys
++//! while it is composing, so nothing else could carry the text. Korean input therefore did
++//! nothing at all - not even the physical letters.
++
++/// Byte range of the composing caret inside `preedit`, as reported by the IME.
++pub(crate) type PreeditCursor = Option<(usize, usize)>;
++
++/// IME composition state for this window.
++#[derive(Default)]
++pub(crate) struct ImeState {
++    /// The platform IME told us it is active (winit's `Ime::Enabled`).
++    pub(crate) enabled: bool,
++    /// Text currently being composed. Drawn inline at the terminal cursor, and empty when no
++    /// composition is in progress.
++    pub(crate) preedit: String,
++    /// Caret inside `preedit`, byte-indexed. `None` hides the composing caret.
++    pub(crate) preedit_cursor: PreeditCursor,
++    /// Cell the IME caret area was last published for, so the candidate window is only
++    /// repositioned when the caret actually moves.
++    pub(crate) published_cell: Option<(usize, usize)>,
++}
++
++impl ImeState {
++    /// Whether there is preedit text to draw.
++    pub(crate) fn is_composing(&self) -> bool {
++        !self.preedit.is_empty()
++    }
++
++    /// Forget any composition. Called on commit, and when the IME is disabled.
++    pub(crate) fn clear_preedit(&mut self) {
++        self.preedit.clear();
++        self.preedit_cursor = None;
++    }
++}
+diff --git a/src/app/window_state/impl_init.rs b/src/app/window_state/impl_init.rs
+index b7d4400..d067318 100644
+--- a/src/app/window_state/impl_init.rs
++++ b/src/app/window_state/impl_init.rs
+@@ -132,6 +132,8 @@ impl WindowState {
+             pty_grid_candidate: None,
+             pty_grid_suspect: false,
+ 
++            ime: super::ime_state::ImeState::default(),
++
+             last_workflow_context: std::sync::Arc::new(std::sync::Mutex::new(None)),
+         }
+     }
+diff --git a/src/app/window_state/mod.rs b/src/app/window_state/mod.rs
+index d8b3399..659efaf 100644
+--- a/src/app/window_state/mod.rs
++++ b/src/app/window_state/mod.rs
+@@ -69,6 +69,7 @@ pub(crate) mod debug_state;
+ mod egui_state;
+ mod focus_state;
+ pub(crate) mod frame_state;
++mod ime_state;
+ mod impl_agent;
+ mod impl_helpers;
+ mod impl_init;
+@@ -95,6 +96,7 @@ pub(crate) use crate::app::tmux_handler::tmux_state::TmuxState;
+ pub(crate) use automation_target::AutomationTarget;
+ pub(crate) use egui_state::EguiState;
+ pub(crate) use focus_state::FocusState;
++pub(crate) use ime_state::ImeState;
+ pub(crate) use notifications::NotificationClickState;
+ pub(crate) use overlay_state::OverlayState;
+ pub(crate) use render_loop_state::{ConfigSaveState, RenderLoopState};
+@@ -289,4 +291,7 @@ pub struct WindowState {
+     /// Cleared by the next real `WindowEvent::Resized`, which is the point where the
+     /// grid is derived from a size the user actually asked for.
+     pub(crate) pty_grid_suspect: bool,
++
++    /// IME composition state (preedit + caret), fed by `WindowEvent::Ime`.
++    pub(crate) ime: ImeState,
+ }
+diff --git a/src/platform/notify.rs b/src/platform/notify.rs
+index ea7f618..72fa13f 100644
+--- a/src/platform/notify.rs
++++ b/src/platform/notify.rs
+@@ -214,6 +214,10 @@ fn fnv1a_u32(s: &str) -> u32 {
+ 
+ /// Global click-token channel shared by all notification backends.
+ struct ClickChannel {
++    /// Only read by `click_sender`, which is compiled for macOS and other Unix targets only.
++    /// On Windows the channel is still created and drained, but nothing can send to it, so the
++    /// field is legitimately unread there and `dead_code` would fail `clippy -D warnings`.
++    #[cfg_attr(windows, allow(dead_code))]
+     sender: mpsc::Sender<u64>,
+     receiver: Mutex<mpsc::Receiver<u64>>,
+ }

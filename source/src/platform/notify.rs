@@ -214,6 +214,10 @@ fn fnv1a_u32(s: &str) -> u32 {
 
 /// Global click-token channel shared by all notification backends.
 struct ClickChannel {
+    /// Only read by `click_sender`, which is compiled for macOS and other Unix targets only.
+    /// On Windows the channel is still created and drained, but nothing can send to it, so the
+    /// field is legitimately unread there and `dead_code` would fail `clippy -D warnings`.
+    #[cfg_attr(windows, allow(dead_code))]
     sender: mpsc::Sender<u64>,
     receiver: Mutex<mpsc::Receiver<u64>>,
 }

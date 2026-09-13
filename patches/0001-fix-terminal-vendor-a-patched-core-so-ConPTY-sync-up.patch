@@ -1,7 +1,7 @@
 From 037dabf30585b0819854251fbbdb470446573836 Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 09:11:28 +0900
-Subject: [PATCH 1/4] fix(terminal): vendor a patched core so ConPTY sync
+Subject: [PATCH 1/5] fix(terminal): vendor a patched core so ConPTY sync
  updates always flush
 
 pi's TUI was receiving keystrokes but never redrawing them, which made the terminal

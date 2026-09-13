@@ -1,7 +1,7 @@
 From 0c6763424e791fab07d592ab9c759ac2ccc704e2 Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 09:11:37 +0900
-Subject: [PATCH 2/4] feat(input): implement the kitty keyboard protocol
+Subject: [PATCH 2/5] feat(input): implement the kitty keyboard protocol
  encoder
 
 pi requires the kitty keyboard protocol (its docs: "Pi uses the Kitty keyboard

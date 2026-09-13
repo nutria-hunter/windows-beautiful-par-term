@@ -249,7 +249,60 @@ scrollbar_height = (viewport_ratio * track_pixel_height).max(MIN_SCROLLBAR_THUMB
 
 ---
 
-## 5. 기각된 가설 (다시 조사하지 말 것)
+## 5. 한글(IME) 입력 — ✅ 해결 · 검증
+
+### 증상과 원인
+
+par-term 창에서 **한글이 아예 입력되지 않았다**(영문 알파벳조차 들어가지 않음).
+
+원인은 `impl_init.rs`가 `window.set_ime_allowed(true)`로 플랫폼 IME를 켜놓고도,
+이벤트 루프에 **`WindowEvent::Ime` 처리 arm이 없었던 것**이다(17개 arm 중 누락).
+IME가 조합 중에는 물리 키를 소비하므로 키 경로에서도 문자가 나오지 않아, 글자가
+**어떤 경로로도 PTY에 도달할 수 없었다.**
+
+### 구현
+
+| 위치 | 내용 |
+| --- | --- |
+| `src/app/input_events/ime.rs` (신규) | `handle_ime_event` — `Enabled`/`Disabled`/`Preedit`/`Commit` |
+| `src/app/window_state/ime_state.rs` (신규) | `ImeState` (조합 문자열·커서·후보창 위치 캐시) |
+| `handle_window_event.rs` | `WindowEvent::Ime(ime) => self.handle_ime_event(ime)` |
+| `egui_overlays.rs` + `egui_submit.rs` | `render_ime_preedit` — 조합 중 문자열을 커서 셀 위에 인라인 표시(밑줄 포함) |
+| `publish_ime_cursor_area` | `set_ime_cursor_area`로 후보창을 커서에 붙임 |
+
+**중요**: `Commit`은 `paste_text`를 쓰지 않고 **plain write**로 보낸다. `paste_text`는
+`TerminalManager::paste`로 가서 붙여넣기 의미론(브래킷 붙여넣기, 개행 처리)이 붙기 때문에
+"타이핑"에 부적합하다.
+
+### 검증 (실제 한국어 IME)
+
+로그에 **완성형 음절**이 찍히는 것으로 확인했다:
+
+```text
+IME: commit "호" (0xD638)
+IME: commit "안" (0xC548)
+IME: commit "녕" (0xB155)
+```
+
+`U+AC00~U+D7A3`(완성형 음절) 영역이면 조합이 정상이다. 화면 확인도 일치했다.
+
+### ⚠️ 진단 함정 (이걸 모르면 정상 동작을 버그로 오판한다)
+
+**자음만 이어서 치면 자음마다 `commit`되는 것이 정상이다.** 예를 들어 `ㅎㅇㅎㅇ`을 치면
+`commit "ㅎ" (0x314e)`, `commit "ㅇ" (0x3147)` … 처럼 **호환 자모(U+3131~U+318E)** 가
+따로 커밋된다. 조합할 모음이 없기 때문이다. 이 로그만 보고 "조합이 안 된다"고 단정했다가
+오판한 적이 있다 — 판정은 반드시 **모음을 포함한 음절**(예: 안녕)로 할 것.
+
+### 대안 검증 방법 (자동화가 막힌 지점)
+
+Imm32로 조합 문자열을 주입하는 자동 검증은 **Windows가 백그라운드 프로세스의 포그라운드
+전환을 막아서** 실패한다(`SetForegroundWindow` 후에도 `activated=False`). TSF 기반 IME는
+활성 창에만 HIMC를 만들기 때문에 `ImmGetContext`가 0을 반환한다. 스크립트로 밀어붙이지 말고
+사람이 직접 치게 할 것(이번에도 그렇게 해서 검증했다).
+
+---
+
+## 6. 기각된 가설 (다시 조사하지 말 것)
 
 | 가설 | 기각 근거 |
 | --- | --- |
@@ -260,10 +313,11 @@ scrollbar_height = (viewport_ratio * track_pixel_height).max(MIN_SCROLLBAR_THUMB
 | 최소화 패닉 = egui/의존성 내부 | `src/` 스크롤바 산술이 정확히 일치 (§3) |
 | pi 입력창 문제 = 그리드/리사이즈 | 행 수 부족(24행)이 원인. 39행으로 키우면 정상 표시 |
 | 탭 아이콘 = 프로필 아이콘/벨 이모지 | 사용자 확인 결과 탭 자체의 가로 폭 |
+| 한글 = 자모 단위로 들어가서 조합이 안 된다 | **오판**. 초성만 친 경우(ㅎㅇㅎㅇ)는 자음마다 확정되는 것이 정상. 모음을 포함해 치면 완성형 음절이 커밋된다 |
 
 ---
 
-## 6. 남은 위험 · 다음 작업
+## 7. 남은 위험 · 다음 작업
 
 | 항목 | 내용 |
 | --- | --- |

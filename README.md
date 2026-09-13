@@ -72,7 +72,7 @@ cargo build --release
 - **기존 배포본과 프레임 타이밍을 비교할 때는 `release-fat`을 쓰세요.** 최적화 설정이 다르면
   비교가 무의미해집니다.
 
-`patches/` 에는 upstream v0.45.0 위에 올린 커밋 4개가 patch 파일로 들어 있습니다
+`patches/` 에는 upstream v0.45.0 위에 올린 커밋 5개가 patch 파일로 들어 있습니다
 (`git am patches/*.patch`). 소스 트리를 통째로 받았다면 필요 없습니다.
 
 ---
@@ -110,8 +110,8 @@ cargo build --release
 | 최소화 → 복원 생존 | ✅ 검증 | 최소화 4초 후에도 프로세스 생존, 복원 후 정상 |
 | 1행 그리드 미전달 | ✅ 검증 | 자식이 보고한 크기 이력이 `79x24 ↔ 80x24`뿐, `rows<=1` 이벤트 0건 |
 | 회귀 테스트 | ✅ 통과 | `par-term-input` 26 · `par-term-terminal` 19 · `par-term-render` 98, 실패 0 |
-| **한글 IME** | ⚠️ **구현 완료, 실제 IME 최종 확인 필요** | winit 0.30.13의 `WindowEvent::Ime` 계약(`GCS_RESULTSTR` → `Commit`, `GCS_COMPSTR` → `Preedit`)에 맞춰 구현. 자동 합성 검증은 Windows가 백그라운드 프로세스의 포그라운드 전환을 막아 실패했으므로 **실제로 한글을 쳐서 확인해야 합니다** |
-| clippy CI 게이트 | ⚠️ 재확인 필요 | `clippy::doc_lazy_continuation` 1건은 수정했으나 전체 게이트 재실행 결과는 미기록 |
+| **한글 IME** | ✅ **검증 (실제 IME로 확인)** | 조합이 정상 동작합니다. 터미널이 받은 값이 완성형 음절입니다: `commit "호" (0xD638)`, `commit "안" (0xC548)`, `commit "녕" (0xB155)`. 조합을 거쳐 확정된 음절이 그대로 전달되는 것을 로그로 확인 — `U+AC00~U+D7A3` 영역 |
+| clippy CI 게이트 | ✅ 통과 | `cargo clippy --all-targets --all-features -- -D warnings` 기준. `clippy::doc_lazy_continuation` 1건과 Windows에서만 나오던 upstream `dead_code` 1건을 수정 |
 
 한글 입력이 여전히 안 되면 `%TEMP%\par_term_debug.log`에서 `IME:` 로 시작하는 줄을 보세요.
 `--log-level info`로 실행하면 됩니다:
@@ -120,7 +120,9 @@ cargo build --release
 & "$env:USERPROFILE\par-term\par-term.exe" --log-level info
 ```
 
-- `IME: commit "한" (3 bytes)` 가 보이면 par-term까지는 도달한 것입니다 (문제는 자식 쪽).
+- `IME: commit "안" (3 bytes)` 처럼 **완성형 음절**(U+AC00~U+D7A3)이 보이면 정상입니다.
+- `IME: commit "ㅎ"` 처럼 **호환 자모**(U+3131~U+318E)만 보인다면, 그 순간 초성만 치고 있었을 가능성이 큽니다.
+  자음만 이어서 치면(예: ㅎㅇㅎㅇ) 조합할 모음이 없어 자음마다 확정되는 것이 **정상 동작**입니다.
 - 그 줄조차 없으면 IME 이벤트가 창에 도달하지 않은 것입니다 (Windows IME/포커스 문제).
 
 ---
@@ -149,7 +151,7 @@ cargo build --release
 release/       패치된 실행파일 + 원본 0.45.0 백업
 config/        config.yaml + 커스텀 셰이더
 source/        전체 소스 트리 (빌드 산출물·git 이력 제외)
-patches/       upstream 위에 올린 커밋 4개 (git am 용)
+patches/       upstream 위에 올린 커밋 5개 (git am 용)
 tools/         개발/검증 스크립트 (창 캡처, 입력 프로브, 셰이더 성능 측정 등)
 docs/          작업 기록: 미해결 문제 핸드오프, 브리핑, 셰이더 개선 이력
 galaxy-work/   셰이더 제작 작업장 (shaders/ 작업본, work/ 스크립트, outputs/ 렌더 결과)

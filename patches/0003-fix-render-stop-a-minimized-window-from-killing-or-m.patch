@@ -1,7 +1,7 @@
 From 56829bc6273480d1038949c29ac2a63b0319a4b6 Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sun, 13 Sep 2026 09:11:51 +0900
-Subject: [PATCH 3/4] fix(render): stop a minimized window from killing or
+Subject: [PATCH 3/5] fix(render): stop a minimized window from killing or
  mis-sizing the child
 
 Minimizing killed the process with an `f32::clamp` whose min exceeded its max, and
