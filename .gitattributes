@@ -33,3 +33,6 @@
 *.toml text eol=lf
 *.glsl text eol=lf
 *.wgsl text eol=lf
+
+# 셰이더는 바이트 그대로 보관(설치본과 해시 대조용) — 위의 text eol=lf 규칙을 덮어씁니다.
+*.glsl -text
