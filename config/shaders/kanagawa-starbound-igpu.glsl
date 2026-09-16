@@ -1,5 +1,5 @@
 /*! par-term shader metadata
-name: Kanagawa - Starbound
+name: Kanagawa - Starbound iGPU Eco
 author: Codex
 description: Flat retro space mural, ink-blue nebula banks, cut-paper planets and quiet pixel stars. Texture-free; banded day/night lighting with a real terminator, restrained lit-limb atmospheres, ring shadows, coast-hugging city lights, eclipses, comets, depth-layered star drifts, breathing nebula banks and fleets that range from a lone squadron to a grand fleet warping in at a distance.
 version: 6.1.0
@@ -1704,7 +1704,8 @@ vec3 shipEvent(vec2 fragCoord, vec3 bg) {
     else if(cls<1.5) count=4+int(floor(hash21(vec2(seed,17.0))*3.99));
     else count=12+int(floor(hash21(vec2(seed,17.0))*6.99));
     // Far-to-near order is stable. Each craft has its own pose and entry/exit point.
-    for(int j=0;j<18;j++) {
+    count=min(count,4);
+    for(int j=0;j<4;j++) {
         if(j>=count) continue;
         float id=float(j);
         // Grand fleets stagger a little wider, so the formation unfolds instead of popping at once.
@@ -1884,53 +1885,21 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
     vec2 p = (pixel+0.5)/size.y;
     vec2 screen=fragCoord/iResolution.y;
     float aspect = size.x/size.y;
-    // Ink banks cross the complete canvas, leaving a quiet middle — and they are alive. The field
-    // crawls in whole logical pixels, its features breathe in size, its boundary waves drift and
-    // its cast slides slowly between the mural's violet and its cold teal. The crawl moves the
-    // *noise* only: the band boundaries stay anchored in screen space (they compare `uv.y`), so
-    // the quiet middle the text sits in can never wander away. Everything reads from the
-    // quantised `pixel` via `p`, so the edges stay hard while the shape changes.
-    float life = clamp(iNebulaLife,0.0,1.0);
-    vec2 crawl = vec2(floor(iTime*life*0.16), floor(iTime*life*0.10));
-    vec2 pc = p + crawl/size.y;
-    float breathe = 1.0 + 0.16*sin(iTime*life*0.033);
-    float wob = sin(iTime*life*0.026);
-    float n = noise2(pc*(3.0*breathe))*0.7 + noise2(pc*(7.0*breathe)+11.0)*0.3;
-    float wave = 0.72 + 0.025*sin(iTime*life*0.021)
-        + (0.13+0.050*wob)*sin(pc.x*(3.7+0.28*wob))
-        + (n-0.5)*0.23;
-    float upperBase = 0.12 + 0.025*sin(iTime*life*0.018)
-        + (0.10+0.040*wob)*sin(pc.x*(3.1+0.20*wob)+1.5*sin(iTime*life*0.013));
-    float lower = (uv.y-wave)*8.0;
-    float upper = (upperBase+(n-0.5)*0.22-uv.y)*8.0;
-    float detailN=noise2(pc*19.0+31.0);
-    float bank = max(lower,upper) + (detailN-0.5)*0.18;
-    // The ramp is offset down by roughly the half level the dither adds on average, so the banks
-    // end up the same width as the solid version while their edge fades instead of stepping.
-    float t = clamp((bank+0.21)*2.3*iNebula,0.0,5.0);
-    float kf = floor(t);
-    // Ordered dither with a hashed jitter: pure Bayer reads as a regular screen-door pattern, pure
-    // hash as noise. A mix keeps the pixel-art ramp while losing the regularity.
-    float thr = bayer4(pixel)*0.65 + hash21(pixel+3.0)*0.35;
-    float up = (fract(t) > thr) ? 1.0 : 0.0;
-    float k = kf + up;
-    vec3 color = ink(k);
-    // Star dust: a sparse sprinkle of single logical pixels inside the banks - the other half of the
-    // pixel-art nebula vocabulary, and what gives the surface something to catch the eye.
-    if(k>=2.0 && hash21(pixel+7.0)>0.9975)
-        color=max(color, vec3(148,162,178)/255.0*max(iStarGain,0.6));
-    // Sparse ridges only, following the noise. The old parallel contour ribbons read like a
-    // topographic map rather than a nebula, so they are gone.
-    if (k>=2.0 && detailN>0.72 && n>0.55 && mod(floor(bank*5.0),4.0)==0.0) color = ink(k+1.0);
-    // Cast drift: the ink keeps its value but changes temperature as it crawls. Weighted by `k`, so
-    // the quiet middle - and the text sitting on it - cannot shift at all. The dithered cells take a
-    // small extra violet cast, which keeps the ramp from reading as a flat poster step.
-    float cast=0.5+0.5*sin(iTime*life*0.030 + noise2(pc*2.2)*2.6);
-    if(k>=2.0) {
-        vec3 warm=vec3(44,34,56)/255.0, cool=vec3(26,48,54)/255.0;
-        color=mix(color,mix(warm,cool,cast),0.22);
-        if(up>0.5) color=mix(color,warm,0.18);
-    }
+    // iGPU sky: two noise samples instead of six, sharing the broad density field.
+    // Palette, whole-cell animation and ordered edge dithering remain unchanged.
+    float life=clamp(iNebulaLife,0.0,1.0);
+    vec2 crawl=floor(iTime*life*vec2(0.16,0.10));
+    vec2 pc=p+crawl/size.y;
+    float n=noise2(pc*3.2);
+    float detailN=noise2(pc*12.0+31.0);
+    float wob=sin(iTime*life*0.026);
+    float wave=0.72+(0.13+0.04*wob)*sin(pc.x*3.7)+(n-0.5)*0.23;
+    float upper=0.12+(0.10+0.03*wob)*sin(pc.x*3.1+0.3)+(n-0.5)*0.22;
+    float bank=max((uv.y-wave)*8.0,(upper-uv.y)*8.0)+(detailN-0.5)*0.18;
+    float t=clamp((bank+0.21)*2.3*iNebula,0.0,5.0);
+    float k=floor(t)+step(bayer4(pixel),fract(t));
+    vec3 color=ink(k);
+    if(k>=2.0) color=mix(color,vec3(32,38,52)/255.0,0.10+0.05*wob);
     vec2 center = orbitLane(aspect,1.2,1.0,0.78,0.50,1.0);       // hero: in frame about half its cycle
     vec2 gas = orbitLane(aspect,4.10,0.87,0.62,0.30,3.2);        // upper lane, rare visitor
     vec2 ochre = orbitLane(aspect,2.30,0.73,0.86,0.72,3.8);      // lower lane
@@ -1956,9 +1925,9 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
     // 1.75 planet radii, which left a starless halo around every body that read as a shadow cast onto
     // the sky; drawing them afterwards instead painted stars over the planets.
     {
-        float starCloud=noise2(pixel*0.0031 + 4.7);
-        color=max(color,stars(pixel,29.0,0.0,1.0,starCloud)+stars(pixel,47.0,1.0,1.0,starCloud)
-            +stars(pixel,71.0,2.2,2.0,starCloud)+stars(pixel,17.0,1.6,1.0,starCloud));
+        float starCloud=0.4+0.5*n;
+        color=max(color,stars(pixel,29.0,0.0,1.0,starCloud)
+            +stars(pixel,47.0,1.0,1.5,starCloud));
         // The finest layer: single *physical* pixels of dust. Everything else in the mural lives on
         // the 4px block grid; this is a deliberate exception, still hard-edged (no AA, no partial
         // coverage) but fine enough to read as grain between the blocky stars.
@@ -2041,11 +2010,11 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
     // Foreground points never paint across the silhouettes of the planets. The distant world is
     // deliberately left out of this test: stars in front of it are what sell its distance.
     color=shipEvent(fragCoord,color);
-    color=depthComposite(color,asteroidGroup(fragCoord,pixel,size,color),2.7);
+    // Eco: omit the dense asteroid belt.
     color=patrolPass(fragCoord,pixel,size,color);
     color=depthComposite(color,structurePass(fragCoord,pixel,size,color),2.3);
-    color=incursionEvent(fragCoord,pixel,size,center,CITY_R,shield.x,shieldRail.x,color);
-    color=operaEncounter(fragCoord,color);
+    // Eco: omit the full planetary battle simulation.
+    // Eco: omit the additional distant encounter fleet.
     color=cometPixel(fragCoord,pixel,size,color);
     color=meteorPixel(fragCoord,pixel,size,color);
     fragColor=vec4(color*max(iBrightness,0.0),1.0);
@@ -2053,7 +2022,7 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
 
 void mainImage(out vec4 fragColor,in vec2 fragCoord) {
     vec3 a3,b3;float age;
-    bool active=gravityShot(a3,b3,age);
+    bool active=false; age=0.0; a3=vec3(0); b3=vec3(0);
     // One compiled scene call inside a dynamic loop instead of two inlined copies of the scene.
     int passes=active ? 2 : 1;
     vec2 samplePoint=fragCoord;

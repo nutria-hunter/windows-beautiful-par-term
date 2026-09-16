@@ -2052,30 +2052,24 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
 }
 
 void mainImage(out vec4 fragColor,in vec2 fragCoord) {
+    renderOperaScene(fragColor,fragCoord);
+    float surfaceDepth=sceneDepth;
     vec3 a3,b3;float age;
-    bool active=gravityShot(a3,b3,age);
-    // One compiled scene call inside a dynamic loop instead of two inlined copies of the scene.
-    int passes=active ? 2 : 1;
-    vec2 samplePoint=fragCoord;
-    float coverage=0.0, envelope=0.0;
-    for(int pass=0;pass<passes;pass++) {
-        renderOperaScene(fragColor,samplePoint);
-        if(pass==1) {
-            fragColor.rgb=mix(fragColor.rgb,vec3(0),coverage*envelope);
-            break;
-        }
-        if(!active) break;
-        vec2 a=operaProject(a3),b=operaProject(b3);
-        vec2 v=b-a;float len=max(length(v),1.0);vec2 dir=v/len;
-        vec2 normal=vec2(-dir.y,dir.x);
-        float along=dot(fragCoord-a,dir), across=dot(fragCoord-a,normal);
-        float head=clamp(age/0.035,0.0,1.0)*len;
-        if(along<0.0 || along>head || abs(across)>24.0) break;
-        float z=mix(a3.z,b3.z,clamp(along/len,0.0,1.0));
-        if(sceneDepth<z-0.02) break;
-        envelope=sin(clamp(age/0.16,0.0,1.0)*3.14159265);
-        float bend=sign(across)*min(12.0,55.0/(abs(across)+3.0))*envelope;
-        samplePoint=fragCoord+normal*bend;
-        coverage=1.0-smoothstep(0.20,0.80,abs(across));
-    }
+    if(!gravityShot(a3,b3,age)) return;
+    vec2 a=operaProject(a3),b=operaProject(b3);
+    vec2 v=b-a;float len=max(length(v),1.0);vec2 dir=v/len;
+    vec2 normal=vec2(-dir.y,dir.x);
+    float along=dot(fragCoord-a,dir), across=dot(fragCoord-a,normal);
+    float head=clamp(age/0.035,0.0,1.0)*len;
+    if(along<0.0 || along>head || abs(across)>24.0) return;
+    float z=mix(a3.z,b3.z,clamp(along/len,0.0,1.0));
+    if(surfaceDepth<z-0.02) return;
+    // Re-evaluate the actual procedural scene through a localized deflection field.
+    // Foreground occluders are tested before the second evaluation.
+    float envelope=sin(clamp(age/0.16,0.0,1.0)*3.14159265);
+    float bend=sign(across)*min(12.0,55.0/(abs(across)+3.0))*envelope;
+    renderOperaScene(fragColor,fragCoord+normal*bend);
+    // Subpixel coverage for a one-physical-pixel black core, even on a diagonal.
+    float coverage=1.0-smoothstep(0.20,0.80,abs(across));
+    fragColor.rgb=mix(fragColor.rgb,vec3(0),coverage*envelope);
 }

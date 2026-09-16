@@ -695,176 +695,62 @@ vec2 structureSchedule(float time) {
 }
 
 vec3 structureArt(vec2 d, float r, float seed, bool gate, vec3 color) {
+    vec3 dark=vec3(18,23,33)/255.0, mid=vec3(46,57,69)/255.0;
+    vec3 lit=vec3(76,85,92)/255.0, gold=vec3(114,104,77)/255.0;
+    vec3 teal=vec3(65,103,105)/255.0;
     vec2 n=d/max(r,1.0);
-    float texel=0.5/max(r,1.0);
-    bool detail=r>=9.0;
-    vec3 ink=vec3(10,15,23)/255.0, dark=vec3(20,27,38)/255.0;
-    vec3 steel=vec3(45,57,69)/255.0, deck=vec3(66,79,88)/255.0;
-    vec3 edge=vec3(99,111,113)/255.0, glint=vec3(139,150,144)/255.0;
-    vec3 gold=vec3(135,119,80)/255.0, teal=vec3(65,110,110)/255.0;
-    // Large planes carry the structure. Service detail is restricted to machinery islands.
     if(gate) {
-        vec2 tilted=vec2(n.x+0.23*n.y,n.y-0.10*n.x);
-        vec2 e=vec2(tilted.x/0.55,tilted.y);
-        vec2 back=e-vec2(0.20,0.06);
-        float rear=max(max(abs(back.x),abs(back.y)),(abs(back.x)+abs(back.y))*0.7071068);
-        if(rear<1.22 && rear>0.69) color=dark;
-        if(rear<1.22 && rear>1.14 && back.x>0.0) color=steel;
-        float rho=max(max(abs(e.x),abs(e.y)),(abs(e.x)+abs(e.y))*0.7071068);
-        float angle=atan(e.y,e.x);
-        float sector=fract((angle+3.14159265)/TAU*12.0);
-        if(rho<1.20 && rho>0.74) {
-            float lighting=-e.x*0.45-e.y;
-            color=lighting>0.0 ? steel : dark;
-            // Outer armor lip, recessed coil channel, inner pressure-bearing wall.
-            if(rho>1.12) color=lighting>0.20 ? edge : steel;
-            if(rho>1.04 && rho<1.09) color=ink;
-            if(rho>0.89 && rho<1.02) {
-                color=ink;
-                if(sector>0.24 && sector<0.76) color=deck;
-                if(sector>0.32 && sector<0.67 && detail) color=steel;
-            }
-            if(rho<0.84) color=lighting>0.1 ? deck : dark;
-            if(rho<0.78) color=ink;
-            // Panel boundaries follow the actual segments rather than a rectangular overlay.
-            if(sector<0.055 && rho>0.84) color=ink;
-            if(sector>0.08 && sector<0.13 && rho>1.12 && lighting>0.45) color=glint;
+        // Oblique, thick armored aperture. Faceted octagonal rim with four docking buttresses.
+        vec2 e=vec2(n.x/0.43,n.y);
+        float oct=max(max(abs(e.x),abs(e.y)),(abs(e.x)+abs(e.y))*0.7071068);
+        if(oct<1.03 && oct>0.72) {
+            color=e.x+e.y<-0.2 ? lit : mid;
+            if(oct<0.84) color=dark;
         }
-        // The throat is almost black. Two short filaments imply an active field, not a neon hoop.
-        if(rho<0.74) {
-            color=vec3(8,13,22)/255.0;
-            float flow=0.5+0.5*sin(iTime*0.45+seed*6.0);
-            if(rho>0.68 && e.y>0.15 && e.x<0.30) color=teal*(0.45+0.12*flow);
-            if(abs(e.x+0.13*sin(e.y*4.0+iTime*0.13))<texel*0.6 && abs(e.y)<0.40)
-                color=vec3(24,38,48)/255.0;
+        if(oct<0.72) {
+            color=vec3(9,14,23)/255.0;
+            float wave=0.5+0.5*sin(oct*14.0-iTime*0.30+seed*6.0);
+            if(wave>0.84) color=vec3(22,32,44)/255.0;
+            if(oct>0.65 && e.y>0.0) color=teal*0.65;
         }
-        // Four massive clamp houses, their inset sockets and short hydraulic pistons.
         for(int k=0;k<4;k++) {
-            float a=0.78539816+float(k)*1.5707963;
-            vec2 axis=vec2(cos(a),sin(a));
-            vec2 v=e-axis*1.04;
-            vec2 q=vec2(dot(v,axis),dot(v,vec2(-axis.y,axis.x)));
-            if(abs(q.y)<0.18 && q.x>-0.17 && q.x<0.35-abs(q.y)*0.40) {
-                color=q.y<0.0 ? deck : dark;
-                if(q.y<-0.11) color=edge;
-                if(q.x>-0.07 && q.x<0.19 && abs(q.y)<0.08) color=ink;
-                if(q.x>0.04 && q.x<0.15 && abs(q.y)<0.034) color=steel;
-                if(q.x<0.0 && q.x>-0.09 && abs(q.y)<0.032) color=gold;
-            }
-        }
-        // Asymmetric power trunk and service spine distinguish orientation at silhouette scale.
-        vec2 p=tilted-vec2(0.37,0.96);
-        if(abs(p.x)<0.20 && p.y>-0.12 && p.y<0.42) {
-            color=p.x<0.0 ? steel : dark;
-            if(p.x<-0.13) color=deck;
-            if(abs(p.x)<0.10 && p.y>0.06 && p.y<0.31) {
-                color=ink;
-                if(detail && mod(floor(p.y/0.065),2.0)==0.0) color=steel;
+            float a=0.7853982+float(k)*1.5707963;
+            vec2 u=vec2(cos(a),sin(a));
+            vec2 v=e-u*0.93;
+            float along=dot(v,u), across=dot(v,vec2(-u.y,u.x));
+            if(abs(across)<0.16 && along>-0.18 && along<0.26) {
+                color=across<0.0 ? mid : dark;
+                if(abs(across)<0.055 && along<-0.06) color=gold;
             }
         }
     } else {
-        // Naval repair citadel: unequal open drydocks, a recessed reactor keel and an offset bridge.
-        vec2 p=vec2(n.x+0.14*n.y,n.y);
-        if(p.x>-1.13 && p.x<1.35 && abs(p.y)<0.075) color=dark;
-        if(p.x>-0.89 && p.x<-0.62 && p.y>-1.16 && p.y<1.18) color=steel;
-        // Counterweight/service wharf: staggered left-hand modules break the letter-like outline.
-        if(p.x>-1.28 && p.x<-0.55 && p.y>-0.56 && p.y<-0.47) color=steel;
-        for(int k=0;k<3;k++) {
-            vec2 pod=p-vec2(-1.14+float(k)*0.20,-0.49-float(k)*0.12);
-            if(abs(pod.x)<0.14 && abs(pod.y)<0.24-abs(pod.x)*0.32) {
-                color=pod.x<0.0 ? steel : dark;
-                if(pod.y<-0.16) color=edge;
-                if(abs(pod.x)<0.075 && abs(pod.y)<0.12) {
-                    color=ink;
-                    if(detail && pod.y>-0.03 && pod.y<0.01) color=deck;
-                }
+        // Heavy orbital drydock: paired armored dock jaws, central keel, broad radiator banks.
+        if(abs(n.x)<1.40 && abs(n.y)<0.09) color=dark;
+        for(int j=0;j<2;j++) {
+            float side=j==0 ? -1.0 : 1.0;
+            vec2 v=vec2(n.x-side*0.92,n.y);
+            if(abs(v.x)<0.30 && abs(v.y)<0.79) {
+                color=v.x<0.0 ? mid : dark;
+                if(v.y<-0.60) color=lit;
+                if(abs(v.x)<0.18 && abs(v.y)<0.48) color=vec3(25,33,44)/255.0;
+                if(abs(v.y)<0.035 && abs(v.x)<0.18) color=mid;
             }
+            vec2 jaw=vec2(n.x,n.y-side*0.39);
+            if(jaw.x>-0.57 && jaw.x<0.68-abs(jaw.y)*0.65 && abs(jaw.y)<0.14)
+                color=jaw.y<0.0 ? mid : dark;
+            if(jaw.x>-0.18 && jaw.x<0.31 && abs(jaw.y)<0.026) color=gold;
         }
-        // Radiator wing and attachment spars: one quiet dark face, three large readable channels.
-        if(p.x>-1.49 && p.x<-0.77 && p.y>0.42 && p.y<0.97) {
-            color=dark;
-            if(p.y<0.48) color=deck;
-            if(p.x>-1.40 && p.x<-0.85 && p.y>0.52 && p.y<0.89) {
-                color=ink;
-                if(mod(floor((p.y-0.52)/0.115),2.0)==0.0) color=steel;
-            }
+        if(n.x>-0.62 && n.x<-0.30 && abs(n.y)<0.59) color=mid;
+        if(n.x>-0.55 && n.x<-0.38 && abs(n.y)<0.24) color=lit;
+        if(n.x>-0.48 && n.x<-0.40 && abs(n.y)<0.10) color=dark;
+        // Small rotating service collar; only four discrete lamps, no spinning bright checkerboard.
+        float rr=length(n-vec2(-0.45,0.0));
+        if(rr>0.26 && rr<0.35) color=mid;
+        for(int k=0;k<4;k++) {
+            float a=iTime*0.08+float(k)*1.5707963+seed*6.0;
+            vec2 v=n-vec2(-0.45,0.0)-vec2(cos(a),sin(a))*0.30;
+            if(max(abs(v.x),abs(v.y))<0.034) color=teal;
         }
-        // Two armored jaws project right; empty black space between them remains actual background.
-        for(int k=0;k<2;k++) {
-            float side=k==0 ? -1.0 : 1.0;
-            vec2 q=p-vec2(0.28,side*0.47);
-            float end=k==0 ? 1.05 : 0.80;
-            float width=0.19-clamp(q.x-0.56,0.0,0.5)*0.17;
-            if(q.x>-0.72 && q.x<end && abs(q.y)<width) {
-                color=q.y<0.0 ? deck : steel;
-                if(q.y<-width+max(texel,0.027)) color=edge;
-                if(q.y>width-0.045) color=ink;
-                if(q.x>-0.44 && q.x<end-0.19 && abs(q.y)<width*0.43) {
-                    color=ink;
-                    if(detail && mod(floor((q.x+0.44)/0.14),4.0)==0.0) color=steel;
-                }
-                if(q.x>0.12 && q.x<0.37 && abs(q.y-side*width*0.65)<max(texel*0.55,0.018)) color=gold;
-            }
-            // Outboard dock cap, chamfered corners, deep square service port.
-            vec2 cap=q-vec2(end-0.12,0);
-            if(abs(cap.x)<0.17 && abs(cap.y)<0.27-abs(cap.x)*0.30) {
-                color=cap.y<0.0 ? steel : dark;
-                if(cap.y<-0.18) color=edge;
-                if(abs(cap.x)<0.08 && abs(cap.y)<0.12) color=ink;
-                if(abs(cap.x)<0.025 && abs(cap.y)<0.07) color=teal;
-            }
-        }
-        // Central stepped armored keel with a broad calm shoulder and sunken machinery trench.
-        float hullWidth=p.y<-0.60 ? 0.22 : p.y>0.55 ? 0.26 : 0.37;
-        if(abs(p.x+0.40)<hullWidth && p.y>-0.88 && p.y<0.92) {
-            color=p.x<-0.40 ? deck : steel;
-            if(p.x<-0.40-hullWidth+max(texel,0.032)) color=edge;
-            if(p.x>-0.40+hullWidth-0.04) color=ink;
-            if(abs(p.x+0.37)<0.095 && p.y>-0.45 && p.y<0.54) {
-                color=ink;
-                if(mod(floor((p.y+0.45)/0.18),3.0)==0.0) color=deck;
-            }
-            if(detail && p.x<-0.51 && p.y>-0.60 && p.y<0.70) {
-                float seam=fract((p.y+0.60)/0.29);
-                if(seam<0.10) color=dark;
-                if(seam>0.13 && seam<0.20) color=edge;
-            }
-        }
-        // Raised dock-root shoulders and dark access pockets give the keel several depth planes.
-        for(int k=0;k<2;k++) {
-            vec2 q=p-vec2(-0.13,k==0 ? -0.40 : 0.46);
-            if(abs(q.x)<0.19 && abs(q.y)<0.27-abs(q.x)*0.5) {
-                color=q.y<0.0 ? deck : steel;
-                if(q.y<-0.17) color=edge;
-                if(abs(q.x)<0.10 && abs(q.y)<0.10) color=ink;
-                if(q.x>-0.075 && q.x<-0.035 && abs(q.y)<0.09) color=steel;
-            }
-        }
-        // Reactor saddle: overlapping faceted plates, no decorative glowing circle.
-        vec2 hub=p-vec2(-0.44,0.10);
-        float facet=max(max(abs(hub.x),abs(hub.y)),(abs(hub.x)+abs(hub.y))*0.7071068);
-        if(facet<0.31) {
-            color=hub.y<0.0 ? deck : dark;
-            if(facet>0.255 && hub.y<0.0) color=edge;
-            if(facet<0.20) color=ink;
-            if(facet<0.12) color=steel;
-            if(abs(hub.x)<0.06 && abs(hub.y)<0.035) color=teal;
-        }
-        // Offset command tower and staggered sensor mast give an intentional asymmetric skyline.
-        if(p.x>-0.64 && p.x<-0.43 && p.y>-1.26 && p.y<-0.65) color=steel;
-        vec2 bridge=p-vec2(-0.40,-0.96);
-        if(abs(bridge.x)<0.36 && abs(bridge.y)<0.14-abs(bridge.x)*0.12) {
-            color=bridge.y<0.0 ? deck : dark;
-            if(bridge.y<-0.07) color=edge;
-            if(abs(bridge.x)<0.24 && abs(bridge.y)<0.035) {
-                color=ink;
-                if(!detail || mod(floor((bridge.x+0.24)/0.07),3.0)<2.0) color=gold;
-            }
-        }
-        if(abs(p.x+0.57)<max(texel*0.55,0.017) && p.y>-1.48 && p.y<-1.21) color=deck;
-        // Slow local service traffic, just one lamp traveling inside the docking channel.
-        vec2 cart=p-vec2(0.13+0.64*(0.5+0.5*sin(iTime*0.15+seed)),0.35);
-        if(abs(cart.x)<0.045 && abs(cart.y)<max(texel*0.5,0.022)) color=teal;
     }
     return color;
 }
@@ -2052,30 +1938,24 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
 }
 
 void mainImage(out vec4 fragColor,in vec2 fragCoord) {
+    renderOperaScene(fragColor,fragCoord);
+    float surfaceDepth=sceneDepth;
     vec3 a3,b3;float age;
-    bool active=gravityShot(a3,b3,age);
-    // One compiled scene call inside a dynamic loop instead of two inlined copies of the scene.
-    int passes=active ? 2 : 1;
-    vec2 samplePoint=fragCoord;
-    float coverage=0.0, envelope=0.0;
-    for(int pass=0;pass<passes;pass++) {
-        renderOperaScene(fragColor,samplePoint);
-        if(pass==1) {
-            fragColor.rgb=mix(fragColor.rgb,vec3(0),coverage*envelope);
-            break;
-        }
-        if(!active) break;
-        vec2 a=operaProject(a3),b=operaProject(b3);
-        vec2 v=b-a;float len=max(length(v),1.0);vec2 dir=v/len;
-        vec2 normal=vec2(-dir.y,dir.x);
-        float along=dot(fragCoord-a,dir), across=dot(fragCoord-a,normal);
-        float head=clamp(age/0.035,0.0,1.0)*len;
-        if(along<0.0 || along>head || abs(across)>24.0) break;
-        float z=mix(a3.z,b3.z,clamp(along/len,0.0,1.0));
-        if(sceneDepth<z-0.02) break;
-        envelope=sin(clamp(age/0.16,0.0,1.0)*3.14159265);
-        float bend=sign(across)*min(12.0,55.0/(abs(across)+3.0))*envelope;
-        samplePoint=fragCoord+normal*bend;
-        coverage=1.0-smoothstep(0.20,0.80,abs(across));
-    }
+    if(!gravityShot(a3,b3,age)) return;
+    vec2 a=operaProject(a3),b=operaProject(b3);
+    vec2 v=b-a;float len=max(length(v),1.0);vec2 dir=v/len;
+    vec2 normal=vec2(-dir.y,dir.x);
+    float along=dot(fragCoord-a,dir), across=dot(fragCoord-a,normal);
+    float head=clamp(age/0.035,0.0,1.0)*len;
+    if(along<0.0 || along>head || abs(across)>24.0) return;
+    float z=mix(a3.z,b3.z,clamp(along/len,0.0,1.0));
+    if(surfaceDepth<z-0.02) return;
+    // Re-evaluate the actual procedural scene through a localized deflection field.
+    // Foreground occluders are tested before the second evaluation.
+    float envelope=sin(clamp(age/0.16,0.0,1.0)*3.14159265);
+    float bend=sign(across)*min(12.0,55.0/(abs(across)+3.0))*envelope;
+    renderOperaScene(fragColor,fragCoord+normal*bend);
+    // Subpixel coverage for a one-physical-pixel black core, even on a diagonal.
+    float coverage=1.0-smoothstep(0.20,0.80,abs(across));
+    fragColor.rgb=mix(fragColor.rgb,vec3(0),coverage*envelope);
 }

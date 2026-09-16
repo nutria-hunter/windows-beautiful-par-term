@@ -1,5 +1,5 @@
 /*! par-term shader metadata
-name: Kanagawa - Starbound
+name: Kanagawa - Starbound Eco
 author: Codex
 description: Flat retro space mural, ink-blue nebula banks, cut-paper planets and quiet pixel stars. Texture-free; banded day/night lighting with a real terminator, restrained lit-limb atmospheres, ring shadows, coast-hugging city lights, eclipses, comets, depth-layered star drifts, breathing nebula banks and fleets that range from a lone squadron to a grand fleet warping in at a distance.
 version: 6.1.0
@@ -1704,7 +1704,8 @@ vec3 shipEvent(vec2 fragCoord, vec3 bg) {
     else if(cls<1.5) count=4+int(floor(hash21(vec2(seed,17.0))*3.99));
     else count=12+int(floor(hash21(vec2(seed,17.0))*6.99));
     // Far-to-near order is stable. Each craft has its own pose and entry/exit point.
-    for(int j=0;j<18;j++) {
+    count=min(count,4);
+    for(int j=0;j<4;j++) {
         if(j>=count) continue;
         float id=float(j);
         // Grand fleets stagger a little wider, so the formation unfolds instead of popping at once.
@@ -2041,11 +2042,11 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
     // Foreground points never paint across the silhouettes of the planets. The distant world is
     // deliberately left out of this test: stars in front of it are what sell its distance.
     color=shipEvent(fragCoord,color);
-    color=depthComposite(color,asteroidGroup(fragCoord,pixel,size,color),2.7);
+    // Eco: omit the dense asteroid belt.
     color=patrolPass(fragCoord,pixel,size,color);
     color=depthComposite(color,structurePass(fragCoord,pixel,size,color),2.3);
-    color=incursionEvent(fragCoord,pixel,size,center,CITY_R,shield.x,shieldRail.x,color);
-    color=operaEncounter(fragCoord,color);
+    // Eco: omit the full planetary battle simulation.
+    // Eco: omit the additional distant encounter fleet.
     color=cometPixel(fragCoord,pixel,size,color);
     color=meteorPixel(fragCoord,pixel,size,color);
     fragColor=vec4(color*max(iBrightness,0.0),1.0);
@@ -2053,7 +2054,7 @@ void renderOperaScene(out vec4 fragColor, in vec2 fragCoord) {
 
 void mainImage(out vec4 fragColor,in vec2 fragCoord) {
     vec3 a3,b3;float age;
-    bool active=gravityShot(a3,b3,age);
+    bool active=false; age=0.0; a3=vec3(0); b3=vec3(0);
     // One compiled scene call inside a dynamic loop instead of two inlined copies of the scene.
     int passes=active ? 2 : 1;
     vec2 samplePoint=fragCoord;
