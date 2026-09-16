@@ -319,6 +319,11 @@ impl WindowManager {
             Ok(window) => {
                 let window_id = window.id();
 
+                // Same IME composition observer as `create_window` installs. This path is a
+                // second window-creation route (session restore, arrangements) and does not go
+                // through `window_lifecycle`, so it needs its own call.
+                crate::app::window_manager::ime_composition::install(&window);
+
                 // Initialize menu BEFORE the blocking GPU init (same rationale
                 // as create_window — see window_lifecycle.rs for details).
                 if self.menu.is_none() {

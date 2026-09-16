@@ -1,0 +1,119 @@
+[
+  {
+    "name": "citadel_17",
+    "seed": 17,
+    "profile": "citadel",
+    "metrics": {
+      "opaque_pixels": 5217,
+      "components": [
+        5217
+      ],
+      "accent_fraction": 0.0102,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "citadel_18",
+    "seed": 18,
+    "profile": "citadel",
+    "metrics": {
+      "opaque_pixels": 4899,
+      "components": [
+        4899
+      ],
+      "accent_fraction": 0.01,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "citadel_19",
+    "seed": 19,
+    "profile": "citadel",
+    "metrics": {
+      "opaque_pixels": 5226,
+      "components": [
+        5226
+      ],
+      "accent_fraction": 0.01,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "drydock_17",
+    "seed": 17,
+    "profile": "drydock",
+    "metrics": {
+      "opaque_pixels": 5105,
+      "components": [
+        5105
+      ],
+      "accent_fraction": 0.0074,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "drydock_18",
+    "seed": 18,
+    "profile": "drydock",
+    "metrics": {
+      "opaque_pixels": 4807,
+      "components": [
+        4807
+      ],
+      "accent_fraction": 0.0083,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "drydock_19",
+    "seed": 19,
+    "profile": "drydock",
+    "metrics": {
+      "opaque_pixels": 5128,
+      "components": [
+        5128
+      ],
+      "accent_fraction": 0.0078,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "relay_17",
+    "seed": 17,
+    "profile": "relay",
+    "metrics": {
+      "opaque_pixels": 4964,
+      "components": [
+        4964
+      ],
+      "accent_fraction": 0.0083,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "relay_18",
+    "seed": 18,
+    "profile": "relay",
+    "metrics": {
+      "opaque_pixels": 4597,
+      "components": [
+        4597
+      ],
+      "accent_fraction": 0.0089,
+      "colors_used": 13
+    }
+  },
+  {
+    "name": "relay_19",
+    "seed": 19,
+    "profile": "relay",
+    "metrics": {
+      "opaque_pixels": 4973,
+      "components": [
+        4973
+      ],
+      "accent_fraction": 0.0082,
+      "colors_used": 13
+    }
+  }
+]

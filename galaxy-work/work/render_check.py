@@ -75,11 +75,12 @@ def build(ctx, source, w, h, over=None):
 
 
 def parse_args(argv):
-    """shader.glsl  [tag=NAME] [w=NNN] [h=NNN] [iUniform=VALUE ...]"""
+    """shader.glsl  [tag=NAME] [w=NNN] [h=NNN] [t=SECONDS] [iUniform=VALUE ...]"""
     shader = None
     over = {}
     tag = ""
     w, h = W, H
+    t = FIXED_TIME
     for a in argv:
         if "=" in a and not a.endswith(".glsl"):
             k, v = a.split("=", 1)
@@ -89,11 +90,15 @@ def parse_args(argv):
                 w = whole(v, W)
             elif k == "h":
                 h = whole(v, H)
+            elif k == "t":
+                # Scene time for the capture. The scenery rides closed orbits, so a later moment
+                # is the only way to photograph a body that is off-screen at the default time.
+                t = num(v, FIXED_TIME)
             else:
                 over[k] = whole(v) if re.fullmatch(r"-?\d+", v) else num(v)
         elif shader is None:
             shader = a
-    return (shader or "tilted-spiral.glsl"), over, tag, w, h
+    return (shader or "tilted-spiral.glsl"), over, tag, w, h, t
 
 
 def shade(ctx, prog, w, h, t):
@@ -123,7 +128,7 @@ def stats(arr):
 
 def main():
     moderngl = importlib.import_module("moderngl")
-    shader, over, tag, w, h = parse_args(sys.argv[1:])
+    shader, over, tag, w, h, t = parse_args(sys.argv[1:])
     ctx = moderngl.create_standalone_context(require=330)
     report = {
         "renderer": ctx.info["GL_RENDERER"],
@@ -140,7 +145,7 @@ def main():
 
     times = []
     for i in range(WARMUP + SAMPLES):
-        prog["iTime"].value = FIXED_TIME
+        prog["iTime"].value = t
         q = ctx.query(time=True)
         with q:
             vao.render(vertices=3)
@@ -149,7 +154,7 @@ def main():
             times.append(num(q.elapsed) / 1e6)
     vao.release()
 
-    img = shade(ctx, prog, w, h, FIXED_TIME)
+    img = shade(ctx, prog, w, h, t)
     stem = Path(shader).stem + ("-" + tag if tag else "")
     (ROOT / "outputs").mkdir(exist_ok=True)
     img.save(ROOT / "outputs" / f"{stem}-4k.png")
@@ -166,7 +171,7 @@ def main():
     entry.update(stats(np.asarray(img).astype(float)))
 
     prog["iBrightness"].value = 0.0
-    blank = np.asarray(shade(ctx, prog, 256, 144, FIXED_TIME))
+    blank = np.asarray(shade(ctx, prog, 256, 144, t))
     entry["brightness_zero_is_black"] = bool(blank.max() == 0)
     prog["iBrightness"].value = 1.0
 

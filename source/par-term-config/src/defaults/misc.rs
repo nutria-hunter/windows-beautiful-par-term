@@ -8,6 +8,11 @@ pub fn bool_false() -> bool {
 }
 
 /// Serde default returning `true`.
+/// Background shader render scale: 1.0 = full resolution (the pre-existing behaviour).
+pub fn shader_render_scale() -> f32 {
+    1.0
+}
+
 pub fn bool_true() -> bool {
     true
 }

@@ -1,0 +1,66 @@
+{
+  "believes": {
+    "columns": 145,
+    "rows": 39
+  },
+  "steps": [
+    {
+      "label": "home",
+      "cpr": {
+        "row": 1,
+        "col": 1
+      }
+    },
+    {
+      "label": "145 x 'x' (full row)",
+      "cpr": {
+        "row": 1,
+        "col": 145
+      }
+    },
+    {
+      "label": "then one more 'y' (forces the pending wrap)",
+      "cpr": {
+        "row": 2,
+        "col": 2
+      }
+    },
+    {
+      "label": "then CR LF",
+      "cpr": {
+        "row": 3,
+        "col": 1
+      }
+    },
+    {
+      "label": "wide char U+D55C (Hangul, East Asian Width = 2)",
+      "cpr": {
+        "row": 3,
+        "col": 3
+      }
+    },
+    {
+      "label": "wide char then CR LF",
+      "cpr": {
+        "row": 4,
+        "col": 1
+      }
+    },
+    {
+      "label": "full row of U+D55C (72 chars)",
+      "cpr": {
+        "row": 4,
+        "col": 145
+      }
+    },
+    {
+      "label": "then one ASCII 'z' after that full wide row",
+      "cpr": {
+        "row": 4,
+        "col": 145
+      }
+    }
+  ],
+  "columnsUsed": 145,
+  "rowsUsed": 39
+}

@@ -59,12 +59,13 @@ pub use colors::{
     search_highlight_color, tab_active_background, tab_active_indicator, tab_active_text,
     tab_activity_indicator, tab_bar_background, tab_bar_bg_alpha, tab_bell_indicator,
     tab_border_color, tab_close_button, tab_close_button_hover, tab_hover_background,
-    tab_inactive_background, tab_indicator_height, tab_inactive_text, tab_pill_inset_y,
+    tab_inactive_background, tab_inactive_text, tab_indicator_height, tab_pill_inset_y,
     tab_text_bold, visual_bell_color,
 };
 
 // ── Miscellaneous ──────────────────────────────────────────────────────────
 pub use misc::{
+    shader_render_scale,
     ambiguous_width, badge_color_alpha, badge_format, badge_max_height, badge_max_width,
     badge_right_margin, badge_top_margin, bool_false, bool_true, command_separator_opacity,
     command_separator_thickness, cursor_boost, cursor_shadow_blur, cursor_shadow_offset,

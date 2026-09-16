@@ -49,7 +49,22 @@ impl WindowState {
             } else {
                 self.config.load().rendering.max_fps
             };
-        let frame_interval = std::time::Duration::from_millis((1000 / target_fps.max(1)) as u64);
+        // When throughput batching is on, PTY-driven redraws (which arrive via
+        // direct `request_redraw` from the tab refresh task and bypass the
+        // `about_to_wait` batching gate) must also be coalesced here — this is
+        // the one choke point every frame passes through. Otherwise each
+        // streaming chunk renders its torn intermediate state (scrolled text
+        // with the footer not yet redrawn) and the footer visibly judders.
+        let mut interval_ms = (1000 / target_fps.max(1)) as u64;
+        // Batching stands down while the IME has a composition open. The IME replaces that string
+        // on every keystroke and the composition exists only for as long as the user is typing it,
+        // so coalescing those frames into the throughput interval can drop the composition from
+        // the screen entirely - and the overlay is the only place it is drawn.
+        if self.config.load().rendering.maximize_throughput && !self.ime.is_composing() {
+            interval_ms =
+                interval_ms.max(self.config.load().rendering.throughput_render_interval_ms as u64);
+        }
+        let frame_interval = std::time::Duration::from_millis(interval_ms);
         if let Some(last_render) = self.focus_state.last_render_time
             && last_render.elapsed() < frame_interval
         {

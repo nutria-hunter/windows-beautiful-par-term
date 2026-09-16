@@ -1,0 +1,26 @@
+{
+  "events": [],
+  "samples": [
+    {
+      "label": "start (no scrollback)",
+      "columns": 145,
+      "rows": 39
+    },
+    {
+      "label": "after 3 screens of output (scrollback present)",
+      "columns": 145,
+      "rows": 39
+    },
+    {
+      "label": "after clearing scrollback (ESC[3J)",
+      "columns": 145,
+      "rows": 39
+    },
+    {
+      "label": "after refilling scrollback",
+      "columns": 145,
+      "rows": 39
+    }
+  ],
+  "resizeEventCount": 0
+}

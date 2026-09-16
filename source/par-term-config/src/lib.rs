@@ -273,16 +273,16 @@ pub use automation::{
 pub use types::{
     AlertEvent, AlertSoundConfig, BackgroundImageMode, BackgroundMode, CursorShaderConfig,
     CursorShaderMetadata, CursorStyle, DividerRect, DividerStyle, DownloadSaveLocation,
-    DroppedFileQuoteStyle, FontRange, ImageScalingMode, InstallPromptState, IntegrationVersions,
-    KeyBinding, LinkUnderlineStyle, LogLevel, ModifierRemapping, ModifierTarget, NewTabPosition,
-    OptionKeyMode, PaneBackground, PaneBackgroundConfig, PaneId, PaneTitlePosition,
-    PowerPreference, ProgressBarPosition, ProgressBarStyle, RemoteTabTitleFormat,
-    SemanticHistoryEditorMode, SeparatorMark, SessionLogFormat, ShaderBackgroundBlendMode,
-    ShaderConfig, ShaderInstallPrompt, ShaderMetadata, ShaderSafetyBadge, ShellExitAction,
-    ShellType, SmartSelectionPrecision, SmartSelectionRule, StartupDirectoryMode,
-    StatusBarPosition, TabBarMode, TabBarPosition, TabId, TabStyle, TabTitleMode, ThinStrokesMode,
-    UnfocusedCursorStyle, UpdateCheckFrequency, VsyncMode, WindowType,
-    default_smart_selection_rules,
+    DroppedFileQuoteStyle, FontRange, ImageScalingMode, ImePreeditRendering, InstallPromptState,
+    IntegrationVersions, KeyBinding, LinkUnderlineStyle, LogLevel, ModifierRemapping,
+    ModifierTarget, NewTabPosition, OptionKeyMode, PaneBackground, PaneBackgroundConfig, PaneId,
+    PaneTitlePosition, PowerPreference, ProgressBarPosition, ProgressBarStyle,
+    RemoteTabTitleFormat, SemanticHistoryEditorMode, SeparatorMark, SessionLogFormat,
+    ShaderBackgroundBlendMode, ShaderConfig, ShaderInstallPrompt, ShaderMetadata,
+    ShaderSafetyBadge, ShellExitAction, ShellType, SmartSelectionPrecision, SmartSelectionRule,
+    StartupDirectoryMode, StatusBarPosition, TabBarMode, TabBarPosition, TabId, TabStyle,
+    TabTitleMode, ThinStrokesMode, UnfocusedCursorStyle, UpdateCheckFrequency, VsyncMode,
+    WindowType, default_smart_selection_rules,
 };
 // Scripting / observer scripts
 pub use scripting::ScriptConfig;

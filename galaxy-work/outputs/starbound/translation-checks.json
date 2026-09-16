@@ -1,0 +1,5 @@
+{
+  "city_local_blocks_are_4px": true,
+  "physical_1px_translation_exact": true,
+  "note": "No AA/subpixel interpolation; rendering at 120fps does not guarantee 120 distinct poses per second."
+}

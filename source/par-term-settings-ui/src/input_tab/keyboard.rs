@@ -2,7 +2,7 @@
 
 use crate::SettingsUI;
 use crate::section::collapsing_section;
-use par_term_config::{ModifierTarget, OptionKeyMode};
+use par_term_config::{ImePreeditRendering, ModifierTarget, OptionKeyMode};
 use std::collections::HashSet;
 
 // ============================================================================
@@ -117,12 +117,72 @@ pub(super) fn show_keyboard_section(
 
         ui.add_space(8.0);
         ui.separator();
+
+        // IME composition rendering. Only the built-in mode uses the Imm32 reader, which is
+        // Windows-only, but the setting is shown everywhere because the value is shared.
+        ui.horizontal(|ui| {
+            ui.label("IME composition (preedit) rendering:");
+            let current = settings.config.input.ime_preedit_rendering;
+            egui::ComboBox::from_id_salt("input_ime_preedit_rendering")
+                .selected_text(ime_preedit_rendering_label(current))
+                .show_ui(ui, |ui| {
+                    for mode in [ImePreeditRendering::Builtin, ImePreeditRendering::System] {
+                        if ui
+                            .selectable_value(
+                                &mut settings.config.input.ime_preedit_rendering,
+                                mode,
+                                ime_preedit_rendering_label(mode),
+                            )
+                            .changed()
+                        {
+                            settings.has_changes = true;
+                            *changes_this_frame = true;
+                        }
+                    }
+                });
+        });
+
+        ui.indent("input_ime_preedit_desc", |ui| {
+            ui.label(
+                egui::RichText::new(ime_preedit_rendering_description(
+                    settings.config.input.ime_preedit_rendering,
+                ))
+                .weak()
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
         ui.label(egui::RichText::new("Tips:").strong());
         ui.label("• Use \"Esc\" mode for emacs Meta key (M-x, M-f, M-b, etc.)");
         ui.label("• Use \"Esc\" mode for vim Alt mappings");
         ui.label("• Use \"Normal\" to type special characters (ƒ, ∂, ß, etc.)");
         ui.label("• Enable physical keys if shortcuts feel wrong on non-US layouts");
     });
+}
+
+/// Short name for an IME composition rendering mode.
+fn ime_preedit_rendering_label(mode: ImePreeditRendering) -> &'static str {
+    match mode {
+        ImePreeditRendering::Builtin => "Built-in (inline at the cursor)",
+        ImePreeditRendering::System => "System composition window",
+    }
+}
+
+/// One-line explanation of the selected IME composition rendering mode.
+fn ime_preedit_rendering_description(mode: ImePreeditRendering) -> &'static str {
+    match mode {
+        ImePreeditRendering::Builtin => {
+            "par-term draws the composing text itself, in the terminal's own font, at the cursor \
+             cell (what WezTerm calls \"Builtin\")."
+        }
+        ImePreeditRendering::System => {
+            "Windows draws its own composition window near the caret. Looks worse than the \
+             built-in overlay, but it cannot be lost to a frame that is skipped (WezTerm's \
+             \"System\")."
+        }
+    }
 }
 
 // ============================================================================

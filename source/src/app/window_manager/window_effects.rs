@@ -70,7 +70,13 @@ mod imp {
     ///
     /// # Safety
     /// `value` must point to `size` readable bytes.
-    unsafe fn set_attribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32, name: &str) {
+    unsafe fn set_attribute(
+        hwnd: isize,
+        attribute: u32,
+        value: *const c_void,
+        size: u32,
+        name: &str,
+    ) {
         // SAFETY: forwarded directly to DWM; the caller guarantees `value`/`size`.
         let hr = unsafe { DwmSetWindowAttribute(hwnd, attribute, value, size) };
         if hr != 0 {
@@ -120,9 +126,7 @@ mod imp {
         }
 
         // A `COLORREF`-free sentinel means "leave the border as the OS decides".
-        let border = effects
-            .border_color
-            .map_or(DWMWA_COLOR_NONE, colorref);
+        let border = effects.border_color.map_or(DWMWA_COLOR_NONE, colorref);
         // SAFETY: `border` is a live local and the attribute takes a COLORREF.
         unsafe {
             set_attribute(

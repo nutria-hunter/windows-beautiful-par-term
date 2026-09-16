@@ -99,6 +99,34 @@ impl WindowState {
         let current_generation = snap.current_generation;
         let cell_grid_dims = snap.grid_dims;
 
+        // The IME composition is stamped into the cell buffer so the normal cell renderer draws
+        // it — the same approach Windows Terminal, kitty and ghostty take — instead of a
+        // separately aligned egui overlay. See `ime_stamp` for why. `cells` (unstamped) keeps
+        // feeding the caches and URL detection, so a stamp can never outlive the composition;
+        // `gpu_cells` below is the stamped copy the renderer uploads.
+        let gpu_cells = if crate::app::window_manager::ime_composition::mode()
+            == par_term_config::ImePreeditRendering::Builtin
+            && self.ime.is_composing()
+        {
+            match super::ime_stamp::stamp_arc_cells(
+                &cells,
+                cell_grid_dims.0,
+                shader_cursor_pos,
+                self.ime.display_preedit(),
+            ) {
+                Some(stamped) => {
+                    // The stamp must reach the GPU on every composing frame: a cache hit would
+                    // keep serving the last unstamped upload and the composition would vanish
+                    // between keystrokes.
+                    self.frame.cache_hit = false;
+                    stamped
+                }
+                None => std::sync::Arc::clone(&cells),
+            }
+        } else {
+            std::sync::Arc::clone(&cells)
+        };
+
         if let Some(tab) = self.tab_manager.active_tab_mut() {
             // A TUI reads its geometry when it starts, so that is when a size pulse has
             // to land. Unix gets one from the emulator core (a real SIGWINCH);
@@ -150,6 +178,7 @@ impl WindowState {
         self.flush_cell_cache(
             &cells,
             current_cursor_pos,
+            shader_cursor_pos,
             cell_grid_dims,
             current_generation,
         );
@@ -259,7 +288,7 @@ impl WindowState {
         self.update_cursor_blink();
 
         Some(FrameRenderData {
-            cells,
+            cells: gpu_cells,
             cursor_pos: current_cursor_pos,
             cursor_style,
             shader_cursor_pos,

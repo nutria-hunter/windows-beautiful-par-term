@@ -335,7 +335,10 @@ impl CellRenderer {
         // Linux: Try Vulkan first, fall back to GL for VM compatibility
         #[cfg(target_os = "windows")]
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
+            // Honour WGPU_BACKEND when it is set: the DX12 path goes through the HLSL compiler, which
+            // is the backend that takes minutes on this shader (wgpu#7443). Vulkan compiles the same
+            // shader in seconds, so the choice must not be hard-coded.
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         #[cfg(target_os = "macos")]

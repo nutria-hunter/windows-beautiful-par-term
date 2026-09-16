@@ -231,6 +231,27 @@ pub(crate) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Helper function to find the last occurrence of a subsequence.
+/// Used to cut a synchronized-update buffer after its last complete
+/// transaction so a trailing partial update stays buffered.
+#[inline]
+pub(crate) fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut last = None;
+    let mut index = 0;
+    while index + needle.len() <= haystack.len() {
+        if haystack[index..index + needle.len()] == *needle {
+            last = Some(index);
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    last
+}
+
 // =============================================================================
 // Cohesive state sub-structs (ARC-001: decomposing the `Terminal` god object)
 //
@@ -1959,21 +1980,45 @@ impl Terminal {
         self.sync_state.synchronized_updates
     }
 
-    /// Flush the synchronized update buffer
+    /// Flush the synchronized update buffer.
+    ///
+    /// Applies only complete transactions: a trailing partial update (a
+    /// begin marker with no later end marker) stays buffered for the next
+    /// read, while ordinary output past the last transaction applies right
+    /// away. Applying the trailing partial immediately would expose a torn
+    /// intermediate grid (e.g. scrolled text with the footer not yet
+    /// redrawn) on the next render, which is exactly the judder seen with
+    /// fast streaming apps whose updates ConPTY splits across reads.
     pub fn flush_synchronized_updates(&mut self) {
-        if !self.sync_state.update_buffer.is_empty() {
-            let buffer = std::mem::take(&mut self.sync_state.update_buffer);
-            debug::log(
-                debug::DebugLevel::Debug,
-                "SYNC_UPDATE",
-                &format!("Flushing buffer ({} bytes)", buffer.len()),
-            );
-            // Process the buffered data without synchronized mode
-            let saved_mode = self.sync_state.synchronized_updates;
-            self.sync_state.sync_update_explicitly_disabled = false;
-            self.sync_state.synchronized_updates = false;
-            self.process(&buffer);
+        if self.sync_state.update_buffer.is_empty() {
+            return;
+        }
+        let buffer = std::mem::take(&mut self.sync_state.update_buffer);
+        debug::log(
+            debug::DebugLevel::Debug,
+            "SYNC_UPDATE",
+            &format!("Flushing buffer ({} bytes)", buffer.len()),
+        );
+        // Process the buffered data without synchronized mode
+        let saved_mode = self.sync_state.synchronized_updates;
+        self.sync_state.sync_update_explicitly_disabled = false;
+        self.sync_state.synchronized_updates = false;
+        const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+        const SYNC_END: &[u8] = b"\x1b[?2026l";
+        let search_from = find_last_subslice(&buffer, SYNC_END)
+            .map(|pos| pos + SYNC_END.len())
+            .unwrap_or(0);
+        let pending_start = buffer[search_from..]
+            .windows(SYNC_BEGIN.len())
+            .position(|window| window == SYNC_BEGIN)
+            .map(|pos| search_from + pos)
+            .unwrap_or(buffer.len());
+        let (apply, retain) = buffer.split_at(pending_start);
+        if !apply.is_empty() {
+            self.process(apply);
+        }
 
+        if retain.is_empty() {
             // Restore only if it was originally enabled and not explicitly disabled
             if saved_mode
                 && !self.sync_state.sync_update_explicitly_disabled
@@ -1981,6 +2026,11 @@ impl Terminal {
             {
                 self.sync_state.synchronized_updates = true;
             }
+        } else {
+            // A new transaction supersedes any earlier explicit disable.
+            self.sync_state.update_buffer.extend_from_slice(retain);
+            self.sync_state.synchronized_updates = true;
+            self.sync_state.sync_update_explicitly_disabled = false;
         }
     }
 
@@ -2861,9 +2911,37 @@ impl Terminal {
             return false;
         }
 
+        // A transaction beginning without a later end marker in this read
+        // continues in a later read (ConPTY splits updates arbitrarily).
+        // Buffer from the pending begin so a torn head is never applied on
+        // its own; complete transactions and ordinary output still parse
+        // immediately below. A new begin always supersedes any earlier
+        // explicit disable (per-update begin/end pairs keep working).
+        let mut immediate = data;
+        {
+            const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+            const SYNC_END: &[u8] = b"\x1b[?2026l";
+            let search_from = find_last_subslice(data, SYNC_END)
+                .map(|pos| pos + SYNC_END.len())
+                .unwrap_or(0);
+            if let Some(pending) = data[search_from..]
+                .windows(SYNC_BEGIN.len())
+                .position(|window| window == SYNC_BEGIN)
+                .map(|pos| search_from + pos)
+            {
+                self.sync_state.update_buffer.extend_from_slice(&data[pending..]);
+                self.sync_state.synchronized_updates = true;
+                self.sync_state.sync_update_explicitly_disabled = false;
+                if pending == 0 {
+                    return false;
+                }
+                immediate = &data[..pending];
+            }
+        }
+
         if self.tmux.tmux_parser.is_control_mode() || self.tmux.tmux_parser.is_auto_detect() {
             // Process as tmux control protocol (handles auto-detect internally)
-            let notifications = self.tmux.tmux_parser.parse(data);
+            let notifications = self.tmux.tmux_parser.parse(immediate);
             for notification in notifications {
                 match notification {
                     crate::tmux_control::TmuxNotification::TerminalOutput { data } => {
@@ -2879,7 +2957,7 @@ impl Terminal {
             }
         } else {
             // Process as standard terminal output (with Kitty APC pre-filtering)
-            self.filter_apc_and_advance(data);
+            self.filter_apc_and_advance(immediate);
         }
 
         true

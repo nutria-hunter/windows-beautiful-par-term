@@ -146,12 +146,13 @@ fn detect_shells() -> Vec<ShellInfo> {
     // PowerShell 7+ (pwsh)
     if let Ok(output) = std::process::Command::new("where").arg("pwsh.exe").output()
         && output.status.success()
-            && let Ok(path) = String::from_utf8(output.stdout) {
-                let path = path.lines().next().unwrap_or("").trim();
-                if !path.is_empty() && Path::new(path).exists() {
-                    shells.push(ShellInfo::new("PowerShell 7", path));
-                }
-            }
+        && let Ok(path) = String::from_utf8(output.stdout)
+    {
+        let path = path.lines().next().unwrap_or("").trim();
+        if !path.is_empty() && Path::new(path).exists() {
+            shells.push(ShellInfo::new("PowerShell 7", path));
+        }
+    }
 
     // Windows PowerShell (5.1)
     let ps_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";

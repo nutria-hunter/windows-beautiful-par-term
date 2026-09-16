@@ -8,10 +8,15 @@ pub struct RenderCache {
     pub(crate) generation: u64, // Last terminal generation number (for dirty tracking)
     pub(crate) scroll_offset: usize, // Last scroll offset (for cache invalidation)
     pub(crate) cursor_pos: Option<(usize, usize)>, // Last cursor position (for cache invalidation)
+    /// Cursor position as published for background shaders: the terminal's own position, whether
+    /// or not the cursor is visible. Consumers that need *where* the caret is rather than whether
+    /// it is drawn (the IME composition overlay) must use this one - a TUI that draws its own
+    /// caret hides the terminal cursor, and `cursor_pos` is `None` for the whole time.
+    pub(crate) shader_cursor_pos: Option<(usize, usize)>,
     pub(crate) selection: Option<Selection>, // Last selection state (for cache invalidation)
-    pub(crate) grid_dims: (usize, usize), // Last known terminal grid dimensions (cols, rows)
-    pub(crate) terminal_title: String, // Last known terminal title (for change detection)
-    pub(crate) scrollback_len: usize, // Last known scrollback length
+    pub(crate) grid_dims: (usize, usize),    // Last known terminal grid dimensions (cols, rows)
+    pub(crate) terminal_title: String,       // Last known terminal title (for change detection)
+    pub(crate) scrollback_len: usize,        // Last known scrollback length
     pub(crate) pane_cells: Option<Arc<Vec<Cell>>>, // Cached cells for pane rendering (reuse across frames)
     pub(crate) pane_cells_generation: u64, // Generation of cached pane_cells (0 = stale/unset)
     pub(crate) pane_cells_scroll_offset: usize, // Scroll offset used when pane_cells was generated
@@ -28,6 +33,7 @@ impl RenderCache {
             generation: 0,
             scroll_offset: 0,
             cursor_pos: None,
+            shader_cursor_pos: None,
             selection: None,
             grid_dims: (0, 0),
             terminal_title: String::new(),

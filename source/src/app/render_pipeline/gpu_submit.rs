@@ -300,6 +300,18 @@ impl WindowState {
             // the same trust rule `commit_pty_grid_when_settled` uses: a minimized window
             // reports its icon size, which the panes turn into a one-row grid.
             let grid_trustworthy = !self.pty_grid_suspect;
+            // A composition is drawn as an overlay in the cursor's own cell, so a filled cursor
+            // block underneath would show the composing glyph inverted - light glyph on a light
+            // block instead of on the terminal background - which reads as a different font from
+            // the text it becomes. Native terminals replace the caret with the composition the
+            // same way, so the cursor stands down while one is open. Opacity is the handle the
+            // pane renderer gates the block on; nothing else about the cursor changes, so the
+            // overlay still gets its cell and the shader cursor keeps tracking the position.
+            let cursor_opacity = if self.ime.is_composing() {
+                0.0
+            } else {
+                self.cursor_anim.cursor_opacity
+            };
             let render_result = if pane_count > 0 {
                 // Gather all per-pane render data.
                 let pane_render_data = self.tab_manager.active_tab_mut().and_then(|tab| {
@@ -308,7 +320,7 @@ impl WindowState {
                         &self.config.load(),
                         &sizing,
                         effective_pane_padding,
-                        self.cursor_anim.cursor_opacity,
+                        cursor_opacity,
                         pane_count,
                         // Always pass scrollbar width in split-pane mode so all
                         // panes have a stable column count regardless of focus or
@@ -363,7 +375,24 @@ impl WindowState {
                             ))
                         });
 
-                        if has_search_matches || url_overlay.is_some() {
+                        // The IME composition rides the same scratch buffer as the other transient
+                        // overlays, so it has to join this block's gate: inside the gate it would
+                        // only be stamped when a URL happened to be hovered or a search was open,
+                        // which is why an open composition drew nothing at all.
+                        let ime_stamp_cursor =
+                            if crate::app::window_manager::ime_composition::mode()
+                                == par_term_config::ImePreeditRendering::Builtin
+                                && self.ime.is_composing()
+                            {
+                                self.tab_manager
+                                    .active_tab()
+                                    .and_then(|tab| tab.active_cache().shader_cursor_pos)
+                            } else {
+                                None
+                            };
+
+                        if has_search_matches || url_overlay.is_some() || ime_stamp_cursor.is_some()
+                        {
                             for pane in &mut pane_data {
                                 if pane.viewport.focused {
                                     // `pane.cells` is always an `Arc::clone` of a cache
@@ -410,6 +439,20 @@ impl WindowState {
                                                 do_color,
                                                 do_underline,
                                             },
+                                        );
+                                    }
+                                    // The IME composition goes on last, so the composing glyphs sit
+                                    // over the search/url decoration exactly where the text will be
+                                    // committed. Focused pane only, live view only — the cursor
+                                    // coordinates are viewport coordinates (see `ime_stamp`).
+                                    if let Some(ime_cursor) = ime_stamp_cursor
+                                        && pane.scroll_offset == 0
+                                    {
+                                        super::ime_stamp::stamp_preedit_cells(
+                                            cells,
+                                            pane.grid_size.0,
+                                            ime_cursor,
+                                            self.ime.display_preedit(),
                                         );
                                     }
                                     // Point this frame's render at the scratch buffer.

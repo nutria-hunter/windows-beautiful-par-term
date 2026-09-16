@@ -18,6 +18,11 @@ impl WindowState {
     ) -> bool {
         use winit::keyboard::{Key, NamedKey};
 
+        // Refresh the IME composition before the match: the string itself is read in the window
+        // procedure (see `window_manager::ime_composition`), so it arrives on whichever event
+        // happens to be dispatched next - including the per-frame `RedrawRequested`.
+        self.sync_ime_composition();
+
         // Let egui handle the event (needed for proper rendering state)
         let (egui_consumed, egui_needs_repaint) =
             if let (Some(egui_state), Some(window)) = (&mut self.egui.state, &self.window) {

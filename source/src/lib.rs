@@ -65,6 +65,7 @@ pub mod command_history_ui;
 pub mod config;
 pub mod config_migration;
 pub mod copy_mode;
+pub mod egui_font;
 pub mod font_metrics;
 pub mod help_ui;
 pub mod http;

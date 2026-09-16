@@ -1,0 +1,12 @@
+{
+  "all_motion_disabled_is_static": true,
+  "isolated_motion": {
+    "iOrbitSpeed": 0.17379123263888888,
+    "iSurfaceSpeed": 0.04220486111111111,
+    "iCityFlow": 0.010815972222222222,
+    "iDrift": 0.0004969618055555555,
+    "iTwinkle": 0.0008268229166666667
+  },
+  "city_exits_both_sides_and_returns": true,
+  "light_changes_with_position": true
+}

@@ -420,7 +420,11 @@ impl WindowState {
 
         let scale_factor = window.scale_factor() as f32;
         let egui_ctx = egui::Context::default();
-        crate::settings_ui::nerd_font::configure_nerd_font(&egui_ctx);
+        // egui's own faces carry no CJK codepoints, so the IME preedit would paint a composed
+        // syllable as a replacement box. Hand it the terminal's font when that font covers Korean,
+        // so the composition is drawn in the very face the committed text will use.
+        let cjk_fallback = crate::egui_font::cjk_fallback_bytes(&self.config.load());
+        crate::settings_ui::nerd_font::configure_egui_fonts(&egui_ctx, cjk_fallback);
 
         if let Some(memory) = previous_memory {
             egui_ctx.memory_mut(|mem| *mem = memory);

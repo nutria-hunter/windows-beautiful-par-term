@@ -194,9 +194,7 @@ mod imp {
                 // let the user "resize" an edge that is pinned to the screen.
                 // SAFETY: hwnd is valid for the duration of this message.
                 let maximized = unsafe { IsZoomed(hwnd) } != 0;
-                if !maximized
-                    && let Some(ht) = border_hit(local_x, local_y, w, h)
-                {
+                if !maximized && let Some(ht) = border_hit(local_x, local_y, w, h) {
                     return ht;
                 }
                 if hits_free_tab_strip(local_x, local_y) {
@@ -214,9 +212,10 @@ mod imp {
             return 0;
         }
         if msg == WM_NCDESTROY
-            && let Ok(mut m) = previous().lock() {
-                m.remove(&hwnd);
-            }
+            && let Ok(mut m) = previous().lock()
+        {
+            m.remove(&hwnd);
+        }
         // SAFETY: prev is the procedure this window had before we subclassed it.
         unsafe { CallWindowProcW(prev, hwnd, msg, wp, lp) }
     }
@@ -237,11 +236,8 @@ mod imp {
         // SAFETY: hwnd comes from winit for this window and stays valid while the
         // window lives; the procedure is a 'static fn with the expected ABI.
         unsafe {
-            let prev = SetWindowLongPtrW(
-                hwnd,
-                GWLP_WNDPROC,
-                subclass_proc as *const c_void as isize,
-            );
+            let prev =
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, subclass_proc as *const c_void as isize);
             if prev == 0 {
                 log::warn!("titlebar drag: SetWindowLongPtrW failed for hwnd {hwnd}");
                 return;

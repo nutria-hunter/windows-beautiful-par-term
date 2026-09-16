@@ -193,3 +193,16 @@ galaxy-work/   셰이더 제작 작업장 (shaders/ 작업본, work/ 스크립�
 
 - 원본: [paulrobello/par-term](https://github.com/paulrobello/par-term) — MIT License, Copyright (c) 2026 Paul Robello
 - 이 저장소는 그 포크이며 `source/LICENSE`에 원 라이선스를 유지합니다.
+
+---
+
+## 2026-09-15 갱신 — 배경 셰이더 복구 (Vulkan 백엔드)
+
+- `release/par-term.exe` 가 새 빌드(**sha256 `a0e1d3e8…`**)로 교체되었습니다.
+- **중요**: 이 빌드는 그래픽 백엔드를 DX12로 고정하지 않습니다. DX12 경로는 이 셰이더의 파이프라인
+  컴파일을 끝내지 못해(수 분/미완) 배경이 사라졌습니다. 기본값은 Vulkan 우선(DX12 폴백)입니다.
+- 설치 셰이더: `config/shaders/kanagawa-starbound.glsl` (v6.1.0, 기능 100%).
+  `tilted-spiral.glsl`(은하수)도 그대로 들어 있습니다.
+- 자세한 원인·측정·검증 방법: `docs/2026-09-15-vulkan-backend-and-starbound.md`
+- 다음 작업(동적 렌더 해상도 스케일): `docs/PLAN-render-scale.md`
+

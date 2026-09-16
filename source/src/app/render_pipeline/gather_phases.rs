@@ -242,6 +242,7 @@ impl WindowState {
         &mut self,
         cells: &Arc<Vec<Cell>>,
         current_cursor_pos: Option<(usize, usize)>,
+        shader_cursor_pos: Option<(usize, usize)>,
         grid_dims: (usize, usize),
         generation: u64,
     ) {
@@ -265,6 +266,7 @@ impl WindowState {
             tab.active_cache_mut().generation = generation;
             tab.active_cache_mut().scroll_offset = current_scroll_offset;
             tab.active_cache_mut().cursor_pos = current_cursor_pos;
+            tab.active_cache_mut().shader_cursor_pos = shader_cursor_pos;
             tab.active_cache_mut().selection = current_selection;
             tab.active_cache_mut().grid_dims = grid_dims;
         }

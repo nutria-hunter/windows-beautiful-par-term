@@ -72,7 +72,7 @@ impl SettingsWindow {
         // Platform-specific backend selection for better VM compatibility
         #[cfg(target_os = "windows")]
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         #[cfg(target_os = "macos")]
@@ -169,7 +169,10 @@ impl SettingsWindow {
         // Initialize egui
         let scale_factor = window.scale_factor() as f32;
         let egui_ctx = egui::Context::default();
-        crate::settings_ui::nerd_font::configure_nerd_font(&egui_ctx);
+        // Same CJK fallback as the main window: the settings UI shows font names and profile
+        // labels, which are Korean for a Korean setup.
+        let cjk_fallback = crate::egui_font::cjk_fallback_bytes(&config);
+        crate::settings_ui::nerd_font::configure_egui_fonts(&egui_ctx, cjk_fallback);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,

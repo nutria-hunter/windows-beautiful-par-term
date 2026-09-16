@@ -1,0 +1,176 @@
+From 6ed0908386f5068ba8b3bb49e1650fbc56d467eb Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 23:41:50 +0900
+Subject: [PATCH 7/8] fix(render): stop hard-coding DX12 and report shader
+ pipeline failures
+
+The background shader compiled in ~1 s on Vulkan but never finished on the DX12
+backend (measured: still nothing after 95 s), which is what made the background
+disappear on a restart - a known wgpu DX12/HLSL path (gfx-rs/wgpu#7443, #2722).
+Backend selection now honours WGPU_BACKEND and otherwise asks for every backend,
+so Vulkan is taken when the driver offers it and DX12 stays as the fallback.
+
+The pipeline also failed silently: wgpu reports a rejected pipeline by panicking
+on the worker thread, and `poll_pipeline` only matched `Ok`, so a dead thread left
+`pipeline = None` for the life of the window with nothing in the log. The thread is
+now wrapped in `catch_unwind` with its message forwarded over the channel, both
+failure paths are logged, and landing a pipeline forces a repaint so the shader
+cannot arrive underneath a frame that nobody redraws.
+---
+ par-term-render/src/cell_renderer/mod.rs      |  5 +-
+ .../src/custom_shader_renderer/mod.rs         | 72 ++++++++++++++-----
+ par-term-render/src/renderer/rendering.rs     | 11 ++-
+ src/settings_window/mod.rs                    |  2 +-
+ 4 files changed, 69 insertions(+), 21 deletions(-)
+
+diff --git a/par-term-render/src/cell_renderer/mod.rs b/par-term-render/src/cell_renderer/mod.rs
+index 32759fa..da7685c 100644
+--- a/par-term-render/src/cell_renderer/mod.rs
++++ b/par-term-render/src/cell_renderer/mod.rs
+@@ -335,7 +335,10 @@ impl CellRenderer {
+         // Linux: Try Vulkan first, fall back to GL for VM compatibility
+         #[cfg(target_os = "windows")]
+         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+-            backends: wgpu::Backends::DX12,
++            // Honour WGPU_BACKEND when it is set: the DX12 path goes through the HLSL compiler, which
++            // is the backend that takes minutes on this shader (wgpu#7443). Vulkan compiles the same
++            // shader in seconds, so the choice must not be hard-coded.
++            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
+             ..wgpu::InstanceDescriptor::new_without_display_handle()
+         });
+         #[cfg(target_os = "macos")]
+diff --git a/par-term-render/src/custom_shader_renderer/mod.rs b/par-term-render/src/custom_shader_renderer/mod.rs
+index 095586c..fc7a385 100644
+--- a/par-term-render/src/custom_shader_renderer/mod.rs
++++ b/par-term-render/src/custom_shader_renderer/mod.rs
+@@ -114,8 +114,11 @@ pub struct CustomShaderRenderer {
+     /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
+     /// window paints while the pipeline is still being built.
+     pub(crate) pipeline: Option<RenderPipeline>,
+-    /// Receives the finished pipeline from that worker thread.
+-    pub(crate) pipeline_rx: Option<std::sync::mpsc::Receiver<RenderPipeline>>,
++    /// Receives the finished pipeline - or the message explaining why there is none - from that
++    /// worker thread. wgpu reports a rejected pipeline by panicking, so a plain `RenderPipeline`
++    /// channel could only ever say "closed", which is why a failed shader used to render nothing
++    /// with nothing in the log.
++    pub(crate) pipeline_rx: Option<std::sync::mpsc::Receiver<Result<RenderPipeline, String>>>,
+     /// Bind group for shader uniforms and textures
+     pub(crate) bind_group: BindGroup,
+     /// Uniform buffer for shader parameters
+@@ -423,15 +426,28 @@ impl CustomShaderRenderer {
+             std::thread::Builder::new()
+                 .name("custom-shader-pipeline".into())
+                 .spawn(move || {
+-                    let pipeline = create_render_pipeline(
+-                        &device,
+-                        &shader_module,
+-                        &bind_group_layout,
+-                        surface_format,
+-                        Some(pipeline_label),
+-                    );
++                    // A rejected pipeline panics inside wgpu (the message names the naga/wgpu error).
++                    // Catching it is what turns "no background, no log" into a readable reason.
++                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                        create_render_pipeline(
++                            &device,
++                            &shader_module,
++                            &bind_group_layout,
++                            surface_format,
++                            Some(pipeline_label),
++                        )
++                    }))
++                    .map_err(|payload| {
++                        payload
++                            .downcast_ref::<String>()
++                            .cloned()
++                            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
++                            .unwrap_or_else(|| {
++                                "pipeline thread panicked with a non-string payload".to_owned()
++                            })
++                    });
+                     // A closed window drops the receiver first; that is not an error.
+-                    let _ = pipeline_tx.send(pipeline);
++                    let _ = pipeline_tx.send(result);
+                 })
+                 .context("Failed to spawn custom shader pipeline thread")?;
+         }
+@@ -541,14 +557,38 @@ impl CustomShaderRenderer {
+     }
+ 
+     /// Install the pipeline once the worker thread finishes. One non-blocking receive per frame.
+-    pub fn poll_pipeline(&mut self) {
++    /// Returns true when a pipeline was installed, so the caller can repaint: the frames drawn while
++    /// the compile was in flight used the ordinary opaque background, and without a repaint the
++    /// shader would land behind an image that is never redrawn - the "toggle the shader and it stays
++    /// covered" symptom.
++    pub fn poll_pipeline(&mut self) -> bool {
+         let Some(rx) = self.pipeline_rx.as_ref() else {
+-            return;
++            return false;
+         };
+-        if let Ok(pipeline) = rx.try_recv() {
+-            log::info!("[SHADER] custom shader pipeline compiled in background; shader is live");
+-            self.pipeline = Some(pipeline);
+-            self.pipeline_rx = None;
++        match rx.try_recv() {
++            Ok(Ok(pipeline)) => {
++                log::info!("[SHADER] custom shader pipeline compiled in background; shader is live");
++                self.pipeline = Some(pipeline);
++                self.pipeline_rx = None;
++                true
++            }
++            Ok(Err(message)) => {
++                // The transpiler accepted the shader but the driver rejected the pipeline. Nothing
++                // will be drawn until the shader is fixed, so this must never be silent again.
++                log::error!(
++                    "[SHADER] pipeline creation failed; no background will be drawn: {message}"
++                );
++                self.pipeline_rx = None;
++                false
++            }
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
++                log::error!(
++                    "[SHADER] pipeline thread died without reporting; no background will be drawn"
++                );
++                self.pipeline_rx = None;
++                false
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+         }
+     }
+ 
+diff --git a/par-term-render/src/renderer/rendering.rs b/par-term-render/src/renderer/rendering.rs
+index 7399d82..082aa27 100644
+--- a/par-term-render/src/renderer/rendering.rs
++++ b/par-term-render/src/renderer/rendering.rs
+@@ -211,9 +211,14 @@ impl Renderer {
+ 
+         // Land the background pipeline compile as soon as it finishes. Until it lands the renderer
+         // reports "no custom shader", so panes paint normally and the background blends in a frame
+-        // later instead of the window waiting seconds on the driver.
+-        if let Some(shader) = self.custom_shader_renderer.as_mut() {
+-            shader.poll_pipeline();
++        // later instead of the window waiting seconds on the driver. Installing it must also force a
++        // repaint: those interim frames were composited against an opaque background, and without a
++        // redraw the shader would arrive underneath an image nobody repaints - which is exactly what
++        // "toggle the shader and the screen stays covered" looked like.
++        if let Some(shader) = self.custom_shader_renderer.as_mut()
++            && shader.poll_pipeline()
++        {
++            self.dirty = true;
+         }
+         let has_custom_shader = self
+             .custom_shader_renderer
+diff --git a/src/settings_window/mod.rs b/src/settings_window/mod.rs
+index 1663909..3b83d38 100644
+--- a/src/settings_window/mod.rs
++++ b/src/settings_window/mod.rs
+@@ -72,7 +72,7 @@ impl SettingsWindow {
+         // Platform-specific backend selection for better VM compatibility
+         #[cfg(target_os = "windows")]
+         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+-            backends: wgpu::Backends::DX12,
++            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
+             ..wgpu::InstanceDescriptor::new_without_display_handle()
+         });
+         #[cfg(target_os = "macos")]

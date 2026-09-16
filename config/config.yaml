@@ -32,6 +32,12 @@ blur_radius: 8
 window_padding: 6.0
 hide_window_padding_on_split: true
 snap_window_to_grid: false
+window_rounded_corners: true
+window_border_enabled: true
+window_border_color:
+- 84
+- 84
+- 109
 window_type: normal
 target_monitor: null
 target_space: null
@@ -52,7 +58,7 @@ background_color:
 - 30
 - 30
 download_save_location: downloads
-custom_shader: tilted-spiral.glsl
+custom_shader: kanagawa-starbound.glsl
 custom_shader_enabled: true
 custom_shader_animation: true
 custom_shader_animation_speed: 1.0
@@ -94,6 +100,8 @@ modifier_remapping:
   left_super: none
   right_super: none
 use_physical_keys: false
+kitty_keyboard: true
+ime_preedit_rendering: builtin
 auto_copy_selection: true
 copy_trailing_newline: false
 middle_click_paste: true
@@ -198,9 +206,9 @@ scrollbar_position: right
 scrollbar_width: 10.0
 scrollbar_thumb_color:
 - 0.62
-- 0.60
+- 0.6
 - 0.71
-- 0.90
+- 0.9
 scrollbar_track_color:
 - 0.0
 - 0.0
@@ -297,7 +305,6 @@ tab_title_mode: auto
 remote_tab_title_format: user_at_host
 remote_tab_title_osc_priority: true
 tab_bar_height: 36.0
-tab_pill_inset_y: 5.0
 tab_bar_position: top
 tab_bar_width: 160.0
 tab_show_close_button: true
@@ -362,6 +369,10 @@ tab_border_color:
 - 109
 tab_border_width: 1.0
 tab_inactive_outline_only: true
+tab_bar_bg_alpha: 0.85
+tab_indicator_height: 2.0
+tab_pill_inset_y: 5.0
+tab_text_bold: true
 pane_divider_width: 2.0
 pane_divider_hit_width: 5.0
 pane_padding: 1.0
@@ -415,7 +426,7 @@ pause_shaders_on_blur: false
 pause_refresh_on_blur: false
 unfocused_fps: 60
 inactive_tab_fps: 30
-shader_hot_reload: false
+shader_hot_reload: true
 shader_hot_reload_delay: 100
 shader_configs: {}
 cursor_shader_configs: {}
@@ -477,7 +488,7 @@ integration_versions:
   shell_integration_installed_version: null
   shell_integration_prompted_version: null
 update_check_frequency: daily
-last_update_check: 2026-09-12T01:19:32.124477+00:00
+last_update_check: 2026-09-16T19:46:07.039393900+00:00
 skipped_version: null
 last_notified_version: null
 restore_session: false
@@ -629,11 +640,3 @@ ai_inspector_agent_terminal_access: false
 ai_inspector_agent_screenshot_access: true
 ai_inspector_chat_font_size: 14.0
 ai_inspector_input_history_mode: session
-tab_bar_bg_alpha: 0.85
-window_rounded_corners: true
-window_border_enabled: true
-window_border_color:
-- 84
-- 84
-- 109
-tab_text_bold: true

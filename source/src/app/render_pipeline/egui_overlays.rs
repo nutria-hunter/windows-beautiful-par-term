@@ -81,12 +81,44 @@ pub(super) fn render_resize_overlay(
         });
 }
 
+/// Vertical correction for the composition, in points.
+///
+/// Calibrated against a committed syllable on the same row: unshifted, the composition's ink sits
+/// ~13 physical px above the terminal's at 200% scaling. Expressed as a fraction of the font size
+/// so it scales with it, and overridable through `PAR_TERM_IME_PREEDIT_DY` (points) so the value
+/// can be confirmed from a screenshot without a rebuild per attempt.
+const BASELINE_CORRECTION: f32 = 0.5;
+
+/// How far down to shift the composition, in points.
+// Kept as a deliberate fallback: the composition is normally stamped into the cell buffer
+// (`ime_stamp`), but if that path ever needs an escape hatch (e.g. a renderer mode that cannot
+// take a stamped grid), this egui overlay is the revert target — re-adding its call in
+// `egui_submit` is a one-line change.
+#[allow(dead_code)]
+fn baseline_correction(size: f32) -> f32 {
+    static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let override_points = *OVERRIDE.get_or_init(|| {
+        std::env::var("PAR_TERM_IME_PREEDIT_DY")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+    });
+    override_points.unwrap_or(size * BASELINE_CORRECTION)
+}
+
 /// Draw the IME preedit inline at the terminal cursor.
 ///
 /// Composing text is not part of the grid - the child learns nothing about it until the IME
 /// commits - so it is painted over the cursor cell, which is how a native terminal shows a
 /// syllable being composed. The caller passes the renderer's physical-pixel metrics while egui
 /// works in logical points, hence the `scale` division.
+///
+/// `bg` is the fill behind the composing glyphs, and it is `None` whenever something other than
+/// the theme paints the grid background (a custom shader or a background image). Filling with the
+/// theme background there would stamp an opaque rectangle through an animated background.
+/// Deliberately retired: the composition is stamped into the cells and drawn by the normal cell
+/// renderer now (see `ime_stamp`), which cannot drift out of font, size or baseline. Kept for a
+/// one-line revert if a renderer mode appears where a stamped grid is not available.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // Each value comes from a different owner (IME state, terminal cache, renderer sizing, theme); a struct for one call site would be worse
 pub(super) fn render_ime_preedit(
     ctx: &egui::Context,
@@ -96,8 +128,9 @@ pub(super) fn render_ime_preedit(
     cell_height_px: f32,
     content_offset_px: (f32, f32),
     scale: f32,
+    font_size_points: f32,
     fg: egui::Color32,
-    bg: egui::Color32,
+    bg: Option<egui::Color32>,
 ) {
     let Some((col, row)) = cell else {
         return;
@@ -109,18 +142,62 @@ pub(super) fn render_ime_preedit(
         (content_offset_px.0 + col as f32 * cell_width_px) / scale,
         (content_offset_px.1 + row as f32 * cell_height_px) / scale,
     );
-    let font = egui::FontId::monospace(cell_height_px / scale);
+    // The composition must be drawn at the size of the text it turns into, not at the size of the
+    // cell. A cell is ~1.4x taller than its glyphs, so using the cell height here paints the
+    // composing syllable noticeably larger than the committed one and the two read as different
+    // fonts (reported as such). Falls back to the cell height only if the config has no size.
+    let size = if font_size_points > 0.0 {
+        font_size_points
+    } else {
+        cell_height_px / scale
+    };
+    // Empirical probe: compare egui's pixels-per-point against the renderer's scale once per
+    // composition; the overlay's geometry only agrees across DPIs when the two match.
+    crate::debug_info!(
+        "IME",
+        "ime preedit draw: egui_ppp={:.2} renderer_scale={:.2} cell_px=({:.1}x{:.1}) font_size={:.2}",
+        ctx.pixels_per_point(),
+        scale,
+        cell_width_px,
+        cell_height_px,
+        font_size_points
+    );
+    let font = egui::FontId::new(
+        size,
+        egui::FontFamily::Name(crate::settings_ui::nerd_font::IME_PREEDIT_FAMILY.into()),
+    );
+    // Characters a renderer is required to draw as nothing. The Korean IME reports U+3164 HANGUL
+    // FILLER while a syllable is still incomplete (and the conjoining fillers U+115F/U+1160 exist
+    // for the same purpose); they are `Default_Ignorable_Code_Point`, so drawing them is wrong to
+    // begin with - and a face that lacks them gets epaint's replacement box instead, which is how
+    // a filler turned into "a small rectangle above the cursor".
+    let preedit: String = preedit
+        .chars()
+        .filter(|c| !matches!(*c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'))
+        .collect();
+    if preedit.is_empty() {
+        return;
+    }
+    // egui lays a galley out from its line-box top, with the ascent taken from the first face in
+    // the family (egui's own monospace); the terminal places the same glyph by the cell's own
+    // metrics. The two do not agree, and the measured difference put the composing syllable about
+    // half a line above the text it continues - a floating glyph instead of inline text, which is
+    // what "the composition sits above the cursor" was. The correction is a fraction of the font
+    // size so it scales with it.
+    let pos = egui::pos2(pos.x, pos.y + baseline_correction(size));
     egui::Area::new(egui::Id::new("ime_preedit"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
-            let galley = ui.painter().layout_no_wrap(preedit.to_owned(), font, fg);
+            let galley = ui.painter().layout_no_wrap(preedit.clone(), font, fg);
             // At least one cell wide, so an empty preedit still shows where composition is.
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(galley.size().x.max(cell_width_px / scale), galley.size().y),
                 egui::Sense::hover(),
             );
-            ui.painter().rect_filled(rect, 0.0, bg);
+            if let Some(bg) = bg {
+                ui.painter().rect_filled(rect, 0.0, bg);
+            }
             ui.painter().galley(rect.min, galley, fg);
             // Underline, so a composition is distinguishable from committed text.
             ui.painter().rect_filled(

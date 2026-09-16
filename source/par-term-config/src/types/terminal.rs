@@ -57,6 +57,24 @@ pub enum OptionKeyMode {
     Esc,
 }
 
+/// How the IME composition (preedit) string is drawn while a syllable is being composed.
+///
+/// Windows expects the focused application to draw the composition itself, and winit enforces
+/// that by clearing `ISC_SHOWUICOMPOSITIONWINDOW` on every `WM_IME_SETCONTEXT`. See
+/// `par_term::app::window_manager::ime_composition` for how each mode is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImePreeditRendering {
+    /// par-term reads the composition string out of Imm32 and draws it inline at the cursor, in
+    /// the terminal's own font. WezTerm calls this `"Builtin"`.
+    #[default]
+    Builtin,
+    /// Let Windows draw its own composition window at the caret. WezTerm calls this `"System"`.
+    /// It looks worse (a floating box rather than inline text) but it survives whatever the
+    /// render loop is doing, because the OS owns the drawing.
+    System,
+}
+
 /// Target modifier for remapping.
 ///
 /// Allows remapping one modifier key to behave as another.

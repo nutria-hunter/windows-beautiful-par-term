@@ -16,6 +16,7 @@ mod frame_setup;
 mod gather_data;
 mod gather_phases;
 mod gpu_submit;
+mod ime_stamp;
 mod overlay_cells;
 mod pane_render;
 mod post_render;

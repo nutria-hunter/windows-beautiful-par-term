@@ -3,6 +3,11 @@
 //! Composition is a separate path from `key_handler`: the IME consumes the physical keys and
 //! reports text instead, so composed Korean/Japanese/Chinese can only reach a child from
 //! `Ime::Commit`. See `window_state::ime_state` for what the missing handler did.
+//!
+//! There are two sources for the *display* of a composition, and `Ime::Preedit` is only one of
+//! them: [`sync_ime_composition`](crate::app::window_state::WindowState::sync_ime_composition)
+//! also pulls the string read straight out of Imm32 by `window_manager::ime_composition`, because
+//! winit's preedit can be empty for an entire composition on Windows.
 
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::Ime;
@@ -60,6 +65,38 @@ impl crate::app::window_state::WindowState {
         }
     }
 
+    /// Pull the Imm32 composition into `ImeState`, and tell the window procedure which renderer
+    /// owns the composition this frame.
+    ///
+    /// Called once per window event rather than from the `Ime` arm: the composition string is
+    /// read in the window procedure, so an event that is not `Ime` (the per-frame
+    /// `RedrawRequested`, above all) is what carries it to the renderer. That also makes the
+    /// reader self-healing - a `Ime::Commit` for the previous syllable clears the state, and the
+    /// next frame restores the composition that arrived in the same message.
+    pub(crate) fn sync_ime_composition(&mut self) {
+        use crate::app::window_manager::ime_composition;
+        ime_composition::publish_mode(self.config.load().input.ime_preedit_rendering);
+        let observed = ime_composition::current();
+        let changed = observed.composing != self.ime.imm_composing
+            || (observed.composing && observed.text != self.ime.imm_preedit);
+        if observed.composing {
+            // The IME is live even when winit has not said so: `Ime::Enabled` rides on the same
+            // path this reader exists to cover, and `publish_ime_cursor_area` is gated on it.
+            self.ime.enabled = true;
+        }
+        self.ime.imm_composing = observed.composing;
+        self.ime.imm_preedit = if observed.composing {
+            observed.text
+        } else {
+            String::new()
+        };
+        if changed {
+            // Re-publishing on change (not every frame) keeps the candidate window next to the
+            // caret without re-issuing IMM calls at frame rate.
+            self.publish_ime_cursor_area();
+        }
+    }
+
     /// Write composed text to the terminal the keyboard would target.
     ///
     /// Deliberately not `paste_text`: that path goes through `TerminalManager::paste`, which
@@ -97,11 +134,12 @@ impl crate::app::window_state::WindowState {
         if !self.ime.enabled {
             return;
         }
-        let Some(cell) = self
-            .tab_manager
-            .active_tab()
-            .and_then(|tab| tab.active_cache().cursor_pos)
-        else {
+        let Some(cell) = self.tab_manager.active_tab().and_then(|tab| {
+            // Position, not visibility: the candidate window belongs next to the caret even when
+            // the application draws its own caret (see the overlay's cell lookup in `egui_submit`).
+            let cache = tab.active_cache();
+            cache.shader_cursor_pos.or(cache.cursor_pos)
+        }) else {
             return;
         };
         if self.ime.published_cell == Some(cell) {

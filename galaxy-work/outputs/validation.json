@@ -6,15 +6,15 @@
   ],
   "overrides": {},
   "results": {
-    "tilted-spiral": {
-      "gpu_ms_median": 0.31630400000000003,
-      "gpu_ms_p95": 0.3189264,
-      "gpu_ms_min": 0.314016,
-      "black_fraction": 0.684482421875,
+    "kanagawa-starbound-baseline": {
+      "gpu_ms_median": 1.4354879999999999,
+      "gpu_ms_p95": 1.447016,
+      "gpu_ms_min": 1.432032,
+      "black_fraction": 0.5947611641589506,
       "luma_median": 0.0,
-      "luma_p95": 43.3036,
-      "luma_p99": 72.6848,
-      "luma_max": 254.85559999999998,
+      "luma_p95": 46.3834,
+      "luma_p99": 46.3834,
+      "luma_max": 118.7256,
       "brightness_zero_is_black": true
     }
   }

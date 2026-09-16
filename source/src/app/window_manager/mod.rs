@@ -16,12 +16,14 @@
 //! - `arrangements`          — save/restore/manage window arrangements
 //! - `config_propagation`    — apply config changes from settings to all windows
 //! - `config_renderer_apply` — renderer-specific settings application (split from config_propagation)
+//! - `ime_composition`       — Imm32 composition observer for the built-in IME preedit overlay
 
 mod arrangements;
 mod cli_timer;
 mod config_propagation;
 mod config_renderer_apply;
 mod coprocess;
+pub(crate) mod ime_composition;
 mod menu_actions;
 mod scripting;
 mod settings_actions;

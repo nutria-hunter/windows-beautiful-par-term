@@ -1,0 +1,21 @@
+{
+  "renderer": "NVIDIA GeForce RTX 5090/PCIe/SSE2",
+  "resolution": [
+    3840,
+    2160
+  ],
+  "overrides": {},
+  "results": {
+    "kanagawa-starbound-v1.5-gas15": {
+      "gpu_ms_median": 0.175008,
+      "gpu_ms_p95": 0.1765536,
+      "gpu_ms_min": 0.172896,
+      "black_fraction": 0.6223283179012346,
+      "luma_median": 0.0,
+      "luma_p95": 51.455600000000004,
+      "luma_p99": 51.455600000000004,
+      "luma_max": 96.01719999999999,
+      "brightness_zero_is_black": true
+    }
+  }
+}

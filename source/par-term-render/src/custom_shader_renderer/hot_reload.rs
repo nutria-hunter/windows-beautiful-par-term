@@ -57,13 +57,14 @@ impl CustomShaderRenderer {
             source: ShaderSource::Wgsl(wgsl_source.into()),
         });
 
-        self.pipeline = create_render_pipeline(
+        self.pipeline = Some(create_render_pipeline(
             device,
             &shader_module,
             &self.bind_group_layout,
             self.surface_format,
             Some("Custom Shader Pipeline (reloaded)"),
-        );
+        ));
+        self.pipeline_rx = None;
         self.custom_controls = custom_controls;
 
         log::info!("Custom shader reloaded successfully from source");

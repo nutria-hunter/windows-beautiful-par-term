@@ -1,0 +1,2315 @@
+From 86e9ef5927ef0805cb6ff898b1673bc7511b2cbb Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 02:08:55 +0900
+Subject: [PATCH 6/8] chore: checkpoint the IME, render-pipeline and
+ shader-init work
+
+Working-tree checkpoint of everything in flight, not a reviewed change set.
+
+Input method
+- Stamp the composition (preedit) into the cell buffer and let the normal cell
+  renderer draw it, so font, size, DPI and wide-cell spacing come out right by
+  construction. Adds src/app/render_pipeline/ime_stamp.rs and
+  src/app/window_manager/ime_composition.rs (Imm32 observer with HWND subclass
+  chaining), retires the egui overlay path for preedit.
+
+Custom background shader
+- Build the render pipeline on a worker thread. The driver compile of a large
+  shader takes seconds and needs no window, so the window now paints its first
+  frame immediately and the shader blends in when it is ready. Measured on this
+  machine: first frame 8.4s -> 1.6s.
+- Isolate the installer's GLSL-frontend limitation that broke such shaders:
+  naga does not resolve GLSL prototypes, so every function must be defined
+  before its first call.
+
+Also includes render-pipeline plumbing, config and settings-UI changes, and
+vendor/par-term-emu-core-rust terminal changes that were pending in the tree.
+---
+ .../src/config/config_struct/input_config.rs  |  12 +-
+ par-term-config/src/defaults/mod.rs           |   2 +-
+ par-term-config/src/lib.rs                    |  20 +-
+ par-term-config/src/shell_detection.rs        |  13 +-
+ par-term-config/src/types/mod.rs              |   5 +-
+ par-term-config/src/types/terminal.rs         |  18 +
+ .../src/custom_shader_renderer/hot_reload.rs  |   5 +-
+ .../src/custom_shader_renderer/mod.rs         |  78 +++-
+ par-term-render/src/renderer/rendering.rs     |  11 +-
+ .../src/input_tab/keyboard.rs                 |  62 ++-
+ par-term-settings-ui/src/nerd_font.rs         | 179 ++++++++
+ .../tests/sync_updates_regression.rs          |  41 ++
+ .../window_state_impl/handle_window_event.rs  |   5 +
+ src/app/input_events/ime.rs                   |  48 ++-
+ src/app/render_pipeline/egui_overlays.rs      |  85 +++-
+ src/app/render_pipeline/egui_submit.rs        |  58 +--
+ src/app/render_pipeline/frame_setup.rs        |  17 +-
+ src/app/render_pipeline/gather_data.rs        |  31 +-
+ src/app/render_pipeline/gather_phases.rs      |   2 +
+ src/app/render_pipeline/gpu_submit.rs         |  47 ++-
+ src/app/render_pipeline/ime_stamp.rs          | 125 ++++++
+ src/app/render_pipeline/mod.rs                |   1 +
+ src/app/render_pipeline/tab_snapshot.rs       |   9 +
+ src/app/window_manager/ime_composition.rs     | 393 ++++++++++++++++++
+ src/app/window_manager/mod.rs                 |   2 +
+ src/app/window_manager/titlebar_drag.rs       |  18 +-
+ src/app/window_manager/window_effects.rs      |  12 +-
+ src/app/window_manager/window_lifecycle.rs    |   5 +
+ src/app/window_manager/window_session.rs      |   5 +
+ src/app/window_state/ime_state.rs             |  50 ++-
+ src/app/window_state/impl_init.rs             |   2 +-
+ src/app/window_state/renderer_init.rs         |   6 +-
+ src/egui_font.rs                              |  98 +++++
+ src/lib.rs                                    |   1 +
+ src/pane/render_cache.rs                      |  12 +-
+ src/settings_window/mod.rs                    |   5 +-
+ .../src/terminal/mod.rs                       | 110 ++++-
+ 37 files changed, 1450 insertions(+), 143 deletions(-)
+ create mode 100644 src/app/render_pipeline/ime_stamp.rs
+ create mode 100644 src/app/window_manager/ime_composition.rs
+ create mode 100644 src/egui_font.rs
+
+diff --git a/par-term-config/src/config/config_struct/input_config.rs b/par-term-config/src/config/config_struct/input_config.rs
+index ca8ac84..d176848 100644
+--- a/par-term-config/src/config/config_struct/input_config.rs
++++ b/par-term-config/src/config/config_struct/input_config.rs
+@@ -4,7 +4,7 @@
+ //! All fields serialise at the top level of the YAML config file -- existing
+ //! config files remain 100% compatible.
+ 
+-use crate::types::{ModifierRemapping, OptionKeyMode};
++use crate::types::{ImePreeditRendering, ModifierRemapping, OptionKeyMode};
+ use serde::{Deserialize, Serialize};
+ 
+ /// Option/Alt key behaviour, modifier remapping and physical key positions.
+@@ -45,6 +45,15 @@ pub struct InputConfig {
+     /// application that requests the protocol but cannot parse the result.
+     #[serde(default = "crate::defaults::bool_true")]
+     pub kitty_keyboard: bool,
++
++    /// How the IME composition (preedit) string is drawn while a syllable is being composed
++    ///
++    /// `builtin` (default) reads the composition string from Imm32 and draws it inline at the
++    /// cursor with the terminal's own font — WezTerm's `ime_preedit_rendering = "Builtin"`.
++    /// `system` leaves the drawing to Windows' own composition window, which is uglier but
++    /// cannot be missed if a frame is skipped — WezTerm's `"System"`.
++    #[serde(default)]
++    pub ime_preedit_rendering: ImePreeditRendering,
+ }
+ 
+ impl Default for InputConfig {
+@@ -55,6 +64,7 @@ impl Default for InputConfig {
+             modifier_remapping: ModifierRemapping::default(),
+             use_physical_keys: crate::defaults::bool_false(),
+             kitty_keyboard: crate::defaults::bool_true(),
++            ime_preedit_rendering: ImePreeditRendering::default(),
+         }
+     }
+ }
+diff --git a/par-term-config/src/defaults/mod.rs b/par-term-config/src/defaults/mod.rs
+index ab40631..86387e7 100644
+--- a/par-term-config/src/defaults/mod.rs
++++ b/par-term-config/src/defaults/mod.rs
+@@ -59,7 +59,7 @@ pub use colors::{
+     search_highlight_color, tab_active_background, tab_active_indicator, tab_active_text,
+     tab_activity_indicator, tab_bar_background, tab_bar_bg_alpha, tab_bell_indicator,
+     tab_border_color, tab_close_button, tab_close_button_hover, tab_hover_background,
+-    tab_inactive_background, tab_indicator_height, tab_inactive_text, tab_pill_inset_y,
++    tab_inactive_background, tab_inactive_text, tab_indicator_height, tab_pill_inset_y,
+     tab_text_bold, visual_bell_color,
+ };
+ 
+diff --git a/par-term-config/src/lib.rs b/par-term-config/src/lib.rs
+index dda7f0f..9ff025a 100644
+--- a/par-term-config/src/lib.rs
++++ b/par-term-config/src/lib.rs
+@@ -273,16 +273,16 @@ pub use automation::{
+ pub use types::{
+     AlertEvent, AlertSoundConfig, BackgroundImageMode, BackgroundMode, CursorShaderConfig,
+     CursorShaderMetadata, CursorStyle, DividerRect, DividerStyle, DownloadSaveLocation,
+-    DroppedFileQuoteStyle, FontRange, ImageScalingMode, InstallPromptState, IntegrationVersions,
+-    KeyBinding, LinkUnderlineStyle, LogLevel, ModifierRemapping, ModifierTarget, NewTabPosition,
+-    OptionKeyMode, PaneBackground, PaneBackgroundConfig, PaneId, PaneTitlePosition,
+-    PowerPreference, ProgressBarPosition, ProgressBarStyle, RemoteTabTitleFormat,
+-    SemanticHistoryEditorMode, SeparatorMark, SessionLogFormat, ShaderBackgroundBlendMode,
+-    ShaderConfig, ShaderInstallPrompt, ShaderMetadata, ShaderSafetyBadge, ShellExitAction,
+-    ShellType, SmartSelectionPrecision, SmartSelectionRule, StartupDirectoryMode,
+-    StatusBarPosition, TabBarMode, TabBarPosition, TabId, TabStyle, TabTitleMode, ThinStrokesMode,
+-    UnfocusedCursorStyle, UpdateCheckFrequency, VsyncMode, WindowType,
+-    default_smart_selection_rules,
++    DroppedFileQuoteStyle, FontRange, ImageScalingMode, ImePreeditRendering, InstallPromptState,
++    IntegrationVersions, KeyBinding, LinkUnderlineStyle, LogLevel, ModifierRemapping,
++    ModifierTarget, NewTabPosition, OptionKeyMode, PaneBackground, PaneBackgroundConfig, PaneId,
++    PaneTitlePosition, PowerPreference, ProgressBarPosition, ProgressBarStyle,
++    RemoteTabTitleFormat, SemanticHistoryEditorMode, SeparatorMark, SessionLogFormat,
++    ShaderBackgroundBlendMode, ShaderConfig, ShaderInstallPrompt, ShaderMetadata,
++    ShaderSafetyBadge, ShellExitAction, ShellType, SmartSelectionPrecision, SmartSelectionRule,
++    StartupDirectoryMode, StatusBarPosition, TabBarMode, TabBarPosition, TabId, TabStyle,
++    TabTitleMode, ThinStrokesMode, UnfocusedCursorStyle, UpdateCheckFrequency, VsyncMode,
++    WindowType, default_smart_selection_rules,
+ };
+ // Scripting / observer scripts
+ pub use scripting::ScriptConfig;
+diff --git a/par-term-config/src/shell_detection.rs b/par-term-config/src/shell_detection.rs
+index 246e7ea..48d50f4 100644
+--- a/par-term-config/src/shell_detection.rs
++++ b/par-term-config/src/shell_detection.rs
+@@ -146,12 +146,13 @@ fn detect_shells() -> Vec<ShellInfo> {
+     // PowerShell 7+ (pwsh)
+     if let Ok(output) = std::process::Command::new("where").arg("pwsh.exe").output()
+         && output.status.success()
+-            && let Ok(path) = String::from_utf8(output.stdout) {
+-                let path = path.lines().next().unwrap_or("").trim();
+-                if !path.is_empty() && Path::new(path).exists() {
+-                    shells.push(ShellInfo::new("PowerShell 7", path));
+-                }
+-            }
++        && let Ok(path) = String::from_utf8(output.stdout)
++    {
++        let path = path.lines().next().unwrap_or("").trim();
++        if !path.is_empty() && Path::new(path).exists() {
++            shells.push(ShellInfo::new("PowerShell 7", path));
++        }
++    }
+ 
+     // Windows PowerShell (5.1)
+     let ps_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+diff --git a/par-term-config/src/types/mod.rs b/par-term-config/src/types/mod.rs
+index 878bb07..6a1e467 100644
+--- a/par-term-config/src/types/mod.rs
++++ b/par-term-config/src/types/mod.rs
+@@ -55,7 +55,8 @@ pub use tab_bar::{
+     TabTitleMode, WindowType,
+ };
+ pub use terminal::{
+-    CursorStyle, LinkUnderlineStyle, LogLevel, ModifierRemapping, ModifierTarget, OptionKeyMode,
+-    SemanticHistoryEditorMode, SessionLogFormat, UnfocusedCursorStyle,
++    CursorStyle, ImePreeditRendering, LinkUnderlineStyle, LogLevel, ModifierRemapping,
++    ModifierTarget, OptionKeyMode, SemanticHistoryEditorMode, SessionLogFormat,
++    UnfocusedCursorStyle,
+ };
+ pub use unicode::{AmbiguousWidth, NormalizationForm, UnicodeVersion};
+diff --git a/par-term-config/src/types/terminal.rs b/par-term-config/src/types/terminal.rs
+index 8b68d7c..783fd05 100644
+--- a/par-term-config/src/types/terminal.rs
++++ b/par-term-config/src/types/terminal.rs
+@@ -57,6 +57,24 @@ pub enum OptionKeyMode {
+     Esc,
+ }
+ 
++/// How the IME composition (preedit) string is drawn while a syllable is being composed.
++///
++/// Windows expects the focused application to draw the composition itself, and winit enforces
++/// that by clearing `ISC_SHOWUICOMPOSITIONWINDOW` on every `WM_IME_SETCONTEXT`. See
++/// `par_term::app::window_manager::ime_composition` for how each mode is implemented.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "lowercase")]
++pub enum ImePreeditRendering {
++    /// par-term reads the composition string out of Imm32 and draws it inline at the cursor, in
++    /// the terminal's own font. WezTerm calls this `"Builtin"`.
++    #[default]
++    Builtin,
++    /// Let Windows draw its own composition window at the caret. WezTerm calls this `"System"`.
++    /// It looks worse (a floating box rather than inline text) but it survives whatever the
++    /// render loop is doing, because the OS owns the drawing.
++    System,
++}
++
+ /// Target modifier for remapping.
+ ///
+ /// Allows remapping one modifier key to behave as another.
+diff --git a/par-term-render/src/custom_shader_renderer/hot_reload.rs b/par-term-render/src/custom_shader_renderer/hot_reload.rs
+index 5779531..0aa8236 100644
+--- a/par-term-render/src/custom_shader_renderer/hot_reload.rs
++++ b/par-term-render/src/custom_shader_renderer/hot_reload.rs
+@@ -57,13 +57,14 @@ impl CustomShaderRenderer {
+             source: ShaderSource::Wgsl(wgsl_source.into()),
+         });
+ 
+-        self.pipeline = create_render_pipeline(
++        self.pipeline = Some(create_render_pipeline(
+             device,
+             &shader_module,
+             &self.bind_group_layout,
+             self.surface_format,
+             Some("Custom Shader Pipeline (reloaded)"),
+-        );
++        ));
++        self.pipeline_rx = None;
+         self.custom_controls = custom_controls;
+ 
+         log::info!("Custom shader reloaded successfully from source");
+diff --git a/par-term-render/src/custom_shader_renderer/mod.rs b/par-term-render/src/custom_shader_renderer/mod.rs
+index 33aed10..095586c 100644
+--- a/par-term-render/src/custom_shader_renderer/mod.rs
++++ b/par-term-render/src/custom_shader_renderer/mod.rs
+@@ -110,8 +110,12 @@ fn animation_start_after_enabled_update(
+ 
+ /// Custom shader renderer that applies post-processing effects
+ pub struct CustomShaderRenderer {
+-    /// The render pipeline for the custom shader
+-    pub(crate) pipeline: RenderPipeline,
++    /// The render pipeline for the custom shader. `None` until the background compile lands: the
++    /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
++    /// window paints while the pipeline is still being built.
++    pub(crate) pipeline: Option<RenderPipeline>,
++    /// Receives the finished pipeline from that worker thread.
++    pub(crate) pipeline_rx: Option<std::sync::mpsc::Receiver<RenderPipeline>>,
+     /// Bind group for shader uniforms and textures
+     pub(crate) bind_group: BindGroup,
+     /// Uniform buffer for shader parameters
+@@ -342,12 +346,10 @@ impl CustomShaderRenderer {
+         )
+         .validate(&module)
+         .context("Custom shader WGSL validation failed")?;
+-
+         let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+             label: Some("Custom Shader Module"),
+             source: ShaderSource::Wgsl(wgsl_source.clone().into()),
+         });
+-
+         // Create intermediate texture for terminal content
+         let (intermediate_texture, intermediate_texture_view) =
+             Self::create_intermediate_texture(device, surface_format, width, height);
+@@ -408,18 +410,35 @@ impl CustomShaderRenderer {
+             },
+         );
+ 
+-        // Create render pipeline
+-        let pipeline = create_render_pipeline(
+-            device,
+-            &shader_module,
+-            &bind_group_layout,
+-            surface_format,
+-            Some("Custom Shader Pipeline"),
+-        );
+-
++        // Build the pipeline on a worker thread. Measured on an RTX 5090: ~40 ms for a small
++        // shader, but 6-9 s for a large one, every single launch, scaling with shader size. The
++        // compile needs only the device, module and layout - never the window - so the window comes
++        // up immediately and the shader blends in when it is ready.
++        let (pipeline_tx, pipeline_rx) = std::sync::mpsc::channel();
++        let pipeline_label = "Custom Shader Pipeline";
++        {
++            let device = device.clone();
++            let shader_module = shader_module.clone();
++            let bind_group_layout = bind_group_layout.clone();
++            std::thread::Builder::new()
++                .name("custom-shader-pipeline".into())
++                .spawn(move || {
++                    let pipeline = create_render_pipeline(
++                        &device,
++                        &shader_module,
++                        &bind_group_layout,
++                        surface_format,
++                        Some(pipeline_label),
++                    );
++                    // A closed window drops the receiver first; that is not an error.
++                    let _ = pipeline_tx.send(pipeline);
++                })
++                .context("Failed to spawn custom shader pipeline thread")?;
++        }
+         let now = Instant::now();
+         Ok(Self {
+-            pipeline,
++            pipeline: None,
++            pipeline_rx: Some(pipeline_rx),
+             bind_group,
+             uniform_buffer,
+             custom_uniform_buffer,
+@@ -515,6 +534,24 @@ impl CustomShaderRenderer {
+ 
+     /// Render the custom shader with a specified clear color.
+     /// Use this for solid background colors where the clear color provides the background.
++    /// Whether the background pipeline compile has landed. Until it has, the shader must not be
++    /// drawn at all: its render pass clears the target, so "drawing nothing" would erase the frame.
++    pub fn is_ready(&self) -> bool {
++        self.pipeline.is_some()
++    }
++
++    /// Install the pipeline once the worker thread finishes. One non-blocking receive per frame.
++    pub fn poll_pipeline(&mut self) {
++        let Some(rx) = self.pipeline_rx.as_ref() else {
++            return;
++        };
++        if let Ok(pipeline) = rx.try_recv() {
++            log::info!("[SHADER] custom shader pipeline compiled in background; shader is live");
++            self.pipeline = Some(pipeline);
++            self.pipeline_rx = None;
++        }
++    }
++
+     pub fn render_with_clear_color(
+         &mut self,
+         device: &Device,
+@@ -523,6 +560,11 @@ impl CustomShaderRenderer {
+         apply_opacity: bool,
+         clear_color: Color,
+     ) -> Result<()> {
++        self.poll_pipeline();
++        if self.pipeline.is_none() {
++            // Still compiling: skip the pass entirely rather than enter it with no draw.
++            return Ok(());
++        }
+         let now = Instant::now();
+ 
+         // Calculate time value
+@@ -589,9 +631,11 @@ impl CustomShaderRenderer {
+             // the render target, not the viewport, causing UV coordinate mismatches.
+             // The opaque panel (PANEL_BG with alpha 255) covers any shader output under it.
+ 
+-            render_pass.set_pipeline(&self.pipeline);
+-            render_pass.set_bind_group(0, &self.bind_group, &[]);
+-            render_pass.draw(0..4, 0..1);
++            if let Some(pipeline) = self.pipeline.as_ref() {
++                render_pass.set_pipeline(pipeline);
++                render_pass.set_bind_group(0, &self.bind_group, &[]);
++                render_pass.draw(0..4, 0..1);
++            }
+         }
+ 
+         queue.submit(std::iter::once(encoder.finish()));
+diff --git a/par-term-render/src/renderer/rendering.rs b/par-term-render/src/renderer/rendering.rs
+index 204f50a..7399d82 100644
+--- a/par-term-render/src/renderer/rendering.rs
++++ b/par-term-render/src/renderer/rendering.rs
+@@ -209,7 +209,16 @@ impl Renderer {
+             divider_settings,
+         } = p;
+ 
+-        let has_custom_shader = self.custom_shader_renderer.is_some();
++        // Land the background pipeline compile as soon as it finishes. Until it lands the renderer
++        // reports "no custom shader", so panes paint normally and the background blends in a frame
++        // later instead of the window waiting seconds on the driver.
++        if let Some(shader) = self.custom_shader_renderer.as_mut() {
++            shader.poll_pipeline();
++        }
++        let has_custom_shader = self
++            .custom_shader_renderer
++            .as_ref()
++            .is_some_and(|s| s.is_ready());
+         // Only use cursor shader if it's enabled and not disabled for alt screen
+         let use_cursor_shader =
+             self.cursor_shader_renderer.is_some() && !self.cursor_shader_disabled_for_alt_screen;
+diff --git a/par-term-settings-ui/src/input_tab/keyboard.rs b/par-term-settings-ui/src/input_tab/keyboard.rs
+index 283d718..6cac408 100644
+--- a/par-term-settings-ui/src/input_tab/keyboard.rs
++++ b/par-term-settings-ui/src/input_tab/keyboard.rs
+@@ -2,7 +2,7 @@
+ 
+ use crate::SettingsUI;
+ use crate::section::collapsing_section;
+-use par_term_config::{ModifierTarget, OptionKeyMode};
++use par_term_config::{ImePreeditRendering, ModifierTarget, OptionKeyMode};
+ use std::collections::HashSet;
+ 
+ // ============================================================================
+@@ -115,6 +115,43 @@ pub(super) fn show_keyboard_section(
+             *changes_this_frame = true;
+         }
+ 
++        ui.add_space(8.0);
++        ui.separator();
++
++        // IME composition rendering. Only the built-in mode uses the Imm32 reader, which is
++        // Windows-only, but the setting is shown everywhere because the value is shared.
++        ui.horizontal(|ui| {
++            ui.label("IME composition (preedit) rendering:");
++            let current = settings.config.input.ime_preedit_rendering;
++            egui::ComboBox::from_id_salt("input_ime_preedit_rendering")
++                .selected_text(ime_preedit_rendering_label(current))
++                .show_ui(ui, |ui| {
++                    for mode in [ImePreeditRendering::Builtin, ImePreeditRendering::System] {
++                        if ui
++                            .selectable_value(
++                                &mut settings.config.input.ime_preedit_rendering,
++                                mode,
++                                ime_preedit_rendering_label(mode),
++                            )
++                            .changed()
++                        {
++                            settings.has_changes = true;
++                            *changes_this_frame = true;
++                        }
++                    }
++                });
++        });
++
++        ui.indent("input_ime_preedit_desc", |ui| {
++            ui.label(
++                egui::RichText::new(ime_preedit_rendering_description(
++                    settings.config.input.ime_preedit_rendering,
++                ))
++                .weak()
++                .small(),
++            );
++        });
++
+         ui.add_space(8.0);
+         ui.separator();
+         ui.label(egui::RichText::new("Tips:").strong());
+@@ -125,6 +162,29 @@ pub(super) fn show_keyboard_section(
+     });
+ }
+ 
++/// Short name for an IME composition rendering mode.
++fn ime_preedit_rendering_label(mode: ImePreeditRendering) -> &'static str {
++    match mode {
++        ImePreeditRendering::Builtin => "Built-in (inline at the cursor)",
++        ImePreeditRendering::System => "System composition window",
++    }
++}
++
++/// One-line explanation of the selected IME composition rendering mode.
++fn ime_preedit_rendering_description(mode: ImePreeditRendering) -> &'static str {
++    match mode {
++        ImePreeditRendering::Builtin => {
++            "par-term draws the composing text itself, in the terminal's own font, at the cursor \
++             cell (what WezTerm calls \"Builtin\")."
++        }
++        ImePreeditRendering::System => {
++            "Windows draws its own composition window near the caret. Looks worse than the \
++             built-in overlay, but it cannot be lost to a frame that is skipped (WezTerm's \
++             \"System\")."
++        }
++    }
++}
++
+ // ============================================================================
+ // Modifier Remapping Section
+ // ============================================================================
+diff --git a/par-term-settings-ui/src/nerd_font.rs b/par-term-settings-ui/src/nerd_font.rs
+index 557625f..459f59d 100644
+--- a/par-term-settings-ui/src/nerd_font.rs
++++ b/par-term-settings-ui/src/nerd_font.rs
+@@ -16,7 +16,40 @@ const NERD_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMo
+ /// (U+2800–U+28FF). These characters are used by CLI spinners such as Claude Code's thinking
+ /// indicator (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏). None of egui's default fonts nor SymbolsNerdFontMono cover
+ /// this block, so without this fallback they render as □.
++///
++/// Prefer [`configure_egui_fonts`] where a font is already known: this entry point can only use
++/// the platform's CJK faces, not the terminal's configured font.
+ pub fn configure_nerd_font(ctx: &egui::Context) {
++    configure_egui_fonts(ctx, None);
++}
++
++/// Font family reserved for the IME composition overlay.
++///
++/// egui's sanctioned mechanism for a vertical shift is `FontTweak::y_offset_factor`
++/// ("Shift font's glyphs downwards by this fraction of the font size ... only a visual effect and
++/// does not affect the text layout"). Applying it to the shared CJK faces would move the settings
++/// UI and the tab bar with it, and registering a second copy of every face just for the tweak
++/// would duplicate ~7 MB of font data per face - so the overlay takes its shift at draw time
++/// instead (see `render_ime_preedit`), which has the same effect on the same pixels for nothing.
++///
++/// The family itself is worth having: it puts the terminal's own face *first* for every codepoint
++/// (so a composition mixing Latin and Hangul stays in one face) and the platform CJK face after
++/// it, which is what stops a codepoint the terminal font lacks from becoming epaint's replacement
++/// box.
++pub const IME_PREEDIT_FAMILY: &str = "ime_preedit";
++
++/// Configure every fallback egui needs: Nerd Font icons, Braille, and CJK.
++///
++/// `cjk_fallback` is font file data supplied by the caller — normally the terminal's own configured
++/// font (see `par_term::egui_font`), so a composed syllable is drawn in the same face as the text
++/// it becomes. When it is `None`, or when the caller's font could not be used, a platform CJK face
++/// is looked up instead.
++///
++/// This fallback is what makes Korean, Japanese and Chinese text render at all in egui: egui ships
++/// Hack, Ubuntu-Light, NotoEmoji and an icon font, and *none* of them contains a single Hangul
++/// codepoint. Without a CJK face every composed syllable paints as epaint's replacement glyph (◻)
++/// — which is exactly how a broken IME looks, even though the committed text is fine.
++pub fn configure_egui_fonts(ctx: &egui::Context, cjk_fallback: Option<Vec<u8>>) {
+     let mut fonts = egui::FontDefinitions::default();
+     fonts.font_data.insert(
+         "nerd_font_symbols".to_owned(),
+@@ -42,6 +75,38 @@ pub fn configure_nerd_font(ctx: &egui::Context) {
+             .push("braille_fallback".to_owned());
+     }
+ 
++    // CJK faces, in this order: the caller's (normally the terminal's own configured font, so a
++    // composed syllable looks like the text it becomes) and then a platform face as the mop-up.
++    //
++    // The terminal font is not always complete for composition. Measured on Maple Mono NF KR: the
++    // precomposed syllables and the conjoining Jamo block are all present, but 41 compatibility
++    // jamo are missing - the archaic vowels and U+3164 HANGUL FILLER, which is the kind of
++    // codepoint an IME reports mid-composition - and both Extended Jamo blocks are absent entirely.
++    // A missing glyph is painted as epaint's replacement box (◻), which is what "the composition is
++    // a small rectangle above the cursor" turned out to be. Appending the platform face last means
++    // it only answers for codepoints the terminal face does not have.
++    let mut cjk_faces: Vec<(&str, Vec<u8>)> = Vec::new();
++    if let Some(bytes) = cjk_fallback {
++        cjk_faces.push(("terminal_cjk_fallback", bytes));
++    }
++    if let Some(bytes) = load_platform_cjk_font() {
++        cjk_faces.push(("platform_cjk_fallback", bytes));
++    }
++    let mut ime_family: Vec<String> = Vec::new();
++    for (name, bytes) in cjk_faces {
++        fonts
++            .font_data
++            .insert(name.to_owned(), egui::FontData::from_owned(bytes).into());
++        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
++            fonts
++                .families
++                .entry(family)
++                .or_default()
++                .push(name.to_owned());
++        }
++        ime_family.push(name.to_owned());
++    }
++
+     // Add Nerd Font as last fallback for Proportional family
+     fonts
+         .families
+@@ -54,9 +119,70 @@ pub fn configure_nerd_font(ctx: &egui::Context) {
+         .entry(egui::FontFamily::Monospace)
+         .or_default()
+         .push("nerd_font_symbols".to_owned());
++
++    // The IME overlay's own family: the terminal's face first (it is what the composition will
++    // become), then the platform CJK face, then the symbol faces for anything odder.
++    ime_family.push("nerd_font_symbols".to_owned());
++    ime_family.push("braille_fallback".to_owned());
++    fonts.families.insert(
++        egui::FontFamily::Name(IME_PREEDIT_FAMILY.into()),
++        ime_family,
++    );
+     ctx.set_fonts(fonts);
+ }
+ 
++/// Load the first platform CJK font that exists.
++///
++/// Candidate order is deliberate: the Korean-capable faces come first on Windows, because the
++/// scripts that need this fallback most (a Hangul IME writing into the preedit overlay) probe for
++/// Hangul. A `.ttc` collection is used through its first face.
++fn load_platform_cjk_font() -> Option<Vec<u8>> {
++    for path in platform_cjk_font_candidates() {
++        if let Ok(data) = std::fs::read(path) {
++            return Some(data);
++        }
++    }
++    None
++}
++
++/// Platform-specific paths for fonts that cover CJK.
++fn platform_cjk_font_candidates() -> &'static [&'static str] {
++    #[cfg(target_os = "windows")]
++    {
++        &[
++            // Malgun Gothic — Korean, ships with Windows itself
++            r"C:\Windows\Fonts\malgun.ttf",
++            // Gulim — Korean, older but always present
++            r"C:\Windows\Fonts\gulim.ttc",
++            // Microsoft YaHei — Simplified Chinese
++            r"C:\Windows\Fonts\msyh.ttc",
++            // Meiryo — Japanese
++            r"C:\Windows\Fonts\meiryo.ttc",
++        ]
++    }
++    #[cfg(target_os = "macos")]
++    {
++        &[
++            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
++            "/System/Library/Fonts/Hiragino Sans GB.ttc",
++            "/System/Library/Fonts/PingFang.ttc",
++        ]
++    }
++    #[cfg(target_os = "linux")]
++    {
++        &[
++            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
++            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
++            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
++            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
++        ]
++    }
++    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
++    {
++        &[]
++    }
++}
++
+ /// Try to find a system font that covers the Braille Patterns Unicode block (U+2800–U+28FF).
+ ///
+ /// Returns the font file bytes if a suitable font is found, or `None` if no font is available.
+@@ -381,3 +507,56 @@ pub const NERD_FONT_PRESETS: &[(&str, &[(&str, &str)])] = &[
+         ],
+     ),
+ ];
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Caller-supplied CJK bytes must be registered in both families.
++    ///
++    /// The bytes themselves are irrelevant here - only that the face is wired into the stack,
++    /// which `configure_nerd_font` cannot do on its own.
++    #[test]
++    fn supplied_cjk_face_is_registered_in_both_families() {
++        let ctx = egui::Context::default();
++        configure_egui_fonts(&ctx, Some(NERD_FONT_BYTES.to_vec()));
++        ctx.run_ui(Default::default(), |_| {});
++
++        let families = ctx.fonts(|fonts| fonts.definitions().families.clone());
++        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
++            let names = families.get(&family).cloned().unwrap_or_default();
++            assert!(
++                names.iter().any(|name| name == "cjk_fallback"),
++                "{family} must be able to fall back to the CJK face, got {names:?}"
++            );
++        }
++    }
++
++    /// The assembled stack must actually be able to draw Hangul.
++    ///
++    /// Regression guard for the bug that motivated the fallback: none of egui's own faces carries
++    /// a single Hangul codepoint (measured with fontTools over Hack, Ubuntu-Light, NotoEmoji and
++    /// emoji-icon-font), so a composing syllable painted as epaint's replacement glyph instead.
++    /// Skipped on a machine with no CJK font installed, where there is nothing to fall back to.
++    #[test]
++    fn assembled_stack_covers_hangul_when_a_cjk_font_exists() {
++        if load_platform_cjk_font().is_none() {
++            eprintln!("skipping: no platform CJK font installed");
++            return;
++        }
++        let ctx = egui::Context::default();
++        configure_nerd_font(&ctx);
++        ctx.run_ui(Default::default(), |_| {});
++
++        let font = egui::FontId::monospace(14.0);
++        assert!(
++            ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, "\u{d55c}\u{ae00}")),
++            "Hangul must resolve to a face in the egui font stack"
++        );
++        // No Latin assertion here on purpose. `FontsView::has_glyphs` reports whether a character
++        // resolves to a face *other than* the replacement-glyph face, and in this stack that face is
++        // Hack, which is the first Monospace face - so every ordinary Latin letter reports `false`
++        // (epaint documents this as a false negative). Hangul is a real signal precisely because it
++        // resolves to the appended CJK face instead.
++    }
++}
+diff --git a/par-term-terminal/tests/sync_updates_regression.rs b/par-term-terminal/tests/sync_updates_regression.rs
+index 3424f4a..7f96288 100644
+--- a/par-term-terminal/tests/sync_updates_regression.rs
++++ b/par-term-terminal/tests/sync_updates_regression.rs
+@@ -28,3 +28,44 @@ fn split_sync_end_is_detected_at_every_chunk_boundary() {
+         assert!(term.content().contains("hello kitty"), "split {split}");
+     }
+ }
++
++#[test]
++fn split_transaction_head_is_not_applied_until_complete() {
++    let mut term = Terminal::new(120, 24);
++    // A read ending mid-transaction must not become visible on its own.
++    term.process(b"\x1b[?2026hTORN-HEAD-");
++    assert!(
++        !term.content().contains("TORN-HEAD-"),
++        "partial transaction head leaked"
++    );
++    assert!(term.synchronized_updates());
++    // The completing read applies the whole transaction atomically.
++    term.process(b"REST\x1b[?2026l");
++    assert!(!term.synchronized_updates());
++    assert!(term.content().contains("TORN-HEAD-REST"));
++}
++
++#[test]
++fn complete_pair_then_partial_next_update_in_one_read() {
++    let mut term = Terminal::new(120, 24);
++    // ConPTY packs [end of N][partial N+1] into one read: N applies,
++    // the partial stays hidden until its own end marker arrives.
++    term.process(b"\x1b[?2026hFIRST\x1b[?2026l\x1b[?2026hSECO");
++    assert!(term.content().contains("FIRST"));
++    assert!(!term.content().contains("SECO"));
++    term.process(b"ND\x1b[?2026l");
++    assert!(term.content().contains("SECOND"));
++}
++
++#[test]
++fn per_update_pairs_do_not_stick_disabled() {
++    // pi-style: every update is its own begin/end pair, so each end fires
++    // DECRST. A split in a later update must still buffer.
++    let mut term = Terminal::new(120, 24);
++    term.process(b"\x1b[?2026hONE\x1b[?2026l");
++    assert!(term.content().contains("ONE"));
++    term.process(b"\x1b[?2026hTW");
++    assert!(!term.content().contains("TW"));
++    term.process(b"O\x1b[?2026l");
++    assert!(term.content().contains("TWO"));
++}
+diff --git a/src/app/handler/window_state_impl/handle_window_event.rs b/src/app/handler/window_state_impl/handle_window_event.rs
+index c8b7686..788a503 100644
+--- a/src/app/handler/window_state_impl/handle_window_event.rs
++++ b/src/app/handler/window_state_impl/handle_window_event.rs
+@@ -18,6 +18,11 @@ impl WindowState {
+     ) -> bool {
+         use winit::keyboard::{Key, NamedKey};
+ 
++        // Refresh the IME composition before the match: the string itself is read in the window
++        // procedure (see `window_manager::ime_composition`), so it arrives on whichever event
++        // happens to be dispatched next - including the per-frame `RedrawRequested`.
++        self.sync_ime_composition();
++
+         // Let egui handle the event (needed for proper rendering state)
+         let (egui_consumed, egui_needs_repaint) =
+             if let (Some(egui_state), Some(window)) = (&mut self.egui.state, &self.window) {
+diff --git a/src/app/input_events/ime.rs b/src/app/input_events/ime.rs
+index c8e1d06..d42e134 100644
+--- a/src/app/input_events/ime.rs
++++ b/src/app/input_events/ime.rs
+@@ -3,6 +3,11 @@
+ //! Composition is a separate path from `key_handler`: the IME consumes the physical keys and
+ //! reports text instead, so composed Korean/Japanese/Chinese can only reach a child from
+ //! `Ime::Commit`. See `window_state::ime_state` for what the missing handler did.
++//!
++//! There are two sources for the *display* of a composition, and `Ime::Preedit` is only one of
++//! them: [`sync_ime_composition`](crate::app::window_state::WindowState::sync_ime_composition)
++//! also pulls the string read straight out of Imm32 by `window_manager::ime_composition`, because
++//! winit's preedit can be empty for an entire composition on Windows.
+ 
+ use winit::dpi::{PhysicalPosition, PhysicalSize};
+ use winit::event::Ime;
+@@ -60,6 +65,38 @@ impl crate::app::window_state::WindowState {
+         }
+     }
+ 
++    /// Pull the Imm32 composition into `ImeState`, and tell the window procedure which renderer
++    /// owns the composition this frame.
++    ///
++    /// Called once per window event rather than from the `Ime` arm: the composition string is
++    /// read in the window procedure, so an event that is not `Ime` (the per-frame
++    /// `RedrawRequested`, above all) is what carries it to the renderer. That also makes the
++    /// reader self-healing - a `Ime::Commit` for the previous syllable clears the state, and the
++    /// next frame restores the composition that arrived in the same message.
++    pub(crate) fn sync_ime_composition(&mut self) {
++        use crate::app::window_manager::ime_composition;
++        ime_composition::publish_mode(self.config.load().input.ime_preedit_rendering);
++        let observed = ime_composition::current();
++        let changed = observed.composing != self.ime.imm_composing
++            || (observed.composing && observed.text != self.ime.imm_preedit);
++        if observed.composing {
++            // The IME is live even when winit has not said so: `Ime::Enabled` rides on the same
++            // path this reader exists to cover, and `publish_ime_cursor_area` is gated on it.
++            self.ime.enabled = true;
++        }
++        self.ime.imm_composing = observed.composing;
++        self.ime.imm_preedit = if observed.composing {
++            observed.text
++        } else {
++            String::new()
++        };
++        if changed {
++            // Re-publishing on change (not every frame) keeps the candidate window next to the
++            // caret without re-issuing IMM calls at frame rate.
++            self.publish_ime_cursor_area();
++        }
++    }
++
+     /// Write composed text to the terminal the keyboard would target.
+     ///
+     /// Deliberately not `paste_text`: that path goes through `TerminalManager::paste`, which
+@@ -97,11 +134,12 @@ impl crate::app::window_state::WindowState {
+         if !self.ime.enabled {
+             return;
+         }
+-        let Some(cell) = self
+-            .tab_manager
+-            .active_tab()
+-            .and_then(|tab| tab.active_cache().cursor_pos)
+-        else {
++        let Some(cell) = self.tab_manager.active_tab().and_then(|tab| {
++            // Position, not visibility: the candidate window belongs next to the caret even when
++            // the application draws its own caret (see the overlay's cell lookup in `egui_submit`).
++            let cache = tab.active_cache();
++            cache.shader_cursor_pos.or(cache.cursor_pos)
++        }) else {
+             return;
+         };
+         if self.ime.published_cell == Some(cell) {
+diff --git a/src/app/render_pipeline/egui_overlays.rs b/src/app/render_pipeline/egui_overlays.rs
+index fab2bb1..21bf6f8 100644
+--- a/src/app/render_pipeline/egui_overlays.rs
++++ b/src/app/render_pipeline/egui_overlays.rs
+@@ -81,12 +81,44 @@ pub(super) fn render_resize_overlay(
+         });
+ }
+ 
++/// Vertical correction for the composition, in points.
++///
++/// Calibrated against a committed syllable on the same row: unshifted, the composition's ink sits
++/// ~13 physical px above the terminal's at 200% scaling. Expressed as a fraction of the font size
++/// so it scales with it, and overridable through `PAR_TERM_IME_PREEDIT_DY` (points) so the value
++/// can be confirmed from a screenshot without a rebuild per attempt.
++const BASELINE_CORRECTION: f32 = 0.5;
++
++/// How far down to shift the composition, in points.
++// Kept as a deliberate fallback: the composition is normally stamped into the cell buffer
++// (`ime_stamp`), but if that path ever needs an escape hatch (e.g. a renderer mode that cannot
++// take a stamped grid), this egui overlay is the revert target — re-adding its call in
++// `egui_submit` is a one-line change.
++#[allow(dead_code)]
++fn baseline_correction(size: f32) -> f32 {
++    static OVERRIDE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
++    let override_points = *OVERRIDE.get_or_init(|| {
++        std::env::var("PAR_TERM_IME_PREEDIT_DY")
++            .ok()
++            .and_then(|value| value.parse::<f32>().ok())
++    });
++    override_points.unwrap_or(size * BASELINE_CORRECTION)
++}
++
+ /// Draw the IME preedit inline at the terminal cursor.
+ ///
+ /// Composing text is not part of the grid - the child learns nothing about it until the IME
+ /// commits - so it is painted over the cursor cell, which is how a native terminal shows a
+ /// syllable being composed. The caller passes the renderer's physical-pixel metrics while egui
+ /// works in logical points, hence the `scale` division.
++///
++/// `bg` is the fill behind the composing glyphs, and it is `None` whenever something other than
++/// the theme paints the grid background (a custom shader or a background image). Filling with the
++/// theme background there would stamp an opaque rectangle through an animated background.
++/// Deliberately retired: the composition is stamped into the cells and drawn by the normal cell
++/// renderer now (see `ime_stamp`), which cannot drift out of font, size or baseline. Kept for a
++/// one-line revert if a renderer mode appears where a stamped grid is not available.
++#[allow(dead_code)]
+ #[allow(clippy::too_many_arguments)] // Each value comes from a different owner (IME state, terminal cache, renderer sizing, theme); a struct for one call site would be worse
+ pub(super) fn render_ime_preedit(
+     ctx: &egui::Context,
+@@ -96,8 +128,9 @@ pub(super) fn render_ime_preedit(
+     cell_height_px: f32,
+     content_offset_px: (f32, f32),
+     scale: f32,
++    font_size_points: f32,
+     fg: egui::Color32,
+-    bg: egui::Color32,
++    bg: Option<egui::Color32>,
+ ) {
+     let Some((col, row)) = cell else {
+         return;
+@@ -109,18 +142,62 @@ pub(super) fn render_ime_preedit(
+         (content_offset_px.0 + col as f32 * cell_width_px) / scale,
+         (content_offset_px.1 + row as f32 * cell_height_px) / scale,
+     );
+-    let font = egui::FontId::monospace(cell_height_px / scale);
++    // The composition must be drawn at the size of the text it turns into, not at the size of the
++    // cell. A cell is ~1.4x taller than its glyphs, so using the cell height here paints the
++    // composing syllable noticeably larger than the committed one and the two read as different
++    // fonts (reported as such). Falls back to the cell height only if the config has no size.
++    let size = if font_size_points > 0.0 {
++        font_size_points
++    } else {
++        cell_height_px / scale
++    };
++    // Empirical probe: compare egui's pixels-per-point against the renderer's scale once per
++    // composition; the overlay's geometry only agrees across DPIs when the two match.
++    crate::debug_info!(
++        "IME",
++        "ime preedit draw: egui_ppp={:.2} renderer_scale={:.2} cell_px=({:.1}x{:.1}) font_size={:.2}",
++        ctx.pixels_per_point(),
++        scale,
++        cell_width_px,
++        cell_height_px,
++        font_size_points
++    );
++    let font = egui::FontId::new(
++        size,
++        egui::FontFamily::Name(crate::settings_ui::nerd_font::IME_PREEDIT_FAMILY.into()),
++    );
++    // Characters a renderer is required to draw as nothing. The Korean IME reports U+3164 HANGUL
++    // FILLER while a syllable is still incomplete (and the conjoining fillers U+115F/U+1160 exist
++    // for the same purpose); they are `Default_Ignorable_Code_Point`, so drawing them is wrong to
++    // begin with - and a face that lacks them gets epaint's replacement box instead, which is how
++    // a filler turned into "a small rectangle above the cursor".
++    let preedit: String = preedit
++        .chars()
++        .filter(|c| !matches!(*c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'))
++        .collect();
++    if preedit.is_empty() {
++        return;
++    }
++    // egui lays a galley out from its line-box top, with the ascent taken from the first face in
++    // the family (egui's own monospace); the terminal places the same glyph by the cell's own
++    // metrics. The two do not agree, and the measured difference put the composing syllable about
++    // half a line above the text it continues - a floating glyph instead of inline text, which is
++    // what "the composition sits above the cursor" was. The correction is a fraction of the font
++    // size so it scales with it.
++    let pos = egui::pos2(pos.x, pos.y + baseline_correction(size));
+     egui::Area::new(egui::Id::new("ime_preedit"))
+         .order(egui::Order::Foreground)
+         .fixed_pos(pos)
+         .show(ctx, |ui| {
+-            let galley = ui.painter().layout_no_wrap(preedit.to_owned(), font, fg);
++            let galley = ui.painter().layout_no_wrap(preedit.clone(), font, fg);
+             // At least one cell wide, so an empty preedit still shows where composition is.
+             let (rect, _) = ui.allocate_exact_size(
+                 egui::vec2(galley.size().x.max(cell_width_px / scale), galley.size().y),
+                 egui::Sense::hover(),
+             );
+-            ui.painter().rect_filled(rect, 0.0, bg);
++            if let Some(bg) = bg {
++                ui.painter().rect_filled(rect, 0.0, bg);
++            }
+             ui.painter().galley(rect.min, galley, fg);
+             // Underline, so a composition is distinguishable from committed text.
+             ui.painter().rect_filled(
+diff --git a/src/app/render_pipeline/egui_submit.rs b/src/app/render_pipeline/egui_submit.rs
+index bbc74c3..4d6798d 100644
+--- a/src/app/render_pipeline/egui_submit.rs
++++ b/src/app/render_pipeline/egui_submit.rs
+@@ -161,43 +161,11 @@ impl WindowState {
+             _ => None,
+         };
+ 
+-        // IME preedit overlay inputs, hoisted for the same reason as the demote snapshot above:
+-        // the egui closure cannot read the renderer or the tab manager. Skipped entirely when no
+-        // composition is in progress, so the common path costs one bool.
+-        let ime_active = self.ime.is_composing();
+-        let ime_preedit = if ime_active {
+-            self.ime.preedit.clone()
+-        } else {
+-            String::new()
+-        };
+-        let ime_cell = if ime_active {
+-            self.tab_manager
+-                .active_tab()
+-                .and_then(|tab| tab.active_cache().cursor_pos)
+-        } else {
+-            None
+-        };
+-        let ime_metrics = if ime_active {
+-            self.renderer.as_ref().map(|renderer| {
+-                (
+-                    renderer.cell_width(),
+-                    renderer.cell_height(),
+-                    (renderer.content_offset_x(), renderer.content_offset_y()),
+-                    renderer.scale_factor(),
+-                )
+-            })
+-        } else {
+-            None
+-        };
+-        let ime_colors = if ime_active {
+-            let theme = self.config.load().load_theme();
+-            (
+-                egui::Color32::from_rgb(theme.foreground.r, theme.foreground.g, theme.foreground.b),
+-                egui::Color32::from_rgb(theme.background.r, theme.background.g, theme.background.b),
+-            )
+-        } else {
+-            (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
+-        };
++        // The IME preedit is no longer an egui overlay: it is stamped into the cell buffer and
++        // drawn by the normal cell renderer (see `render_pipeline::ime_stamp`), which is how
++        // Windows Terminal, kitty and ghostty render a composition. The stamp cannot be applied
++        // here because the egui closure cannot read the renderer or the tab manager — and after
++        // this hoisted block existed for that reason, it now has nothing left to feed.
+ 
+         let result = if let Some(window) = self.window.as_ref() {
+             if let (Some(egui_ctx), Some(egui_state)) = (&self.egui.ctx, &mut self.egui.state) {
+@@ -231,20 +199,8 @@ impl WindowState {
+                         self.overlay_state.resize_dimensions,
+                     );
+ 
+-                    // IME preedit, drawn inline on the cursor cell while a composition is open.
+-                    if let Some((cell_width, cell_height, content_offset, scale)) = ime_metrics {
+-                        egui_overlays::render_ime_preedit(
+-                            ctx,
+-                            &ime_preedit,
+-                            ime_cell,
+-                            cell_width,
+-                            cell_height,
+-                            content_offset,
+-                            scale,
+-                            ime_colors.0,
+-                            ime_colors.1,
+-                        );
+-                    }
++                    // (The IME preedit is stamped into the cells in `gather_render_data` — the
++                    // normal renderer draws it, so there is no egui layer here anymore.)
+ 
+                     // Copy mode status bar overlay (bottom-left)
+                     {
+diff --git a/src/app/render_pipeline/frame_setup.rs b/src/app/render_pipeline/frame_setup.rs
+index 77fe6db..beb597f 100644
+--- a/src/app/render_pipeline/frame_setup.rs
++++ b/src/app/render_pipeline/frame_setup.rs
+@@ -49,7 +49,22 @@ impl WindowState {
+             } else {
+                 self.config.load().rendering.max_fps
+             };
+-        let frame_interval = std::time::Duration::from_millis((1000 / target_fps.max(1)) as u64);
++        // When throughput batching is on, PTY-driven redraws (which arrive via
++        // direct `request_redraw` from the tab refresh task and bypass the
++        // `about_to_wait` batching gate) must also be coalesced here — this is
++        // the one choke point every frame passes through. Otherwise each
++        // streaming chunk renders its torn intermediate state (scrolled text
++        // with the footer not yet redrawn) and the footer visibly judders.
++        let mut interval_ms = (1000 / target_fps.max(1)) as u64;
++        // Batching stands down while the IME has a composition open. The IME replaces that string
++        // on every keystroke and the composition exists only for as long as the user is typing it,
++        // so coalescing those frames into the throughput interval can drop the composition from
++        // the screen entirely - and the overlay is the only place it is drawn.
++        if self.config.load().rendering.maximize_throughput && !self.ime.is_composing() {
++            interval_ms =
++                interval_ms.max(self.config.load().rendering.throughput_render_interval_ms as u64);
++        }
++        let frame_interval = std::time::Duration::from_millis(interval_ms);
+         if let Some(last_render) = self.focus_state.last_render_time
+             && last_render.elapsed() < frame_interval
+         {
+diff --git a/src/app/render_pipeline/gather_data.rs b/src/app/render_pipeline/gather_data.rs
+index 3d62481..8d00432 100644
+--- a/src/app/render_pipeline/gather_data.rs
++++ b/src/app/render_pipeline/gather_data.rs
+@@ -99,6 +99,34 @@ impl WindowState {
+         let current_generation = snap.current_generation;
+         let cell_grid_dims = snap.grid_dims;
+ 
++        // The IME composition is stamped into the cell buffer so the normal cell renderer draws
++        // it — the same approach Windows Terminal, kitty and ghostty take — instead of a
++        // separately aligned egui overlay. See `ime_stamp` for why. `cells` (unstamped) keeps
++        // feeding the caches and URL detection, so a stamp can never outlive the composition;
++        // `gpu_cells` below is the stamped copy the renderer uploads.
++        let gpu_cells = if crate::app::window_manager::ime_composition::mode()
++            == par_term_config::ImePreeditRendering::Builtin
++            && self.ime.is_composing()
++        {
++            match super::ime_stamp::stamp_arc_cells(
++                &cells,
++                cell_grid_dims.0,
++                shader_cursor_pos,
++                self.ime.display_preedit(),
++            ) {
++                Some(stamped) => {
++                    // The stamp must reach the GPU on every composing frame: a cache hit would
++                    // keep serving the last unstamped upload and the composition would vanish
++                    // between keystrokes.
++                    self.frame.cache_hit = false;
++                    stamped
++                }
++                None => std::sync::Arc::clone(&cells),
++            }
++        } else {
++            std::sync::Arc::clone(&cells)
++        };
++
+         if let Some(tab) = self.tab_manager.active_tab_mut() {
+             // A TUI reads its geometry when it starts, so that is when a size pulse has
+             // to land. Unix gets one from the emulator core (a real SIGWINCH);
+@@ -150,6 +178,7 @@ impl WindowState {
+         self.flush_cell_cache(
+             &cells,
+             current_cursor_pos,
++            shader_cursor_pos,
+             cell_grid_dims,
+             current_generation,
+         );
+@@ -259,7 +288,7 @@ impl WindowState {
+         self.update_cursor_blink();
+ 
+         Some(FrameRenderData {
+-            cells,
++            cells: gpu_cells,
+             cursor_pos: current_cursor_pos,
+             cursor_style,
+             shader_cursor_pos,
+diff --git a/src/app/render_pipeline/gather_phases.rs b/src/app/render_pipeline/gather_phases.rs
+index 30fb030..a2221ab 100644
+--- a/src/app/render_pipeline/gather_phases.rs
++++ b/src/app/render_pipeline/gather_phases.rs
+@@ -242,6 +242,7 @@ impl WindowState {
+         &mut self,
+         cells: &Arc<Vec<Cell>>,
+         current_cursor_pos: Option<(usize, usize)>,
++        shader_cursor_pos: Option<(usize, usize)>,
+         grid_dims: (usize, usize),
+         generation: u64,
+     ) {
+@@ -265,6 +266,7 @@ impl WindowState {
+             tab.active_cache_mut().generation = generation;
+             tab.active_cache_mut().scroll_offset = current_scroll_offset;
+             tab.active_cache_mut().cursor_pos = current_cursor_pos;
++            tab.active_cache_mut().shader_cursor_pos = shader_cursor_pos;
+             tab.active_cache_mut().selection = current_selection;
+             tab.active_cache_mut().grid_dims = grid_dims;
+         }
+diff --git a/src/app/render_pipeline/gpu_submit.rs b/src/app/render_pipeline/gpu_submit.rs
+index d7685a5..0a5f7fc 100644
+--- a/src/app/render_pipeline/gpu_submit.rs
++++ b/src/app/render_pipeline/gpu_submit.rs
+@@ -300,6 +300,18 @@ impl WindowState {
+             // the same trust rule `commit_pty_grid_when_settled` uses: a minimized window
+             // reports its icon size, which the panes turn into a one-row grid.
+             let grid_trustworthy = !self.pty_grid_suspect;
++            // A composition is drawn as an overlay in the cursor's own cell, so a filled cursor
++            // block underneath would show the composing glyph inverted - light glyph on a light
++            // block instead of on the terminal background - which reads as a different font from
++            // the text it becomes. Native terminals replace the caret with the composition the
++            // same way, so the cursor stands down while one is open. Opacity is the handle the
++            // pane renderer gates the block on; nothing else about the cursor changes, so the
++            // overlay still gets its cell and the shader cursor keeps tracking the position.
++            let cursor_opacity = if self.ime.is_composing() {
++                0.0
++            } else {
++                self.cursor_anim.cursor_opacity
++            };
+             let render_result = if pane_count > 0 {
+                 // Gather all per-pane render data.
+                 let pane_render_data = self.tab_manager.active_tab_mut().and_then(|tab| {
+@@ -308,7 +320,7 @@ impl WindowState {
+                         &self.config.load(),
+                         &sizing,
+                         effective_pane_padding,
+-                        self.cursor_anim.cursor_opacity,
++                        cursor_opacity,
+                         pane_count,
+                         // Always pass scrollbar width in split-pane mode so all
+                         // panes have a stable column count regardless of focus or
+@@ -363,7 +375,24 @@ impl WindowState {
+                             ))
+                         });
+ 
+-                        if has_search_matches || url_overlay.is_some() {
++                        // The IME composition rides the same scratch buffer as the other transient
++                        // overlays, so it has to join this block's gate: inside the gate it would
++                        // only be stamped when a URL happened to be hovered or a search was open,
++                        // which is why an open composition drew nothing at all.
++                        let ime_stamp_cursor =
++                            if crate::app::window_manager::ime_composition::mode()
++                                == par_term_config::ImePreeditRendering::Builtin
++                                && self.ime.is_composing()
++                            {
++                                self.tab_manager
++                                    .active_tab()
++                                    .and_then(|tab| tab.active_cache().shader_cursor_pos)
++                            } else {
++                                None
++                            };
++
++                        if has_search_matches || url_overlay.is_some() || ime_stamp_cursor.is_some()
++                        {
+                             for pane in &mut pane_data {
+                                 if pane.viewport.focused {
+                                     // `pane.cells` is always an `Arc::clone` of a cache
+@@ -412,6 +441,20 @@ impl WindowState {
+                                             },
+                                         );
+                                     }
++                                    // The IME composition goes on last, so the composing glyphs sit
++                                    // over the search/url decoration exactly where the text will be
++                                    // committed. Focused pane only, live view only — the cursor
++                                    // coordinates are viewport coordinates (see `ime_stamp`).
++                                    if let Some(ime_cursor) = ime_stamp_cursor
++                                        && pane.scroll_offset == 0
++                                    {
++                                        super::ime_stamp::stamp_preedit_cells(
++                                            cells,
++                                            pane.grid_size.0,
++                                            ime_cursor,
++                                            self.ime.display_preedit(),
++                                        );
++                                    }
+                                     // Point this frame's render at the scratch buffer.
+                                     // The clone is dropped when `render_split_panes_with_data`
+                                     // returns, so next frame's `Arc::make_mut` sees a
+diff --git a/src/app/render_pipeline/ime_stamp.rs b/src/app/render_pipeline/ime_stamp.rs
+new file mode 100644
+index 0000000..31a164f
+--- /dev/null
++++ b/src/app/render_pipeline/ime_stamp.rs
+@@ -0,0 +1,125 @@
++//! Stamp the IME composition into the cell buffer so it renders as terminal text.
++//!
++//! The egui overlay drew the composing string as a separate layer, which meant the overlay
++//! needed its own font family, its own baseline correction and its own scale arithmetic to look
++//! like the text it becomes — and every DPI or font change reopened the gap (the way Windows
++//! Terminal, kitty and ghostty render preedit is to write it into the grid and let the normal
++//! cell pipeline draw it; that is what this module does). A glyph stamped here is drawn by the
++//! same cell renderer as the committed text around it, so font, size, colors, wide-cell spacing
++//! and the underline all come out right by construction. The stamp is per-frame: nothing is
++//! written back into the render cache, exactly like the URL/search overlays in `overlay_cells`.
++
++use std::sync::Arc;
++
++use par_term_emu_core_rust::unicode_width_config::{WidthConfig, char_width};
++
++use crate::config::Cell;
++
++/// Characters a renderer is required to draw as nothing.
++///
++/// The Korean IME reports U+3164 HANGUL FILLER while a syllable is still incomplete (and the
++/// conjoining fillers U+115F/U+1160 exist for the same purpose); they are
++/// `Default_Ignorable_Code_Point`, so drawing them is wrong to begin with — and a face that
++/// lacks them turns into a replacement box, which is how a filler once read as "a small
++/// rectangle above the cursor".
++fn is_ignorable(c: char) -> bool {
++    matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
++}
++
++/// Write `text` into `cells` (row-major, `cols` wide) starting at `cursor` (col, row), the same
++/// viewport coordinates the geometric cursor consumes.
++///
++/// Each glyph inherits the colors/weight of the cell it replaces and is underlined; a
++/// double-width glyph (Hangul syllables) gets a `wide_char_spacer` after it — the exact layout
++/// the emulator core produces for committed Hangul, so the composition is indistinguishable
++/// from the text it will become. Overflow past the right edge wraps to the next row, like
++/// Windows Terminal; past the last viewport row the stamp simply stops.
++pub(super) fn stamp_preedit_cells(
++    cells: &mut [Cell],
++    cols: usize,
++    cursor: (usize, usize),
++    text: &str,
++) {
++    let rows = if cols > 0 { cells.len() / cols } else { 0 };
++    if cols == 0 || rows == 0 {
++        return;
++    }
++    let (mut col, mut row) = cursor;
++    if row >= rows {
++        return;
++    }
++    for ch in text.chars().filter(|c| !is_ignorable(*c)) {
++        let width = char_width(ch, &WidthConfig::default()).max(1).min(cols);
++        if col + width > cols {
++            row += 1;
++            col = 0;
++            if row >= rows {
++                break;
++            }
++        }
++        let idx = row * cols + col;
++        if idx >= cells.len() {
++            break;
++        }
++        // Copy the inherited style out before overwriting the cell (borrow ends at the block).
++        let (fg, bg, bold, italic) = {
++            let base = &cells[idx];
++            (base.fg_color, base.bg_color, base.bold, base.italic)
++        };
++        cells[idx] = Cell {
++            grapheme: ch.to_string(),
++            fg_color: fg,
++            bg_color: bg,
++            bold,
++            italic,
++            underline: true,
++            strikethrough: false,
++            hyperlink_id: None,
++            wide_char: width == 2,
++            wide_char_spacer: false,
++        };
++        if width == 2 {
++            // The core pairs a wide glyph with a spacer cell (see the grid tests); without it
++            // the cell behind the glyph's second half would still paint its old contents.
++            let spacer_idx = idx + 1;
++            if col + 1 < cols && spacer_idx < cells.len() {
++                let spacer_bg = cells[spacer_idx].bg_color;
++                cells[spacer_idx] = Cell {
++                    grapheme: String::new(),
++                    fg_color: fg,
++                    bg_color: spacer_bg,
++                    bold: false,
++                    italic: false,
++                    underline: true,
++                    strikethrough: false,
++                    hyperlink_id: None,
++                    wide_char: false,
++                    wide_char_spacer: true,
++                };
++            }
++            col += 2;
++        } else {
++            col += 1;
++        }
++    }
++}
++
++/// Clone-stamp an `Arc`'d cell buffer for one frame.
++///
++/// Returns `None` when there is nothing to draw or nowhere to draw it; the caller keeps the
++/// original buffer in that case. The clone is composition-scoped, so the common (not composing)
++/// path never copies the grid.
++pub(super) fn stamp_arc_cells(
++    cells: &Arc<Vec<Cell>>,
++    cols: usize,
++    cursor: Option<(usize, usize)>,
++    text: &str,
++) -> Option<Arc<Vec<Cell>>> {
++    let cursor = cursor?;
++    if text.is_empty() {
++        return None;
++    }
++    let mut owned = (**cells).clone();
++    stamp_preedit_cells(&mut owned, cols, cursor, text);
++    Some(Arc::new(owned))
++}
+diff --git a/src/app/render_pipeline/mod.rs b/src/app/render_pipeline/mod.rs
+index 92b6256..de6ac9a 100644
+--- a/src/app/render_pipeline/mod.rs
++++ b/src/app/render_pipeline/mod.rs
+@@ -16,6 +16,7 @@ mod frame_setup;
+ mod gather_data;
+ mod gather_phases;
+ mod gpu_submit;
++mod ime_stamp;
+ mod overlay_cells;
+ mod pane_render;
+ mod post_render;
+diff --git a/src/app/render_pipeline/tab_snapshot.rs b/src/app/render_pipeline/tab_snapshot.rs
+index bee8e69..1fe4908 100644
+--- a/src/app/render_pipeline/tab_snapshot.rs
++++ b/src/app/render_pipeline/tab_snapshot.rs
+@@ -180,6 +180,15 @@ impl WindowState {
+                 None
+             };
+ 
++            // While the IME has a composition open, the caret *is* the composition: par-term draws
++            // it as an overlay in this very cell, so a filled cursor block underneath would show
++            // the composing glyph inverted - light glyph on a light block instead of on the
++            // terminal background - which reads as a different font from the text it becomes.
++            // Native terminals replace the caret the same way. Only the geometric cursor stands
++            // down: the position is still published for the overlay, and the shader cursor below
++            // keeps tracking it, so background shaders are unaffected.
++            let cursor_style = cursor_style.filter(|_| !self.ime.is_composing());
++
+             let shader_cursor_style = shader_cursor_pos.map(|_| term.cursor_style());
+ 
+             // ARC-004: per-frame hot path — use the custom debug macros
+diff --git a/src/app/window_manager/ime_composition.rs b/src/app/window_manager/ime_composition.rs
+new file mode 100644
+index 0000000..ce30d8d
+--- /dev/null
++++ b/src/app/window_manager/ime_composition.rs
+@@ -0,0 +1,393 @@
++//! Imm32 composition observer for the main window.
++//!
++//! Windows hands the composition (preedit) string to the focused application and expects it to
++//! draw the text itself; winit enforces that by clearing `ISC_SHOWUICOMPOSITIONWINDOW` out of
++//! every `WM_IME_SETCONTEXT` before calling `DefWindowProcW`. That is the same contract WezTerm
++//! implements as `ime_preedit_rendering = "Builtin"`, and par-term already has the drawing half:
++//! [`render_ime_preedit`](crate::app::render_pipeline::egui_overlays) paints the string at the
++//! cursor cell with the terminal's own font.
++//!
++//! What par-term did not have is a reliable source for the string. Its only supply was winit's
++//! `WM_IME_COMPOSITION` -> `Ime::Preedit`, and when that path yields nothing the composition is
++//! simply invisible: the committed syllable still reaches the PTY (it also arrives as `WM_CHAR`
++//! text), so Korean *works* while the letters being composed are never drawn — which is exactly
++//! how this was reported.
++//!
++//! So this module reads the composition string straight out of Imm32, and does nothing else with
++//! it:
++//!
++//! - **Display only.** Commits stay on winit's path. Writing `GCS_RESULTSTR` here as well would
++//!   put every syllable on the wire twice.
++//! - **Chained, not replaced.** Every message still reaches winit's own procedure, so its IME
++//!   bookkeeping (and its suppression of the OS composition window) is unchanged.
++//! - **Flags handled independently.** A single `WM_IME_COMPOSITION` may carry `GCS_RESULTSTR` and
++//!   `GCS_COMPSTR` together (the IME committed one syllable and already opened the next). That is
++//!   the case a naive implementation clears the composition on, leaving the new preedit invisible;
++//!   see the same fix in wispterm's `src/apprt/win32.zig`.
++//!
++//! `ImePreeditRendering::System` flips one thing here: `WM_IME_SETCONTEXT` is answered with
++//! `ISC_SHOWUICOMPOSITIONWINDOW` put back, and Windows draws its own composition window while this
++//! module observes nothing. That is WezTerm's `"System"` mode, kept as an escape hatch because it
++//! cannot be lost to a frame that never renders.
++
++use std::cell::{Cell, RefCell};
++
++use par_term_config::ImePreeditRendering;
++
++/// What the window procedure last saw, in the shape the renderer needs.
++#[derive(Clone, Default)]
++pub struct Observed {
++    /// A composition session is open (`WM_IME_STARTCOMPOSITION` .. `ENDCOMPOSITION`).
++    pub composing: bool,
++    /// The composition string, empty until the IME has produced one.
++    pub text: String,
++}
++
++thread_local! {
++    static COMPOSITION: RefCell<Observed> = const { RefCell::new(Observed {
++        composing: false,
++        text: String::new(),
++    }) };
++    static MODE: Cell<ImePreeditRendering> = const { Cell::new(ImePreeditRendering::Builtin) };
++}
++
++#[cfg(target_os = "windows")]
++/// The rendering mode last published by the input layer; `Builtin` means par-term draws the
++/// composition itself (the cell-buffer stamp in `render_pipeline::ime_stamp`), `System` means
++/// the OS composition window is left alone.
++pub fn mode() -> ImePreeditRendering {
++    MODE.with(Cell::get)
++}
++
++/// Tell the window procedure which renderer owns the composition.
++///
++/// Called once per frame, so a config change (the settings UI writes the same field) takes effect
++/// on the next frame without restarting. Switching to `System` also drops whatever was observed,
++/// so the built-in overlay cannot linger under the OS-drawn window.
++pub fn publish_mode(mode: ImePreeditRendering) {
++    if MODE.with(|cell| cell.get()) == mode {
++        return;
++    }
++    MODE.with(|cell| cell.set(mode));
++    COMPOSITION.with(|cell| *cell.borrow_mut() = Observed::default());
++    log::info!("IME: composition rendering is now {mode:?}");
++}
++
++/// Snapshot of the composition as the window procedure last saw it.
++pub fn current() -> Observed {
++    COMPOSITION.with(|cell| cell.borrow().clone())
++}
++
++/// Test hook: pretend a composition is open, the way `PAR_TERM_IME_PREEDIT` seeds winit's path.
++///
++/// The overlay screenshot harness cannot drive a real IME from a script, and this module is the
++/// other source it has to cover, so it needs its own seed (`PAR_TERM_IME_IMM_PREEDIT`).
++pub fn seed(text: &str) {
++    COMPOSITION.with(|cell| {
++        let mut observed = cell.borrow_mut();
++        observed.composing = !text.is_empty();
++        observed.text = text.to_owned();
++    });
++}
++
++/// Apply `PAR_TERM_IME_IMM_PREEDIT`, if set. Inert without it.
++fn with_env_seed() {
++    match std::env::var("PAR_TERM_IME_IMM_PREEDIT") {
++        Ok(text) if !text.is_empty() => {
++            log::warn!(
++                "IME: seeding an Imm32-side composition from PAR_TERM_IME_IMM_PREEDIT (test hook)"
++            );
++            seed(&text);
++        }
++        _ => {}
++    }
++}
++
++#[cfg(target_os = "windows")]
++mod imp {
++    use super::{COMPOSITION, mode};
++    use par_term_config::ImePreeditRendering;
++    use std::collections::HashMap;
++    use std::ffi::c_void;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::{Mutex, OnceLock};
++    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
++
++    const GWLP_WNDPROC: i32 = -4;
++    const WM_NCDESTROY: u32 = 0x0082;
++    const WM_IME_SETCONTEXT: u32 = 0x0281;
++    const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
++    const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
++    const WM_IME_COMPOSITION: u32 = 0x010F;
++
++    /// `WM_IME_COMPOSITION` lParam bits (IME composition string values).
++    const GCS_COMPSTR: u32 = 0x0008;
++    const GCS_RESULTSTR: u32 = 0x0800;
++
++    /// `WM_IME_SETCONTEXT` lParam: let Windows draw its own composition window.
++    const ISC_SHOWUICOMPOSITIONWINDOW: isize = 0x8000_0000;
++
++    /// Every IME UI bit: composition window, guideline and all candidate windows.
++    ///
++    /// winit clears only `ISC_SHOWUICOMPOSITIONWINDOW` on this message, leaving the candidate bits
++    /// set - so an IME is still free to draw a box of its own near the caret. That is what was
++    /// reported: a small rectangle above the cursor, whose click commits the composition. winit's
++    /// own intent is the opposite (PR #2241: "Hide OS-drawn composing text", same as every other
++    /// platform), so the whole mask is cleared here for `Builtin`, where par-term draws the
++    /// composition itself. `System` restores the composition bit instead and the rest of the OS UI
++    /// keeps working there, which is the mode to use if a candidate list is needed (한자/변환).
++    const ISC_SHOWUIALL: u32 = 0xC000_000F;
++
++    /// `ImmAssociateContextEx` flags: hand the window the default input context.
++    const IACE_DEFAULT: u32 = 0x0010;
++
++    type LResult = isize;
++
++    #[link(name = "user32")]
++    unsafe extern "system" {
++        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
++        fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, wp: usize, lp: isize) -> LResult;
++        fn DefWindowProcW(hwnd: isize, msg: u32, wp: usize, lp: isize) -> LResult;
++        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
++    }
++
++    #[link(name = "imm32")]
++    unsafe extern "system" {
++        fn ImmGetContext(hwnd: isize) -> isize;
++        fn ImmReleaseContext(hwnd: isize, himc: isize) -> i32;
++        fn ImmAssociateContextEx(hwnd: isize, himc: isize, flags: u32) -> i32;
++        fn ImmGetCompositionStringW(himc: isize, index: u32, buf: *mut c_void, len: u32) -> i32;
++        fn ImmGetDefaultIMEWnd(hwnd: isize) -> isize;
++    }
++
++    /// `ShowWindow` command: hide the window.
++    const SW_HIDE: i32 = 0;
++
++    /// Previous window procedures, keyed by HWND. Two modules subclass the same window
++    /// (`titlebar_drag` does too), so each one chains to what it found.
++    fn previous() -> &'static Mutex<HashMap<isize, isize>> {
++        static PREV: OnceLock<Mutex<HashMap<isize, isize>>> = OnceLock::new();
++        PREV.get_or_init(|| Mutex::new(HashMap::new()))
++    }
++
++    /// One warning is enough; a missing input context would otherwise log per keystroke.
++    fn warned_no_context() -> &'static AtomicBool {
++        static WARNED: AtomicBool = AtomicBool::new(false);
++        &WARNED
++    }
++
++    /// Read one composition string out of the input context.
++    ///
++    /// `size` comes back as a byte count, and the buffer has to be asked for twice (size, then
++    /// contents). A negative result is an error, `0` an empty string.
++    unsafe fn composition_string(himc: isize, index: u32) -> Option<String> {
++        // SAFETY: null buffer with length 0 is the documented size query.
++        let size = unsafe { ImmGetCompositionStringW(himc, index, std::ptr::null_mut(), 0) };
++        if size < 0 {
++            return None;
++        }
++        if size == 0 {
++            return Some(String::new());
++        }
++        let mut buf = vec![0u16; size as usize / 2];
++        // SAFETY: buf.as_mut_ptr() is valid for `size` bytes, which is what we advertise.
++        let written = unsafe {
++            ImmGetCompositionStringW(himc, index, buf.as_mut_ptr() as *mut c_void, size as u32)
++        };
++        if written < 0 {
++            return None;
++        }
++        buf.truncate(written as usize / 2);
++        Some(String::from_utf16_lossy(&buf))
++    }
++
++    /// Update the observed composition from one `WM_IME_COMPOSITION`.
++    ///
++    /// The flags are deliberately not treated as mutually exclusive: a message may carry
++    /// `GCS_RESULTSTR | GCS_COMPSTR`, meaning "the previous syllable is finished and here is the
++    /// next one already". Committing the result is winit's job, so only the preedit is read here,
++    /// and an empty result-only message ends the displayed composition.
++    unsafe fn observe_composition(hwnd: isize, lp: isize) {
++        // SAFETY: hwnd is the window this procedure was installed on.
++        let himc = unsafe { ImmGetContext(hwnd) };
++        if himc == 0 {
++            if !warned_no_context().swap(true, Ordering::Relaxed) {
++                log::warn!(
++                    "IME: ImmGetContext returned no input context for hwnd {hwnd}; the composition \
++                     string cannot be read (set ime_preedit_rendering: system to let Windows draw it)"
++                );
++            }
++            return;
++        }
++
++        let flags = lp as u32;
++        let text = if flags & GCS_COMPSTR != 0 {
++            // SAFETY: himc is a live context until released below.
++            unsafe { composition_string(himc, GCS_COMPSTR) }
++        } else if flags & GCS_RESULTSTR != 0 {
++            // The composed string was committed and no new preedit came with it.
++            Some(String::new())
++        } else {
++            None
++        };
++        // SAFETY: himc came from ImmGetContext above and is not used afterwards.
++        unsafe { ImmReleaseContext(hwnd, himc) };
++
++        if let Some(text) = text {
++            // One line per keystroke while composing, so debug: `DEBUG_LEVEL=2` on the command line
++            // is what makes a real-IME run diagnosable (the committed glyphs alone cannot tell you
++            // whether the composition reached us or only winit's commit did).
++            crate::debug_info!("IME", "imm32 composition: {text:?} (flags=0x{flags:x})");
++            COMPOSITION.with(|cell| {
++                let mut observed = cell.borrow_mut();
++                observed.composing = true;
++                observed.text = text;
++            });
++        }
++    }
++
++    fn end_composition() {
++        COMPOSITION.with(|cell| {
++            let mut observed = cell.borrow_mut();
++            observed.composing = false;
++            observed.text.clear();
++        });
++    }
++
++    /// Hide the IME's own UI window, when it has one.
++    ///
++    /// Clearing `ISC_SHOWUIALL` says what Windows may draw, and on its own that is not enough: a
++    /// legacy IMM32 IME also owns a small top-level window for its UI, and Windows 11 draws the
++    /// composition for some Korean IMEs in a floating box there regardless - which is the
++    /// rectangle reported above the cursor whose click commits the composition. Hiding the window
++    /// is the direct way to keep it off screen while par-term draws the composition inline. A
++    /// no-op for a TSF-only IME, whose UI belongs to `TextInputHost.exe` and cannot be suppressed
++    /// from the application at all (that case needs `ime_preedit_rendering: system`).
++    fn hide_ime_ui(hwnd: isize) {
++        // SAFETY: hwnd is the window we subclassed; ImmGetDefaultIMEWnd only reads thread state.
++        let ime_window = unsafe { ImmGetDefaultIMEWnd(hwnd) };
++        if ime_window == 0 || ime_window == hwnd {
++            return;
++        }
++        // SAFETY: a window handle handed back by ImmGetDefaultIMEWnd. Hiding it does not stop the
++        // IME from composing - it still owns this window and keeps receiving its messages - it
++        // only stops it from being drawn, which is what we are replacing.
++        unsafe { ShowWindow(ime_window, SW_HIDE) };
++    }
++
++    unsafe extern "system" fn subclass_proc(
++        hwnd: isize,
++        msg: u32,
++        wp: usize,
++        mut lp: isize,
++    ) -> LResult {
++        match mode() {
++            ImePreeditRendering::Builtin => {
++                if msg == WM_IME_SETCONTEXT {
++                    crate::debug_info!(
++                        "IME",
++                        "WM_IME_SETCONTEXT ui flags 0x{:x} -> suppressed",
++                        lp
++                    );
++                    // Windows offers its composition/candidate windows here; we draw the
++                    // composition ourselves, so none of them should appear. Chaining afterwards
++                    // lets winit strip the composition bit again, which is harmless.
++                    lp &= !(ISC_SHOWUIALL as isize);
++                    hide_ime_ui(hwnd);
++                }
++                match msg {
++                    WM_IME_STARTCOMPOSITION => {
++                        COMPOSITION.with(|cell| cell.borrow_mut().composing = true);
++                        // A composition is exactly when an IME may raise its UI, and the flags
++                        // message is not guaranteed to have arrived first (logged: it can land
++                        // seconds after the composition it was meant to govern), so hide the UI
++                        // window at the moment it would appear.
++                        hide_ime_ui(hwnd);
++                    }
++                    WM_IME_COMPOSITION => {
++                        // SAFETY: hwnd is the window this procedure was installed on.
++                        unsafe { observe_composition(hwnd, lp) };
++                    }
++                    WM_IME_ENDCOMPOSITION => end_composition(),
++                    _ => {}
++                }
++            }
++            ImePreeditRendering::System => {
++                if msg == WM_IME_SETCONTEXT {
++                    // winit strips this bit on every one of these messages; putting it back and
++                    // answering here (instead of chaining) is what makes Windows draw the
++                    // composition window itself. winit has no other logic in this arm.
++                    // SAFETY: same arguments Windows passed to us, plus the restored bit.
++                    return unsafe {
++                        DefWindowProcW(hwnd, msg, wp, lp | ISC_SHOWUICOMPOSITIONWINDOW)
++                    };
++                }
++            }
++        }
++
++        let prev = previous()
++            .lock()
++            .ok()
++            .and_then(|m| m.get(&hwnd).copied())
++            .unwrap_or(0);
++        if prev == 0 {
++            return 0;
++        }
++        if msg == WM_NCDESTROY
++            && let Ok(mut m) = previous().lock()
++        {
++            m.remove(&hwnd);
++        }
++        // SAFETY: prev is the procedure this window had before we subclassed it.
++        unsafe { CallWindowProcW(prev, hwnd, msg, wp, lp) }
++    }
++
++    /// Subclass `window` to observe the IME composition, and make sure it has an input context.
++    ///
++    /// Safe to call once per window. A no-op if the handle is unavailable.
++    pub fn install(window: &winit::window::Window) {
++        super::with_env_seed();
++        let Ok(handle) = window.window_handle() else {
++            log::warn!("IME composition: no window handle; the composition string cannot be read");
++            return;
++        };
++        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
++            return;
++        };
++        let hwnd = win32.hwnd.get();
++
++        // SAFETY: hwnd comes from winit for this window and stays valid while the window lives;
++        // the procedure is a 'static fn with the expected ABI.
++        unsafe {
++            // winit only associates a context when the system reports IME support, and a window
++            // with none cannot be asked for a composition string at all. Asking for the default
++            // context is harmless when one is already associated.
++            ImmAssociateContextEx(hwnd, 0, IACE_DEFAULT);
++
++            // Best effort before the first composition: hide the IME's UI window if it already
++            // exists, so the floating composition box never gets a chance to be on screen.
++            hide_ime_ui(hwnd);
++
++            let prev =
++                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, subclass_proc as *const c_void as isize);
++            if prev == 0 {
++                log::warn!("IME composition: SetWindowLongPtrW failed for hwnd {hwnd}");
++                return;
++            }
++            if let Ok(mut m) = previous().lock() {
++                m.insert(hwnd, prev);
++            }
++        }
++        log::info!("IME composition observer installed for hwnd {hwnd}");
++    }
++}
++
++#[cfg(target_os = "windows")]
++pub use imp::install;
++
++/// Non-Windows platforms get the composition from winit directly (which is what the preedit
++/// overlay was written against); there is no Imm32 to read.
++#[cfg(not(target_os = "windows"))]
++pub fn install(_window: &winit::window::Window) {
++    with_env_seed();
++}
+diff --git a/src/app/window_manager/mod.rs b/src/app/window_manager/mod.rs
+index 3792c0a..5ae6685 100644
+--- a/src/app/window_manager/mod.rs
++++ b/src/app/window_manager/mod.rs
+@@ -16,12 +16,14 @@
+ //! - `arrangements`          — save/restore/manage window arrangements
+ //! - `config_propagation`    — apply config changes from settings to all windows
+ //! - `config_renderer_apply` — renderer-specific settings application (split from config_propagation)
++//! - `ime_composition`       — Imm32 composition observer for the built-in IME preedit overlay
+ 
+ mod arrangements;
+ mod cli_timer;
+ mod config_propagation;
+ mod config_renderer_apply;
+ mod coprocess;
++pub(crate) mod ime_composition;
+ mod menu_actions;
+ mod scripting;
+ mod settings_actions;
+diff --git a/src/app/window_manager/titlebar_drag.rs b/src/app/window_manager/titlebar_drag.rs
+index 98a487f..2f1f2af 100644
+--- a/src/app/window_manager/titlebar_drag.rs
++++ b/src/app/window_manager/titlebar_drag.rs
+@@ -194,9 +194,7 @@ mod imp {
+                 // let the user "resize" an edge that is pinned to the screen.
+                 // SAFETY: hwnd is valid for the duration of this message.
+                 let maximized = unsafe { IsZoomed(hwnd) } != 0;
+-                if !maximized
+-                    && let Some(ht) = border_hit(local_x, local_y, w, h)
+-                {
++                if !maximized && let Some(ht) = border_hit(local_x, local_y, w, h) {
+                     return ht;
+                 }
+                 if hits_free_tab_strip(local_x, local_y) {
+@@ -214,9 +212,10 @@ mod imp {
+             return 0;
+         }
+         if msg == WM_NCDESTROY
+-            && let Ok(mut m) = previous().lock() {
+-                m.remove(&hwnd);
+-            }
++            && let Ok(mut m) = previous().lock()
++        {
++            m.remove(&hwnd);
++        }
+         // SAFETY: prev is the procedure this window had before we subclassed it.
+         unsafe { CallWindowProcW(prev, hwnd, msg, wp, lp) }
+     }
+@@ -237,11 +236,8 @@ mod imp {
+         // SAFETY: hwnd comes from winit for this window and stays valid while the
+         // window lives; the procedure is a 'static fn with the expected ABI.
+         unsafe {
+-            let prev = SetWindowLongPtrW(
+-                hwnd,
+-                GWLP_WNDPROC,
+-                subclass_proc as *const c_void as isize,
+-            );
++            let prev =
++                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, subclass_proc as *const c_void as isize);
+             if prev == 0 {
+                 log::warn!("titlebar drag: SetWindowLongPtrW failed for hwnd {hwnd}");
+                 return;
+diff --git a/src/app/window_manager/window_effects.rs b/src/app/window_manager/window_effects.rs
+index e376c4d..0a6a77c 100644
+--- a/src/app/window_manager/window_effects.rs
++++ b/src/app/window_manager/window_effects.rs
+@@ -70,7 +70,13 @@ mod imp {
+     ///
+     /// # Safety
+     /// `value` must point to `size` readable bytes.
+-    unsafe fn set_attribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32, name: &str) {
++    unsafe fn set_attribute(
++        hwnd: isize,
++        attribute: u32,
++        value: *const c_void,
++        size: u32,
++        name: &str,
++    ) {
+         // SAFETY: forwarded directly to DWM; the caller guarantees `value`/`size`.
+         let hr = unsafe { DwmSetWindowAttribute(hwnd, attribute, value, size) };
+         if hr != 0 {
+@@ -120,9 +126,7 @@ mod imp {
+         }
+ 
+         // A `COLORREF`-free sentinel means "leave the border as the OS decides".
+-        let border = effects
+-            .border_color
+-            .map_or(DWMWA_COLOR_NONE, colorref);
++        let border = effects.border_color.map_or(DWMWA_COLOR_NONE, colorref);
+         // SAFETY: `border` is a live local and the attribute takes a COLORREF.
+         unsafe {
+             set_attribute(
+diff --git a/src/app/window_manager/window_lifecycle.rs b/src/app/window_manager/window_lifecycle.rs
+index ec16974..ab5068f 100644
+--- a/src/app/window_manager/window_lifecycle.rs
++++ b/src/app/window_manager/window_lifecycle.rs
+@@ -127,6 +127,11 @@ impl WindowManager {
+                     crate::app::window_manager::titlebar_drag::install(&window);
+                 }
+ 
++                // Read the IME composition string ourselves. Unconditional (not tied to
++                // decorations): Windows expects the focused app to draw the composition, and
++                // winit's own `Ime::Preedit` is not always populated (see ime_composition).
++                crate::app::window_manager::ime_composition::install(&window);
++
+                 // Borderless also means no frame, so ask the compositor for the
+                 // corners and the 1px border instead of drawing them ourselves.
+                 // Best-effort: a no-op off Windows and on Windows 10.
+diff --git a/src/app/window_manager/window_session.rs b/src/app/window_manager/window_session.rs
+index d221721..df6a099 100644
+--- a/src/app/window_manager/window_session.rs
++++ b/src/app/window_manager/window_session.rs
+@@ -319,6 +319,11 @@ impl WindowManager {
+             Ok(window) => {
+                 let window_id = window.id();
+ 
++                // Same IME composition observer as `create_window` installs. This path is a
++                // second window-creation route (session restore, arrangements) and does not go
++                // through `window_lifecycle`, so it needs its own call.
++                crate::app::window_manager::ime_composition::install(&window);
++
+                 // Initialize menu BEFORE the blocking GPU init (same rationale
+                 // as create_window — see window_lifecycle.rs for details).
+                 if self.menu.is_none() {
+diff --git a/src/app/window_state/ime_state.rs b/src/app/window_state/ime_state.rs
+index 8de8f6c..f6a36b4 100644
+--- a/src/app/window_state/ime_state.rs
++++ b/src/app/window_state/ime_state.rs
+@@ -25,17 +25,65 @@ pub(crate) struct ImeState {
+     /// Cell the IME caret area was last published for, so the candidate window is only
+     /// repositioned when the caret actually moves.
+     pub(crate) published_cell: Option<(usize, usize)>,
++    /// Composition string read straight out of Imm32 by `window_manager::ime_composition`.
++    ///
++    /// Display only, and a second source on purpose: `preedit` above is whatever winit reported,
++    /// and experience on Windows is that it can be empty for the whole composition while the
++    /// committed syllable still arrives through `WM_CHAR`. Nothing here is ever written to a PTY.
++    pub(crate) imm_preedit: String,
++    /// True while Imm32 reports a composition is open, even if its string is still empty.
++    pub(crate) imm_composing: bool,
+ }
+ 
+ impl ImeState {
++    /// Seed a composition from `PAR_TERM_IME_PREEDIT`, for screenshots without a human at the
++    /// keyboard.
++    ///
++    /// A real composition is only delivered by the platform IME to the *active* window, and
++    /// Windows refuses to hand a background process an input context, so the preedit overlay had
++    /// no automated coverage at all. This hook feeds the same state `Ime::Preedit` feeds, which is
++    /// what makes the overlay screenshot-testable (see `galaxy-work/work/ime_preedit_probe.ps1`).
++    /// It is inert unless the variable is set.
++    pub(crate) fn with_env_seed(mut self) -> Self {
++        match std::env::var("PAR_TERM_IME_PREEDIT") {
++            Ok(text) if !text.is_empty() => {
++                log::warn!("IME: seeding a composition from PAR_TERM_IME_PREEDIT (test hook)");
++                self.enabled = true;
++                self.preedit = text;
++            }
++            _ => {}
++        }
++        self
++    }
++
+     /// Whether there is preedit text to draw.
++    ///
++    /// Either source counts: winit's `Ime::Preedit` when it carries text, and the Imm32 reader
++    /// otherwise (see `display_preedit`).
+     pub(crate) fn is_composing(&self) -> bool {
+-        !self.preedit.is_empty()
++        !self.preedit.is_empty() || !self.imm_preedit.is_empty()
++    }
++
++    /// The string to draw for the composition in progress.
++    ///
++    /// winit's preedit wins when it has text, because it also carries the clause cursor; the
++    /// Imm32 string is the fallback that keeps the composition visible when winit reports
++    /// nothing.
++    pub(crate) fn display_preedit(&self) -> &str {
++        if self.preedit.is_empty() {
++            &self.imm_preedit
++        } else {
++            &self.preedit
++        }
+     }
+ 
+     /// Forget any composition. Called on commit, and when the IME is disabled.
+     pub(crate) fn clear_preedit(&mut self) {
+         self.preedit.clear();
+         self.preedit_cursor = None;
++        // Both sources, or a composition that winit dropped would stay on screen from the
++        // Imm32 copy until the next keystroke.
++        self.imm_preedit.clear();
++        self.imm_composing = false;
+     }
+ }
+diff --git a/src/app/window_state/impl_init.rs b/src/app/window_state/impl_init.rs
+index d067318..e407769 100644
+--- a/src/app/window_state/impl_init.rs
++++ b/src/app/window_state/impl_init.rs
+@@ -132,7 +132,7 @@ impl WindowState {
+             pty_grid_candidate: None,
+             pty_grid_suspect: false,
+ 
+-            ime: super::ime_state::ImeState::default(),
++            ime: super::ime_state::ImeState::default().with_env_seed(),
+ 
+             last_workflow_context: std::sync::Arc::new(std::sync::Mutex::new(None)),
+         }
+diff --git a/src/app/window_state/renderer_init.rs b/src/app/window_state/renderer_init.rs
+index 7debfb9..4982274 100644
+--- a/src/app/window_state/renderer_init.rs
++++ b/src/app/window_state/renderer_init.rs
+@@ -420,7 +420,11 @@ impl WindowState {
+ 
+         let scale_factor = window.scale_factor() as f32;
+         let egui_ctx = egui::Context::default();
+-        crate::settings_ui::nerd_font::configure_nerd_font(&egui_ctx);
++        // egui's own faces carry no CJK codepoints, so the IME preedit would paint a composed
++        // syllable as a replacement box. Hand it the terminal's font when that font covers Korean,
++        // so the composition is drawn in the very face the committed text will use.
++        let cjk_fallback = crate::egui_font::cjk_fallback_bytes(&self.config.load());
++        crate::settings_ui::nerd_font::configure_egui_fonts(&egui_ctx, cjk_fallback);
+ 
+         if let Some(memory) = previous_memory {
+             egui_ctx.memory_mut(|mem| *mem = memory);
+diff --git a/src/egui_font.rs b/src/egui_font.rs
+new file mode 100644
+index 0000000..b675f2a
+--- /dev/null
++++ b/src/egui_font.rs
+@@ -0,0 +1,98 @@
++//! Font bytes for egui's overlay font stack.
++//!
++//! egui draws the terminal's overlays (the IME preedit at the cursor, dialogs, the settings
++//! window) from *its own* font stack, not from the terminal's renderer. egui ships Latin and
++//! emoji faces only, so CJK text there has no glyph and lands on epaint's replacement character:
++//! a Hangul syllable being composed painted as `◻` while the syllable it became drew correctly
++//! from the grid font. That is the entire reason Korean composition looked broken while committed
++//! Korean looked fine.
++//!
++//! The terminal's own configured font is the best candidate for that stack — it is the face the
++//! user already chose, so a composition and the text it turns into look identical — but only if it
++//! actually contains the codepoints a Korean IME composes. Otherwise the caller leaves the choice
++//! to the platform candidates in `par_term_settings_ui::nerd_font`.
++
++use fontdb::{Database, Family, Query};
++
++use crate::config::Config;
++
++/// Codepoints a Korean composition passes through.
++///
++/// A syllable alone is not enough: an IME that has only received a consonant commits compatibility
++/// jamo (ㄱ, ㅏ) rather than a precomposed syllable, so both blocks have to be covered.
++const KOREAN_PROBE: &[char] = &['한', '글', 'ㄱ', 'ㅏ'];
++
++/// Font file bytes for `config`'s terminal font, when that font covers Korean.
++///
++/// Returns `None` when the family is missing, unreadable, or has no Hangul coverage — the caller
++/// then falls back to the platform faces.
++pub fn cjk_fallback_bytes(config: &Config) -> Option<Vec<u8>> {
++    let mut db = Database::new();
++    db.load_system_fonts();
++
++    let mut families: Vec<&str> = vec![config.font_family.as_str()];
++    if let Some(bold) = config.font_family_bold.as_deref()
++        && !families.contains(&bold)
++    {
++        families.push(bold);
++    }
++
++    for family in families {
++        let Some(bytes) = load_family_bytes(&mut db, family) else {
++            log::debug!("egui CJK fallback: font family '{family}' not found");
++            continue;
++        };
++        if covers(&bytes, KOREAN_PROBE) {
++            log::info!(
++                "egui CJK fallback: '{family}' covers Korean; overlays will use the terminal face"
++            );
++            return Some(bytes);
++        }
++        log::info!("egui CJK fallback: '{family}' has no Korean coverage");
++    }
++
++    log::info!("egui CJK fallback: no configured family covers Korean; using a platform face");
++    None
++}
++
++/// Read a family's font bytes out of the system font database.
++fn load_family_bytes(db: &mut Database, family: &str) -> Option<Vec<u8>> {
++    let query = Query {
++        families: &[Family::Name(family)],
++        weight: fontdb::Weight::NORMAL,
++        style: fontdb::Style::Normal,
++        ..Query::default()
++    };
++    let id = db.query(&query)?;
++    // SAFETY: `make_shared_face_data` may hand back a memory map of the font file rather than an
++    // owned buffer, so the bytes are only valid while that file is not modified or truncated by
++    // another process. A valid `id` from `query()` is necessary but is *not* the invariant that
++    // makes this call sound. The mapping is copied into an owned `Vec` on the next line and the
++    // shared handle is dropped immediately after, which keeps the exposure window to a single
++    // synchronous copy. Same reasoning as `crate::font_metrics`.
++    let (data, _) = unsafe { db.make_shared_face_data(id) }?;
++    Some(data.as_ref().as_ref().to_vec())
++}
++
++/// Whether every probed codepoint has a glyph in `bytes`.
++fn covers(bytes: &[u8], chars: &[char]) -> bool {
++    let Some(font) = swash::FontRef::from_index(bytes, 0) else {
++        return false;
++    };
++    let charmap = font.charmap();
++    chars.iter().all(|c| charmap.map(*c) != 0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The configured font is used only when it really has Hangul.
++    #[test]
++    fn coverage_probe_rejects_fonts_without_hangul() {
++        // DejaVu Sans Mono is the embedded fallback: Latin, Greek, Cyrillic, Braille, no Hangul.
++        const DEJAVU: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
++        assert!(!covers(DEJAVU, KOREAN_PROBE));
++        assert!(covers(DEJAVU, &['A']));
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 2dba195..5d2bc3e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -65,6 +65,7 @@ pub mod command_history_ui;
+ pub mod config;
+ pub mod config_migration;
+ pub mod copy_mode;
++pub mod egui_font;
+ pub mod font_metrics;
+ pub mod help_ui;
+ pub mod http;
+diff --git a/src/pane/render_cache.rs b/src/pane/render_cache.rs
+index 95bd110..7dc7355 100644
+--- a/src/pane/render_cache.rs
++++ b/src/pane/render_cache.rs
+@@ -8,10 +8,15 @@ pub struct RenderCache {
+     pub(crate) generation: u64, // Last terminal generation number (for dirty tracking)
+     pub(crate) scroll_offset: usize, // Last scroll offset (for cache invalidation)
+     pub(crate) cursor_pos: Option<(usize, usize)>, // Last cursor position (for cache invalidation)
++    /// Cursor position as published for background shaders: the terminal's own position, whether
++    /// or not the cursor is visible. Consumers that need *where* the caret is rather than whether
++    /// it is drawn (the IME composition overlay) must use this one - a TUI that draws its own
++    /// caret hides the terminal cursor, and `cursor_pos` is `None` for the whole time.
++    pub(crate) shader_cursor_pos: Option<(usize, usize)>,
+     pub(crate) selection: Option<Selection>, // Last selection state (for cache invalidation)
+-    pub(crate) grid_dims: (usize, usize), // Last known terminal grid dimensions (cols, rows)
+-    pub(crate) terminal_title: String, // Last known terminal title (for change detection)
+-    pub(crate) scrollback_len: usize, // Last known scrollback length
++    pub(crate) grid_dims: (usize, usize),    // Last known terminal grid dimensions (cols, rows)
++    pub(crate) terminal_title: String,       // Last known terminal title (for change detection)
++    pub(crate) scrollback_len: usize,        // Last known scrollback length
+     pub(crate) pane_cells: Option<Arc<Vec<Cell>>>, // Cached cells for pane rendering (reuse across frames)
+     pub(crate) pane_cells_generation: u64, // Generation of cached pane_cells (0 = stale/unset)
+     pub(crate) pane_cells_scroll_offset: usize, // Scroll offset used when pane_cells was generated
+@@ -28,6 +33,7 @@ impl RenderCache {
+             generation: 0,
+             scroll_offset: 0,
+             cursor_pos: None,
++            shader_cursor_pos: None,
+             selection: None,
+             grid_dims: (0, 0),
+             terminal_title: String::new(),
+diff --git a/src/settings_window/mod.rs b/src/settings_window/mod.rs
+index 22f7c21..1663909 100644
+--- a/src/settings_window/mod.rs
++++ b/src/settings_window/mod.rs
+@@ -169,7 +169,10 @@ impl SettingsWindow {
+         // Initialize egui
+         let scale_factor = window.scale_factor() as f32;
+         let egui_ctx = egui::Context::default();
+-        crate::settings_ui::nerd_font::configure_nerd_font(&egui_ctx);
++        // Same CJK fallback as the main window: the settings UI shows font names and profile
++        // labels, which are Korean for a Korean setup.
++        let cjk_fallback = crate::egui_font::cjk_fallback_bytes(&config);
++        crate::settings_ui::nerd_font::configure_egui_fonts(&egui_ctx, cjk_fallback);
+         let egui_state = egui_winit::State::new(
+             egui_ctx.clone(),
+             egui::ViewportId::ROOT,
+diff --git a/vendor/par-term-emu-core-rust/src/terminal/mod.rs b/vendor/par-term-emu-core-rust/src/terminal/mod.rs
+index b38286a..d1f56a5 100644
+--- a/vendor/par-term-emu-core-rust/src/terminal/mod.rs
++++ b/vendor/par-term-emu-core-rust/src/terminal/mod.rs
+@@ -231,6 +231,27 @@ pub(crate) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+         .any(|window| window == needle)
+ }
+ 
++/// Helper function to find the last occurrence of a subsequence.
++/// Used to cut a synchronized-update buffer after its last complete
++/// transaction so a trailing partial update stays buffered.
++#[inline]
++pub(crate) fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    if needle.is_empty() || haystack.len() < needle.len() {
++        return None;
++    }
++    let mut last = None;
++    let mut index = 0;
++    while index + needle.len() <= haystack.len() {
++        if haystack[index..index + needle.len()] == *needle {
++            last = Some(index);
++            index += needle.len();
++        } else {
++            index += 1;
++        }
++    }
++    last
++}
++
+ // =============================================================================
+ // Cohesive state sub-structs (ARC-001: decomposing the `Terminal` god object)
+ //
+@@ -1959,21 +1980,45 @@ impl Terminal {
+         self.sync_state.synchronized_updates
+     }
+ 
+-    /// Flush the synchronized update buffer
++    /// Flush the synchronized update buffer.
++    ///
++    /// Applies only complete transactions: a trailing partial update (a
++    /// begin marker with no later end marker) stays buffered for the next
++    /// read, while ordinary output past the last transaction applies right
++    /// away. Applying the trailing partial immediately would expose a torn
++    /// intermediate grid (e.g. scrolled text with the footer not yet
++    /// redrawn) on the next render, which is exactly the judder seen with
++    /// fast streaming apps whose updates ConPTY splits across reads.
+     pub fn flush_synchronized_updates(&mut self) {
+-        if !self.sync_state.update_buffer.is_empty() {
+-            let buffer = std::mem::take(&mut self.sync_state.update_buffer);
+-            debug::log(
+-                debug::DebugLevel::Debug,
+-                "SYNC_UPDATE",
+-                &format!("Flushing buffer ({} bytes)", buffer.len()),
+-            );
+-            // Process the buffered data without synchronized mode
+-            let saved_mode = self.sync_state.synchronized_updates;
+-            self.sync_state.sync_update_explicitly_disabled = false;
+-            self.sync_state.synchronized_updates = false;
+-            self.process(&buffer);
+-
++        if self.sync_state.update_buffer.is_empty() {
++            return;
++        }
++        let buffer = std::mem::take(&mut self.sync_state.update_buffer);
++        debug::log(
++            debug::DebugLevel::Debug,
++            "SYNC_UPDATE",
++            &format!("Flushing buffer ({} bytes)", buffer.len()),
++        );
++        // Process the buffered data without synchronized mode
++        let saved_mode = self.sync_state.synchronized_updates;
++        self.sync_state.sync_update_explicitly_disabled = false;
++        self.sync_state.synchronized_updates = false;
++        const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
++        const SYNC_END: &[u8] = b"\x1b[?2026l";
++        let search_from = find_last_subslice(&buffer, SYNC_END)
++            .map(|pos| pos + SYNC_END.len())
++            .unwrap_or(0);
++        let pending_start = buffer[search_from..]
++            .windows(SYNC_BEGIN.len())
++            .position(|window| window == SYNC_BEGIN)
++            .map(|pos| search_from + pos)
++            .unwrap_or(buffer.len());
++        let (apply, retain) = buffer.split_at(pending_start);
++        if !apply.is_empty() {
++            self.process(apply);
++        }
++
++        if retain.is_empty() {
+             // Restore only if it was originally enabled and not explicitly disabled
+             if saved_mode
+                 && !self.sync_state.sync_update_explicitly_disabled
+@@ -1981,6 +2026,11 @@ impl Terminal {
+             {
+                 self.sync_state.synchronized_updates = true;
+             }
++        } else {
++            // A new transaction supersedes any earlier explicit disable.
++            self.sync_state.update_buffer.extend_from_slice(retain);
++            self.sync_state.synchronized_updates = true;
++            self.sync_state.sync_update_explicitly_disabled = false;
+         }
+     }
+ 
+@@ -2861,9 +2911,37 @@ impl Terminal {
+             return false;
+         }
+ 
++        // A transaction beginning without a later end marker in this read
++        // continues in a later read (ConPTY splits updates arbitrarily).
++        // Buffer from the pending begin so a torn head is never applied on
++        // its own; complete transactions and ordinary output still parse
++        // immediately below. A new begin always supersedes any earlier
++        // explicit disable (per-update begin/end pairs keep working).
++        let mut immediate = data;
++        {
++            const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
++            const SYNC_END: &[u8] = b"\x1b[?2026l";
++            let search_from = find_last_subslice(data, SYNC_END)
++                .map(|pos| pos + SYNC_END.len())
++                .unwrap_or(0);
++            if let Some(pending) = data[search_from..]
++                .windows(SYNC_BEGIN.len())
++                .position(|window| window == SYNC_BEGIN)
++                .map(|pos| search_from + pos)
++            {
++                self.sync_state.update_buffer.extend_from_slice(&data[pending..]);
++                self.sync_state.synchronized_updates = true;
++                self.sync_state.sync_update_explicitly_disabled = false;
++                if pending == 0 {
++                    return false;
++                }
++                immediate = &data[..pending];
++            }
++        }
++
+         if self.tmux.tmux_parser.is_control_mode() || self.tmux.tmux_parser.is_auto_detect() {
+             // Process as tmux control protocol (handles auto-detect internally)
+-            let notifications = self.tmux.tmux_parser.parse(data);
++            let notifications = self.tmux.tmux_parser.parse(immediate);
+             for notification in notifications {
+                 match notification {
+                     crate::tmux_control::TmuxNotification::TerminalOutput { data } => {
+@@ -2879,7 +2957,7 @@ impl Terminal {
+             }
+         } else {
+             // Process as standard terminal output (with Kitty APC pre-filtering)
+-            self.filter_apc_and_advance(data);
++            self.filter_apc_and_advance(immediate);
+         }
+ 
+         true

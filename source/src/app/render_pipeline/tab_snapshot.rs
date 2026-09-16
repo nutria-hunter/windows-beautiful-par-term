@@ -180,6 +180,15 @@ impl WindowState {
                 None
             };
 
+            // While the IME has a composition open, the caret *is* the composition: par-term draws
+            // it as an overlay in this very cell, so a filled cursor block underneath would show
+            // the composing glyph inverted - light glyph on a light block instead of on the
+            // terminal background - which reads as a different font from the text it becomes.
+            // Native terminals replace the caret the same way. Only the geometric cursor stands
+            // down: the position is still published for the overlay, and the shader cursor below
+            // keeps tracking it, so background shaders are unaffected.
+            let cursor_style = cursor_style.filter(|_| !self.ime.is_composing());
+
             let shader_cursor_style = shader_cursor_pos.map(|_| term.cursor_style());
 
             // ARC-004: per-frame hot path — use the custom debug macros

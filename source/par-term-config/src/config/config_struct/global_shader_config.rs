@@ -42,6 +42,13 @@ pub struct GlobalShaderConfig {
     /// This dims the shader background to improve text readability
     pub custom_shader_brightness: f32,
 
+    /// Fraction of the window resolution the background shader is rendered at, upscaled with a
+    /// nearest-neighbour blit. 1.0 keeps the existing full-resolution path; 0.5 or 0.25 divide the
+    /// fragment work by 4 or 16, which is what makes a 4K background affordable on integrated
+    /// graphics. Values are clamped to 0.25..=1.0 when used.
+    #[serde(default = "crate::defaults::shader_render_scale")]
+    pub custom_shader_render_scale: f32,
+
     /// Texture file path for custom shader iChannel0 (optional, Shadertoy compatible)
     /// Supports ~ for home directory. Example: "~/textures/noise.png"
     pub custom_shader_channel0: Option<String>,
@@ -134,6 +141,7 @@ impl Default for GlobalShaderConfig {
         Self {
             custom_shader: None,
             custom_shader_enabled: crate::defaults::bool_true(),
+            custom_shader_render_scale: crate::defaults::shader_render_scale(),
             custom_shader_animation: crate::defaults::bool_true(),
             custom_shader_animation_speed: crate::defaults::custom_shader_speed(),
             custom_shader_text_opacity: crate::defaults::text_opacity(),

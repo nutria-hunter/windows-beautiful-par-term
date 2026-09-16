@@ -55,7 +55,8 @@ pub use tab_bar::{
     TabTitleMode, WindowType,
 };
 pub use terminal::{
-    CursorStyle, LinkUnderlineStyle, LogLevel, ModifierRemapping, ModifierTarget, OptionKeyMode,
-    SemanticHistoryEditorMode, SessionLogFormat, UnfocusedCursorStyle,
+    CursorStyle, ImePreeditRendering, LinkUnderlineStyle, LogLevel, ModifierRemapping,
+    ModifierTarget, OptionKeyMode, SemanticHistoryEditorMode, SessionLogFormat,
+    UnfocusedCursorStyle,
 };
 pub use unicode::{AmbiguousWidth, NormalizationForm, UnicodeVersion};

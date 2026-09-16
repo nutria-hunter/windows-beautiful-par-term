@@ -127,6 +127,11 @@ impl WindowManager {
                     crate::app::window_manager::titlebar_drag::install(&window);
                 }
 
+                // Read the IME composition string ourselves. Unconditional (not tied to
+                // decorations): Windows expects the focused app to draw the composition, and
+                // winit's own `Ime::Preedit` is not always populated (see ime_composition).
+                crate::app::window_manager::ime_composition::install(&window);
+
                 // Borderless also means no frame, so ask the compositor for the
                 // corners and the 1px border instead of drawing them ourselves.
                 // Best-effort: a no-op off Windows and on Windows 10.

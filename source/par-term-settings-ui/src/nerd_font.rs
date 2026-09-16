@@ -16,7 +16,40 @@ const NERD_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMo
 /// (U+2800–U+28FF). These characters are used by CLI spinners such as Claude Code's thinking
 /// indicator (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏). None of egui's default fonts nor SymbolsNerdFontMono cover
 /// this block, so without this fallback they render as □.
+///
+/// Prefer [`configure_egui_fonts`] where a font is already known: this entry point can only use
+/// the platform's CJK faces, not the terminal's configured font.
 pub fn configure_nerd_font(ctx: &egui::Context) {
+    configure_egui_fonts(ctx, None);
+}
+
+/// Font family reserved for the IME composition overlay.
+///
+/// egui's sanctioned mechanism for a vertical shift is `FontTweak::y_offset_factor`
+/// ("Shift font's glyphs downwards by this fraction of the font size ... only a visual effect and
+/// does not affect the text layout"). Applying it to the shared CJK faces would move the settings
+/// UI and the tab bar with it, and registering a second copy of every face just for the tweak
+/// would duplicate ~7 MB of font data per face - so the overlay takes its shift at draw time
+/// instead (see `render_ime_preedit`), which has the same effect on the same pixels for nothing.
+///
+/// The family itself is worth having: it puts the terminal's own face *first* for every codepoint
+/// (so a composition mixing Latin and Hangul stays in one face) and the platform CJK face after
+/// it, which is what stops a codepoint the terminal font lacks from becoming epaint's replacement
+/// box.
+pub const IME_PREEDIT_FAMILY: &str = "ime_preedit";
+
+/// Configure every fallback egui needs: Nerd Font icons, Braille, and CJK.
+///
+/// `cjk_fallback` is font file data supplied by the caller — normally the terminal's own configured
+/// font (see `par_term::egui_font`), so a composed syllable is drawn in the same face as the text
+/// it becomes. When it is `None`, or when the caller's font could not be used, a platform CJK face
+/// is looked up instead.
+///
+/// This fallback is what makes Korean, Japanese and Chinese text render at all in egui: egui ships
+/// Hack, Ubuntu-Light, NotoEmoji and an icon font, and *none* of them contains a single Hangul
+/// codepoint. Without a CJK face every composed syllable paints as epaint's replacement glyph (◻)
+/// — which is exactly how a broken IME looks, even though the committed text is fine.
+pub fn configure_egui_fonts(ctx: &egui::Context, cjk_fallback: Option<Vec<u8>>) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "nerd_font_symbols".to_owned(),
@@ -42,6 +75,38 @@ pub fn configure_nerd_font(ctx: &egui::Context) {
             .push("braille_fallback".to_owned());
     }
 
+    // CJK faces, in this order: the caller's (normally the terminal's own configured font, so a
+    // composed syllable looks like the text it becomes) and then a platform face as the mop-up.
+    //
+    // The terminal font is not always complete for composition. Measured on Maple Mono NF KR: the
+    // precomposed syllables and the conjoining Jamo block are all present, but 41 compatibility
+    // jamo are missing - the archaic vowels and U+3164 HANGUL FILLER, which is the kind of
+    // codepoint an IME reports mid-composition - and both Extended Jamo blocks are absent entirely.
+    // A missing glyph is painted as epaint's replacement box (◻), which is what "the composition is
+    // a small rectangle above the cursor" turned out to be. Appending the platform face last means
+    // it only answers for codepoints the terminal face does not have.
+    let mut cjk_faces: Vec<(&str, Vec<u8>)> = Vec::new();
+    if let Some(bytes) = cjk_fallback {
+        cjk_faces.push(("terminal_cjk_fallback", bytes));
+    }
+    if let Some(bytes) = load_platform_cjk_font() {
+        cjk_faces.push(("platform_cjk_fallback", bytes));
+    }
+    let mut ime_family: Vec<String> = Vec::new();
+    for (name, bytes) in cjk_faces {
+        fonts
+            .font_data
+            .insert(name.to_owned(), egui::FontData::from_owned(bytes).into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push(name.to_owned());
+        }
+        ime_family.push(name.to_owned());
+    }
+
     // Add Nerd Font as last fallback for Proportional family
     fonts
         .families
@@ -54,7 +119,68 @@ pub fn configure_nerd_font(ctx: &egui::Context) {
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .push("nerd_font_symbols".to_owned());
+
+    // The IME overlay's own family: the terminal's face first (it is what the composition will
+    // become), then the platform CJK face, then the symbol faces for anything odder.
+    ime_family.push("nerd_font_symbols".to_owned());
+    ime_family.push("braille_fallback".to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name(IME_PREEDIT_FAMILY.into()),
+        ime_family,
+    );
     ctx.set_fonts(fonts);
+}
+
+/// Load the first platform CJK font that exists.
+///
+/// Candidate order is deliberate: the Korean-capable faces come first on Windows, because the
+/// scripts that need this fallback most (a Hangul IME writing into the preedit overlay) probe for
+/// Hangul. A `.ttc` collection is used through its first face.
+fn load_platform_cjk_font() -> Option<Vec<u8>> {
+    for path in platform_cjk_font_candidates() {
+        if let Ok(data) = std::fs::read(path) {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Platform-specific paths for fonts that cover CJK.
+fn platform_cjk_font_candidates() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            // Malgun Gothic — Korean, ships with Windows itself
+            r"C:\Windows\Fonts\malgun.ttf",
+            // Gulim — Korean, older but always present
+            r"C:\Windows\Fonts\gulim.ttc",
+            // Microsoft YaHei — Simplified Chinese
+            r"C:\Windows\Fonts\msyh.ttc",
+            // Meiryo — Japanese
+            r"C:\Windows\Fonts\meiryo.ttc",
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &[
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        &[]
+    }
 }
 
 /// Try to find a system font that covers the Braille Patterns Unicode block (U+2800–U+28FF).
@@ -381,3 +507,56 @@ pub const NERD_FONT_PRESETS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Caller-supplied CJK bytes must be registered in both families.
+    ///
+    /// The bytes themselves are irrelevant here - only that the face is wired into the stack,
+    /// which `configure_nerd_font` cannot do on its own.
+    #[test]
+    fn supplied_cjk_face_is_registered_in_both_families() {
+        let ctx = egui::Context::default();
+        configure_egui_fonts(&ctx, Some(NERD_FONT_BYTES.to_vec()));
+        ctx.run_ui(Default::default(), |_| {});
+
+        let families = ctx.fonts(|fonts| fonts.definitions().families.clone());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let names = families.get(&family).cloned().unwrap_or_default();
+            assert!(
+                names.iter().any(|name| name == "cjk_fallback"),
+                "{family} must be able to fall back to the CJK face, got {names:?}"
+            );
+        }
+    }
+
+    /// The assembled stack must actually be able to draw Hangul.
+    ///
+    /// Regression guard for the bug that motivated the fallback: none of egui's own faces carries
+    /// a single Hangul codepoint (measured with fontTools over Hack, Ubuntu-Light, NotoEmoji and
+    /// emoji-icon-font), so a composing syllable painted as epaint's replacement glyph instead.
+    /// Skipped on a machine with no CJK font installed, where there is nothing to fall back to.
+    #[test]
+    fn assembled_stack_covers_hangul_when_a_cjk_font_exists() {
+        if load_platform_cjk_font().is_none() {
+            eprintln!("skipping: no platform CJK font installed");
+            return;
+        }
+        let ctx = egui::Context::default();
+        configure_nerd_font(&ctx);
+        ctx.run_ui(Default::default(), |_| {});
+
+        let font = egui::FontId::monospace(14.0);
+        assert!(
+            ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, "\u{d55c}\u{ae00}")),
+            "Hangul must resolve to a face in the egui font stack"
+        );
+        // No Latin assertion here on purpose. `FontsView::has_glyphs` reports whether a character
+        // resolves to a face *other than* the replacement-glyph face, and in this stack that face is
+        // Hack, which is the first Monospace face - so every ordinary Latin letter reports `false`
+        // (epaint documents this as a false negative). Hangul is a real signal precisely because it
+        // resolves to the appended CJK face instead.
+    }
+}

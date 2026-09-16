@@ -161,43 +161,11 @@ impl WindowState {
             _ => None,
         };
 
-        // IME preedit overlay inputs, hoisted for the same reason as the demote snapshot above:
-        // the egui closure cannot read the renderer or the tab manager. Skipped entirely when no
-        // composition is in progress, so the common path costs one bool.
-        let ime_active = self.ime.is_composing();
-        let ime_preedit = if ime_active {
-            self.ime.preedit.clone()
-        } else {
-            String::new()
-        };
-        let ime_cell = if ime_active {
-            self.tab_manager
-                .active_tab()
-                .and_then(|tab| tab.active_cache().cursor_pos)
-        } else {
-            None
-        };
-        let ime_metrics = if ime_active {
-            self.renderer.as_ref().map(|renderer| {
-                (
-                    renderer.cell_width(),
-                    renderer.cell_height(),
-                    (renderer.content_offset_x(), renderer.content_offset_y()),
-                    renderer.scale_factor(),
-                )
-            })
-        } else {
-            None
-        };
-        let ime_colors = if ime_active {
-            let theme = self.config.load().load_theme();
-            (
-                egui::Color32::from_rgb(theme.foreground.r, theme.foreground.g, theme.foreground.b),
-                egui::Color32::from_rgb(theme.background.r, theme.background.g, theme.background.b),
-            )
-        } else {
-            (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
-        };
+        // The IME preedit is no longer an egui overlay: it is stamped into the cell buffer and
+        // drawn by the normal cell renderer (see `render_pipeline::ime_stamp`), which is how
+        // Windows Terminal, kitty and ghostty render a composition. The stamp cannot be applied
+        // here because the egui closure cannot read the renderer or the tab manager — and after
+        // this hoisted block existed for that reason, it now has nothing left to feed.
 
         let result = if let Some(window) = self.window.as_ref() {
             if let (Some(egui_ctx), Some(egui_state)) = (&self.egui.ctx, &mut self.egui.state) {
@@ -231,20 +199,8 @@ impl WindowState {
                         self.overlay_state.resize_dimensions,
                     );
 
-                    // IME preedit, drawn inline on the cursor cell while a composition is open.
-                    if let Some((cell_width, cell_height, content_offset, scale)) = ime_metrics {
-                        egui_overlays::render_ime_preedit(
-                            ctx,
-                            &ime_preedit,
-                            ime_cell,
-                            cell_width,
-                            cell_height,
-                            content_offset,
-                            scale,
-                            ime_colors.0,
-                            ime_colors.1,
-                        );
-                    }
+                    // (The IME preedit is stamped into the cells in `gather_render_data` — the
+                    // normal renderer draws it, so there is no egui layer here anymore.)
 
                     // Copy mode status bar overlay (bottom-left)
                     {

@@ -4,7 +4,7 @@
 //! All fields serialise at the top level of the YAML config file -- existing
 //! config files remain 100% compatible.
 
-use crate::types::{ModifierRemapping, OptionKeyMode};
+use crate::types::{ImePreeditRendering, ModifierRemapping, OptionKeyMode};
 use serde::{Deserialize, Serialize};
 
 /// Option/Alt key behaviour, modifier remapping and physical key positions.
@@ -45,6 +45,15 @@ pub struct InputConfig {
     /// application that requests the protocol but cannot parse the result.
     #[serde(default = "crate::defaults::bool_true")]
     pub kitty_keyboard: bool,
+
+    /// How the IME composition (preedit) string is drawn while a syllable is being composed
+    ///
+    /// `builtin` (default) reads the composition string from Imm32 and draws it inline at the
+    /// cursor with the terminal's own font — WezTerm's `ime_preedit_rendering = "Builtin"`.
+    /// `system` leaves the drawing to Windows' own composition window, which is uglier but
+    /// cannot be missed if a frame is skipped — WezTerm's `"System"`.
+    #[serde(default)]
+    pub ime_preedit_rendering: ImePreeditRendering,
 }
 
 impl Default for InputConfig {
@@ -55,6 +64,7 @@ impl Default for InputConfig {
             modifier_remapping: ModifierRemapping::default(),
             use_physical_keys: crate::defaults::bool_false(),
             kitty_keyboard: crate::defaults::bool_true(),
+            ime_preedit_rendering: ImePreeditRendering::default(),
         }
     }
 }

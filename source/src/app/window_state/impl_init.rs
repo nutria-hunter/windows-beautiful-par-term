@@ -132,7 +132,7 @@ impl WindowState {
             pty_grid_candidate: None,
             pty_grid_suspect: false,
 
-            ime: super::ime_state::ImeState::default(),
+            ime: super::ime_state::ImeState::default().with_env_seed(),
 
             last_workflow_context: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
