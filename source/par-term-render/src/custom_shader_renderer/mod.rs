@@ -27,6 +27,7 @@ mod cubemap;
 mod cursor;
 mod hot_reload;
 pub mod pipeline;
+mod scaled_background;
 mod state;
 pub mod textures;
 pub mod transpiler;
@@ -110,6 +111,12 @@ fn animation_start_after_enabled_update(
 
 /// Custom shader renderer that applies post-processing effects
 pub struct CustomShaderRenderer {
+    integrated_gpu: bool,
+    /// When the background renders into its own scaled texture the compositor can reuse it,
+    /// so the artwork is redrawn a few times a second instead of every frame.
+    /// `None` means it has not been drawn into the current target yet.
+    last_background_render: Option<Instant>,
+    scaled_background: Option<scaled_background::ScaledBackground>,
     /// The render pipeline for the custom shader. `None` until the background compile lands: the
     /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
     /// window paints while the pipeline is still being built.
@@ -453,6 +460,9 @@ impl CustomShaderRenderer {
         }
         let now = Instant::now();
         Ok(Self {
+            integrated_gpu: device.adapter_info().device_type == DeviceType::IntegratedGpu,
+            last_background_render: None,
+            scaled_background: None,
             pipeline: None,
             pipeline_rx: Some(pipeline_rx),
             bind_group,
@@ -567,7 +577,9 @@ impl CustomShaderRenderer {
         };
         match rx.try_recv() {
             Ok(Ok(pipeline)) => {
-                log::info!("[SHADER] custom shader pipeline compiled in background; shader is live");
+                log::info!(
+                    "[SHADER] custom shader pipeline compiled in background; shader is live"
+                );
                 self.pipeline = Some(pipeline);
                 self.pipeline_rx = None;
                 true
@@ -630,7 +642,41 @@ impl CustomShaderRenderer {
         self.frame_count = self.frame_count.wrapping_add(1);
 
         // Calculate uniforms
-        let uniforms = self.build_uniforms(time, time_delta, apply_opacity);
+        let size = scaled_background::target_size(
+            self.texture_width,
+            self.texture_height,
+            self.integrated_gpu,
+            self.full_content_mode,
+        );
+        let scaled = size != (self.texture_width, self.texture_height);
+        if scaled
+            && self
+                .scaled_background
+                .as_ref()
+                .is_none_or(|target| target.size != size)
+        {
+            log::info!(
+                "Background render target: {}x{} -> {}x{} (native text)",
+                self.texture_width,
+                self.texture_height,
+                size.0,
+                size.1
+            );
+            self.scaled_background = Some(scaled_background::ScaledBackground::new(
+                device,
+                self.surface_format,
+                size,
+            ));
+            // A fresh target holds nothing yet, so the next frame must draw into it.
+            self.last_background_render = None;
+        } else if !scaled {
+            self.scaled_background = None;
+        }
+        let mut uniforms = self.build_uniforms(time, time_delta, apply_opacity);
+        if scaled {
+            uniforms.readability[2] = self.texture_width as f32 / size.0 as f32;
+            uniforms.readability[3] = self.texture_height as f32 / size.1 as f32;
+        }
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         let custom_uniforms =
             crate::custom_shader_renderer::types::CustomShaderControlUniforms::from_controls(
@@ -643,19 +689,44 @@ impl CustomShaderRenderer {
             bytemuck::cast_slice(&[custom_uniforms]),
         );
 
+        // Integrated GPUs shade this background on their own: the artwork is a slow nebula, so
+        // redrawing it 30 times a second halves the cost while still reading as motion. A
+        // non-animated shader only needs a redraw when something else changes, so it leans on
+        // the same texture for a second at a time. The scaled path owns its texture, which is
+        // what makes reuse safe; the direct path draws straight into the output view.
+        let interval = if self.animation_enabled {
+            1.0 / 30.0
+        } else {
+            1.0
+        };
+        let background_due = !scaled
+            || self
+                .last_background_render
+                .is_none_or(|last| last.elapsed().as_secs_f32() >= interval);
+        if background_due {
+            self.last_background_render = Some(now);
+        }
+
         // Create command encoder and render
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("Custom Shader Encoder"),
         });
 
-        {
+        if background_due {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Custom Shader Render Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: output_view,
+                    view: self
+                        .scaled_background
+                        .as_ref()
+                        .map_or(output_view, |target| &target.view),
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(clear_color),
+                        load: LoadOp::Clear(if scaled {
+                            Color::TRANSPARENT
+                        } else {
+                            clear_color
+                        }),
                         store: StoreOp::Store,
                     },
                     depth_slice: None,
@@ -678,6 +749,16 @@ impl CustomShaderRenderer {
             }
         }
 
+        if let Some(target) = &self.scaled_background {
+            target.composite(
+                device,
+                &mut encoder,
+                output_view,
+                &self.intermediate_texture_view,
+                &self.uniform_buffer,
+                clear_color,
+            );
+        }
         queue.submit(std::iter::once(encoder.finish()));
         Ok(())
     }

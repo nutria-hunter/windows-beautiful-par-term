@@ -359,6 +359,15 @@ impl CellRenderer {
             .await
             .context("Failed to find wgpu adapter")?;
 
+        let info = adapter.get_info();
+        log::info!(
+            "Selected GPU: {} ({:?}, {:?}); preference={:?}",
+            info.name,
+            info.device_type,
+            info.backend,
+            power_preference
+        );
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("device"),

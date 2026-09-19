@@ -146,7 +146,8 @@ void main() {{
     iChannelResolution[4] = iChannelResolution4.xyz;
 
     // Flip once here (wgpu y=0 top -> Shadertoy y=0 bottom).
-    vec2 st_fragCoord = vec2(gl_FragCoord_st.x, iResolution.y - gl_FragCoord_st.y);
+    vec2 nativeCoord = gl_FragCoord_st * max(iReadability.zw, vec2(1.0));
+    vec2 st_fragCoord = vec2(nativeCoord.x, iResolution.y - nativeCoord.y);
     gl_FragCoord_st = st_fragCoord;
     vec4 shaderColor;
     mainImage(shaderColor, st_fragCoord);
@@ -210,7 +211,8 @@ void main() {{
         // - Otherwise, use shader output (dimmedShaderRgb) as background
         float useSolidBg = step(0.01, iBackgroundColor.a);
         float contentMask = clamp(terminalColor.a, 0.0, 1.0);
-        float readabilityDim = mix(1.0, max(0.0, 1.0 - iReadability.y), iReadability.x * contentMask);
+        // Scaled backgrounds defer the content mask to the native-resolution compositor.
+        float readabilityDim = iReadability.z > 1.0 ? 1.0 : mix(1.0, max(0.0, 1.0 - iReadability.y), iReadability.x * contentMask);
         vec3 readableShaderRgb = dimmedShaderRgb * readabilityDim;
         vec3 bgColor = mix(readableShaderRgb, iBackgroundColor.rgb * iBrightness, useSolidBg);
 

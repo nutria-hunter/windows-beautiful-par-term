@@ -6,14 +6,14 @@
   ],
   "overrides": {},
   "results": {
-    "kanagawa-starbound-igpu-luidmap2": {
-      "gpu_ms_median": 0.43209600000000004,
-      "gpu_ms_p95": 0.439976,
-      "gpu_ms_min": 0.426624,
-      "black_fraction": 0.5569605999228395,
+    "kanagawa-starbound-main-visual": {
+      "gpu_ms_median": 0.98368,
+      "gpu_ms_p95": 1.1873615999999996,
+      "gpu_ms_min": 0.974112,
+      "black_fraction": 0.5947611641589506,
       "luma_median": 0.0,
-      "luma_p95": 48.6682,
-      "luma_p99": 48.6682,
+      "luma_p95": 46.3834,
+      "luma_p99": 46.3834,
       "luma_max": 118.7256,
       "brightness_zero_is_black": true
     }
