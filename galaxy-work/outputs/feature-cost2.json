@@ -1,0 +1,83 @@
+{
+  "shader": "C:\\Users\\jky72\\par-term\\galaxy-work\\shaders\\kanagawa-starbound.glsl",
+  "results": [
+    {
+      "variant": "baseline",
+      "stubbed": null,
+      "gpu_ms": 0.791088,
+      "delta_ms": 0.0
+    },
+    {
+      "variant": "cost2-shipSchedule",
+      "stubbed": "shipSchedule",
+      "gpu_ms": 0.618704,
+      "delta_ms": 0.17238399999999998
+    },
+    {
+      "variant": "cost2-incursionSchedule",
+      "stubbed": "incursionSchedule",
+      "gpu_ms": 0.674752,
+      "delta_ms": 0.116336
+    },
+    {
+      "variant": "cost2-operaPulse",
+      "stubbed": "operaPulse",
+      "gpu_ms": 0.78704,
+      "delta_ms": 0.0040480000000000516
+    },
+    {
+      "variant": "cost2-hullWreck",
+      "stubbed": "hullWreck",
+      "gpu_ms": 0.6748160000000001,
+      "delta_ms": 0.11627199999999993
+    },
+    {
+      "variant": "cost2-operaShield",
+      "stubbed": "operaShield",
+      "gpu_ms": 0.791312,
+      "delta_ms": -0.00022400000000000198
+    },
+    {
+      "variant": "cost2-damagedHull",
+      "stubbed": "damagedHull",
+      "gpu_ms": 0.79552,
+      "delta_ms": -0.0044319999999999915
+    },
+    {
+      "variant": "cost2-hullImpact",
+      "stubbed": "hullImpact",
+      "gpu_ms": 0.679696,
+      "delta_ms": 0.11139200000000005
+    },
+    {
+      "variant": "cost2-warpTrail",
+      "stubbed": "warpTrail",
+      "gpu_ms": 0.765216,
+      "delta_ms": 0.025872000000000006
+    },
+    {
+      "variant": "cost2-operaShip",
+      "stubbed": "operaShip",
+      "gpu_ms": 0.801728,
+      "delta_ms": -0.010639999999999983
+    },
+    {
+      "variant": "cost2-armorLight",
+      "stubbed": "armorLight",
+      "gpu_ms": 0.7960160000000001,
+      "delta_ms": -0.0049280000000000435
+    },
+    {
+      "variant": "cost2-stationPoint",
+      "stubbed": "stationPoint",
+      "gpu_ms": 0.8040959999999999,
+      "delta_ms": -0.013007999999999909
+    },
+    {
+      "variant": "cost2-hash21",
+      "stubbed": "hash21",
+      "gpu_ms": 0.21628799999999998,
+      "delta_ms": 0.5748
+    }
+  ]
+}
