@@ -1,0 +1,77 @@
+{
+  "shader": "C:\\Users\\jky72\\par-term\\galaxy-work\\shaders\\kanagawa-starbound.glsl",
+  "results": [
+    {
+      "variant": "baseline",
+      "stubbed": null,
+      "gpu_ms": 0.7408319999999999,
+      "delta_ms": 0.0
+    },
+    {
+      "variant": "cost3-patrolPass",
+      "stubbed": "patrolPass",
+      "gpu_ms": 0.7264,
+      "delta_ms": 0.01443199999999989
+    },
+    {
+      "variant": "cost3-structurePass",
+      "stubbed": "structurePass",
+      "gpu_ms": 0.7294080000000001,
+      "delta_ms": 0.011423999999999879
+    },
+    {
+      "variant": "cost3-ring",
+      "stubbed": "ring",
+      "gpu_ms": 0.731984,
+      "delta_ms": 0.008847999999999967
+    },
+    {
+      "variant": "cost3-shieldState",
+      "stubbed": "shieldState",
+      "gpu_ms": 0.709536,
+      "delta_ms": 0.03129599999999999
+    },
+    {
+      "variant": "cost3-starDust",
+      "stubbed": "starDust",
+      "gpu_ms": 0.631024,
+      "delta_ms": 0.1098079999999999
+    },
+    {
+      "variant": "cost3-ink",
+      "stubbed": "ink",
+      "gpu_ms": 0.732592,
+      "delta_ms": 0.008239999999999914
+    },
+    {
+      "variant": "cost3-noise2",
+      "stubbed": "noise2",
+      "gpu_ms": 0.5433600000000001,
+      "delta_ms": 0.19747199999999987
+    },
+    {
+      "variant": "cost3-illumination",
+      "stubbed": "illumination",
+      "gpu_ms": 0.748704,
+      "delta_ms": -0.007872000000000101
+    },
+    {
+      "variant": "cost3-orbitLane",
+      "stubbed": "orbitLane",
+      "gpu_ms": 0.6928639999999999,
+      "delta_ms": 0.04796800000000001
+    },
+    {
+      "variant": "cost3-depthComposite",
+      "stubbed": "depthComposite",
+      "gpu_ms": 0.163024,
+      "delta_ms": 0.5778079999999999
+    },
+    {
+      "variant": "cost3-bodyLocal",
+      "stubbed": "bodyLocal",
+      "gpu_ms": 0.776144,
+      "delta_ms": -0.03531200000000001
+    }
+  ]
+}
