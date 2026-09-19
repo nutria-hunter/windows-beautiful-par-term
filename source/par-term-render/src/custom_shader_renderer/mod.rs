@@ -122,6 +122,8 @@ pub struct CustomShaderRenderer {
     scale_viewport: (u32, u32),
     /// Consecutive seconds spent below `SLOW_FPS`, which is what steps the divisor up.
     slow_seconds: u32,
+    /// Redraw rate for the scaled background, lowered when the divisor has nowhere left to go.
+    background_fps: f32,
     scaled_background: Option<scaled_background::ScaledBackground>,
     /// The render pipeline for the custom shader. `None` until the background compile lands: the
     /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
@@ -471,6 +473,7 @@ impl CustomShaderRenderer {
             scale_divisor: 0,
             scale_viewport: (0, 0),
             slow_seconds: 0,
+            background_fps: scaled_background::DEFAULT_BACKGROUND_FPS,
             scaled_background: None,
             pipeline: None,
             pipeline_rx: Some(pipeline_rx),
@@ -663,6 +666,7 @@ impl CustomShaderRenderer {
             self.scale_viewport = viewport;
             self.scale_divisor = 0;
             self.slow_seconds = 0;
+            self.background_fps = scaled_background::DEFAULT_BACKGROUND_FPS;
         }
         if scalable {
             let floor = scaled_background::floor_divisor(self.texture_width, self.texture_height);
@@ -674,12 +678,29 @@ impl CustomShaderRenderer {
                     0
                 };
             }
-            let next = if self.slow_seconds >= scaled_background::SLOW_SECONDS {
+            let behind = self.slow_seconds >= scaled_background::SLOW_SECONDS;
+            let next = if behind && current < scaled_background::MAX_DIVISOR {
                 self.slow_seconds = 0;
                 scaled_background::coarser(current, floor)
             } else {
                 current
             };
+            if behind && current >= scaled_background::MAX_DIVISOR {
+                // The picture is already as coarse as the policy allows, so what is left is how often
+                // it is redrawn: the eye reads fewer redraws as slower motion rather than as a
+                // coarser image, and the engine load falls with the redraw rate.
+                self.slow_seconds = 0;
+                let slower = (self.background_fps * 0.5).max(scaled_background::MIN_BACKGROUND_FPS);
+                if slower < self.background_fps {
+                    log::info!(
+                        "Background redraw rate: {:.0} -> {:.0} fps ({:.0} fps rendered)",
+                        self.background_fps,
+                        slower,
+                        self.current_frame_rate
+                    );
+                    self.background_fps = slower;
+                }
+            }
             if next != self.scale_divisor {
                 if self.scale_divisor != 0 {
                     log::info!(
@@ -744,12 +765,15 @@ impl CustomShaderRenderer {
         );
 
         // Integrated GPUs shade this background on their own: the artwork is a slow nebula, so
-        // redrawing it 30 times a second halves the cost while still reading as motion. A
-        // non-animated shader only needs a redraw when something else changes, so it leans on
-        // the same texture for a second at a time. The scaled path owns its texture, which is
+        // redrawing it a few times a second halves the cost while still reading as motion, and the
+        // adaptive policy lowers that rate further when a machine cannot keep up. A non-animated
+        // shader only needs a redraw when something else changes, so it leans on the same texture
+        // for a second at a time. The scaled path owns its texture, which is
         // what makes reuse safe; the direct path draws straight into the output view.
         let interval = if self.animation_enabled {
-            1.0 / 30.0
+            1.0 / self
+                .background_fps
+                .max(scaled_background::MIN_BACKGROUND_FPS)
         } else {
             1.0
         };

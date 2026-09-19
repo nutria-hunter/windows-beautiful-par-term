@@ -4,6 +4,12 @@ use wgpu::*;
 /// Coarsest background scale the adaptive policy will pick.
 pub(super) const MAX_DIVISOR: u32 = 4;
 
+/// Background redraw rate the policy starts from, and the floor it may fall to. Once the picture is
+/// as coarse as it goes, redrawing less often is the only lever left: the eye reads that as slower
+/// motion rather than as a coarser image, and the engine load falls in proportion.
+pub(super) const DEFAULT_BACKGROUND_FPS: f32 = 30.0;
+pub(super) const MIN_BACKGROUND_FPS: f32 = 5.0;
+
 /// Resolution-derived starting point: enough scaling that a 4K window lands on 1080p.
 pub(super) fn floor_divisor(width: u32, height: u32) -> u32 {
     width.div_ceil(1920).max(height.div_ceil(1080)).max(1)
