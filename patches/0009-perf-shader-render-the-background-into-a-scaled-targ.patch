@@ -1,7 +1,7 @@
 From 0825d742c70d1b35b5643fd8f6042bf2da0d687b Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 11:53:43 +0900
-Subject: [PATCH 09/10] perf(shader): render the background into a scaled
+Subject: [PATCH 09/11] perf(shader): render the background into a scaled
  target and reuse it
 
 The background shader is a full-screen procedural scene, so integrated GPUs shade every pixel

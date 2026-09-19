@@ -1,7 +1,7 @@
 From 1b8b5fb9411715fa89762ea1b6773ed119cdfdf9 Mon Sep 17 00:00:00 2001
 From: jky72 <jky72@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 12:32:22 +0900
-Subject: [PATCH 10/10] perf(shader): let a slow integrated GPU pick its own
+Subject: [PATCH 10/11] perf(shader): let a slow integrated GPU pick its own
  background scale
 
 The divisor used to come from the window size alone, which cannot tell a fast integrated GPU from
