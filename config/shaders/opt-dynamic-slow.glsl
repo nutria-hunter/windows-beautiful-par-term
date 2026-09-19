@@ -131,7 +131,7 @@ float hash21(vec2 p) {
 // exactly 1.0 and nothing changes, so fast GPUs never see it; below ~30fps the formations bottom
 // out at 40% of their size rather than disappearing.
 float formationBudget() {
-    return clamp((iFrameRate - 28.0) / 32.0, 0.40, 1.0);
+    return 0.40;
 }
 
 float noise2(vec2 p) {

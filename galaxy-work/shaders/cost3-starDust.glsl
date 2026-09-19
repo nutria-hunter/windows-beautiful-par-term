@@ -126,14 +126,6 @@ float hash21(vec2 p) {
     return fract((q.x + q.y) * q.z);
 }
 
-// Dynamic quality. A machine that cannot hold the frame rate gets smaller formations instead of a
-// stuttering scene, which is how 2D pipelines have always handled weak hardware. At 60fps this is
-// exactly 1.0 and nothing changes, so fast GPUs never see it; below ~30fps the formations bottom
-// out at 40% of their size rather than disappearing.
-float formationBudget() {
-    return clamp((iFrameRate - 28.0) / 32.0, 0.40, 1.0);
-}
-
 float noise2(vec2 p) {
     vec2 c = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
@@ -507,6 +499,8 @@ vec3 ring(vec2 q, vec3 bg, vec2 lightDir) {
 }
 
 vec3 starDust(vec2 fragCoord, vec3 color) {
+    return vec3(0.0); // feature-cost probe
+
     float cell=9.0;
     vec2 id=floor(fragCoord/cell);
     float seed=hash21(id+401.0);
@@ -927,7 +921,6 @@ vec3 asteroidGroup(vec2 fragCoord, vec2 pixel, vec2 size, vec3 color) {
     vec2 dir=normalize(endp-start);
     vec2 side=vec2(-dir.y,dir.x);
     int count=14+int(floor(hash21(vec2(seed,71.0))*12.0));
-    count=max(1,int(floor(float(count)*formationBudget())));
     for(int j=0;j<min(count,26);j++) {
         float id=float(j);
         float r1=hash21(vec2(seed*13.0,id+5.0));
@@ -1247,7 +1240,6 @@ vec3 patrolPass(vec2 fragCoord, vec2 pixel, vec2 size, vec3 color) {
     vec2 start=vec2(-0.45,lane);
     vec2 endp=vec2(aspect+0.45,lane);
     int count=1+int(floor(hash21(vec2(seed,71.0))*2.99));
-    count=max(1,int(floor(float(count)*formationBudget())));
     for(int k=0;k<min(count,3);k++) {
         float id=float(k);
         float r1=hash21(vec2(seed*17.0,id+3.0));
@@ -1387,7 +1379,6 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
     vec2 sidev=vec2(-forward.y,forward.x);
     vec2 formation=mix(entryP,exitP,travel)*size.y;
     int count=4+int(floor(hash21(vec2(seed,71.0))*5.99));
-    count=max(1,int(floor(float(count)*formationBudget())));
     vec2 tgtPx=target*size.y;
     // The defending squadron, if one answers: its lane is set up here so the raiders can aim at it.
     bool defended = hash21(vec2(seed,211.0))>0.45;
@@ -1714,7 +1705,6 @@ vec3 shipEvent(vec2 fragCoord, vec3 bg) {
     if(cls<0.5) count=2+int(floor(hash21(vec2(seed,17.0))*2.99));
     else if(cls<1.5) count=4+int(floor(hash21(vec2(seed,17.0))*3.99));
     else count=12+int(floor(hash21(vec2(seed,17.0))*6.99));
-    count=max(1,int(floor(float(count)*formationBudget())));
     // The formation lives in one corridor: hulls stay a fraction of a screen height either side of
     // the line through `origin` and drift only a hair along it, so a pixel outside that corridor sees
     // no hull, gate or warp. Skipping the fleet costs a projection instead of eighteen ships.
