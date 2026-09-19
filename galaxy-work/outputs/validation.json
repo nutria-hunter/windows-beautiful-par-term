@@ -6,10 +6,10 @@
   ],
   "overrides": {},
   "results": {
-    "opt-trig-trig3-opt": {
-      "gpu_ms_median": 0.791552,
-      "gpu_ms_p95": 0.8011744,
-      "gpu_ms_min": 0.78688,
+    "opt-nounroll-nr-opt": {
+      "gpu_ms_median": 0.73888,
+      "gpu_ms_p95": 1.3814671999999988,
+      "gpu_ms_min": 0.735104,
       "black_fraction": 0.5947611641589506,
       "luma_median": 0.0,
       "luma_p95": 46.3834,

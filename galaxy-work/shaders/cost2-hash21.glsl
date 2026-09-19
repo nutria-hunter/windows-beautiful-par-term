@@ -121,6 +121,8 @@ vec2 bodyLocal(vec2 screen, vec2 center, float radius) {
 }
 
 float hash21(vec2 p) {
+    return 0.0; // feature-cost probe
+
     vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
     q += dot(q, q.yzx + 33.33);
     return fract((q.x + q.y) * q.z);
@@ -919,7 +921,8 @@ vec3 asteroidGroup(vec2 fragCoord, vec2 pixel, vec2 size, vec3 color) {
     vec2 dir=normalize(endp-start);
     vec2 side=vec2(-dir.y,dir.x);
     int count=14+int(floor(hash21(vec2(seed,71.0))*12.0));
-    for(int j=0;j<min(count,26);j++) {
+    for(int j=0;j<26;j++) {
+        if(j>=count) continue;
         float id=float(j);
         float r1=hash21(vec2(seed*13.0,id+5.0));
         float r2=hash21(vec2(seed*29.0,id+9.0));
@@ -972,7 +975,8 @@ vec3 asteroidGroup(vec2 fragCoord, vec2 pixel, vec2 size, vec3 color) {
         if(mined) {
             // One to three drones working the rock, on a slow orbit, each with a mining beam.
             int drones=1+(hash21(vec2(seed,61.0+id))>0.45 ? 1 : 0)+(hash21(vec2(seed,67.0+id))>0.75 ? 1 : 0);
-            for(int k=0;k<min(drones,3);k++) {
+            for(int k=0;k<3;k++) {
+                if(k>=drones) continue;
                 float kf=float(k);
                 float a2=iTime*0.30*(1.0+0.25*kf)+kf*2.4+float(id);
                 vec2 dp=snapFine(rock+vec2(cos(a2),sin(a2))*rr*1.75);
@@ -1238,7 +1242,8 @@ vec3 patrolPass(vec2 fragCoord, vec2 pixel, vec2 size, vec3 color) {
     vec2 start=vec2(-0.45,lane);
     vec2 endp=vec2(aspect+0.45,lane);
     int count=1+int(floor(hash21(vec2(seed,71.0))*2.99));
-    for(int k=0;k<min(count,3);k++) {
+    for(int k=0;k<3;k++) {
+        if(k>=count) continue;
         float id=float(k);
         float r1=hash21(vec2(seed*17.0,id+3.0));
         // A gentle weave, so a patrol does not look like it is running on rails.
@@ -1386,7 +1391,8 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
     vec2 dForward=normalize(dExit-dEntry);
     vec2 dSide=vec2(-dForward.y,dForward.x);
     vec2 dFormation=mix(dEntry,dExit,clamp((age-2.6)/max(0.1,life-3.4),0.0,1.0))*size.y;
-    for(int j=0;j<min(count,9);j++) {
+    for(int j=0;j<9;j++) {
+        if(j>=count) continue;
         float id=float(j);
         // Shot-down raiders are gone before they can fire again.
         if(age>raiderDownTime(id,seed)) continue;
@@ -1513,7 +1519,8 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
     // The origin is the *drawn* station angle (fixed), not a rotating one, or the bolts come out of empty
     // space beside the station they are supposed to leave from.
     if(attack>0.5) {
-        for(int m=0;m<min(count,3);m++) {
+        for(int m=0;m<3;m++) {
+            if(m>=count) continue;
             vec2 e=stationPoint(0.65+float(m)*TAU/3.0);
             vec2 stLocal=e;   // inverse of infrastructure's frame (no extra scale)
             vec2 stPx=floor(target*iResolution.y)/px+stLocal*targetR*size.y;
@@ -1537,7 +1544,8 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
         }
     }
     // Wrecks are independent of battery count and survive after the firing pass stops.
-    for(int wreckId=0;wreckId<min(count,9);wreckId++) {
+    for(int wreckId=0;wreckId<9;wreckId++) {
+        if(wreckId>=count) continue;
             float dead=raiderDownTime(float(wreckId),seed);
             float eAge=age-dead;
             if(eAge>=0.0 && eAge<2.0) {
@@ -1556,7 +1564,8 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
     if(defended && dCount>0) {
         float dIn=clamp((age-4.0)/4.0,0.0,1.0);
         float dOut=clamp((age-(life-2.4))/2.4,0.0,1.0);
-        for(int k=0;k<min(dCount,5);k++) {
+        for(int k=0;k<5;k++) {
+            if(k>=dCount) continue;
             float id=float(k);
             float down=defenderDownTime(id,seed);
             vec2 dcenter=defenderPos(dFormation,dForward,dSide,id,seed,size);
@@ -1711,7 +1720,8 @@ vec3 shipEvent(vec2 fragCoord, vec3 bg) {
         || dot(fromOrigin,forward)<-0.85*iResolution.y
         || dot(fromOrigin,forward)>0.35*iResolution.y) return bg;
     // Far-to-near order is stable. Each craft has its own pose and entry/exit point.
-    for(int j=0;j<min(count,18);j++) {
+    for(int j=0;j<18;j++) {
+        if(j>=count) continue;
         float id=float(j);
         // Grand fleets stagger a little wider, so the formation unfolds instead of popping at once.
         float t=age-id*(cls>1.5 ? 0.30 : 0.25);
