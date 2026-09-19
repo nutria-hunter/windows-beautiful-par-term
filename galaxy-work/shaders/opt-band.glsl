@@ -1356,7 +1356,8 @@ vec3 incursionEvent(vec2 fragCoord, vec2 pixel, vec2 size, vec2 target, float ta
     float lane=clamp(target.y+side*(0.24+0.16*hash21(vec2(seed,23.0))),0.10,0.90);
       // A raid lives in one horizontal band: the lane it flies along, plus the world and ring it
       // shoots at. A pixel outside that band cannot be touched by a hull, a gate, a shield glint or
-      // a bolt, so it skips the squadron for one comparison instead of nine ships' worth of geometry.
+      // a bolt, so it skips the entire squadron here for one comparison instead of paying for nine
+      // ships' worth of geometry it will never see.
       float bandLo=min(lane,target.y-1.7*targetR)-0.12;
       float bandHi=max(lane,target.y+1.7*targetR)+0.12;
       float bandPad=90.0*px;
@@ -1710,13 +1711,6 @@ vec3 shipEvent(vec2 fragCoord, vec3 bg) {
     if(cls<0.5) count=2+int(floor(hash21(vec2(seed,17.0))*2.99));
     else if(cls<1.5) count=4+int(floor(hash21(vec2(seed,17.0))*3.99));
     else count=12+int(floor(hash21(vec2(seed,17.0))*6.99));
-    // The formation lives in one corridor: hulls stay a fraction of a screen height either side of
-    // the line through `origin` and drift only a hair along it, so a pixel outside that corridor sees
-    // no hull, gate or warp. Skipping the fleet costs a projection instead of eighteen ships.
-    vec2 fromOrigin=fragCoord-origin;
-    if(abs(dot(fromOrigin,side))>0.62*iResolution.y
-        || dot(fromOrigin,forward)<-0.85*iResolution.y
-        || dot(fromOrigin,forward)>0.35*iResolution.y) return bg;
     // Far-to-near order is stable. Each craft has its own pose and entry/exit point.
     for(int j=0;j<18;j++) {
         if(j>=count) continue;

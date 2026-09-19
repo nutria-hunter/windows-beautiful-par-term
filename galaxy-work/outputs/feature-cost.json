@@ -1,0 +1,77 @@
+{
+  "shader": "C:\\Users\\jky72\\par-term\\galaxy-work\\shaders\\kanagawa-starbound.glsl",
+  "results": [
+    {
+      "variant": "baseline",
+      "stubbed": null,
+      "gpu_ms": 0.9796,
+      "delta_ms": 0.0
+    },
+    {
+      "variant": "cost-incursionEvent",
+      "stubbed": "incursionEvent",
+      "gpu_ms": 0.588416,
+      "delta_ms": 0.391184
+    },
+    {
+      "variant": "cost-structureArt",
+      "stubbed": "structureArt",
+      "gpu_ms": 0.98584,
+      "delta_ms": -0.006240000000000023
+    },
+    {
+      "variant": "cost-shipEvent",
+      "stubbed": "shipEvent",
+      "gpu_ms": 0.686256,
+      "delta_ms": 0.29334400000000005
+    },
+    {
+      "variant": "cost-cityPlanet",
+      "stubbed": "cityPlanet",
+      "gpu_ms": 0.988624,
+      "delta_ms": -0.009023999999999921
+    },
+    {
+      "variant": "cost-planet",
+      "stubbed": "planet",
+      "gpu_ms": 0.902208,
+      "delta_ms": 0.07739200000000002
+    },
+    {
+      "variant": "cost-warshipArt",
+      "stubbed": "warshipArt",
+      "gpu_ms": 0.911664,
+      "delta_ms": 0.067936
+    },
+    {
+      "variant": "cost-asteroidGroup",
+      "stubbed": "asteroidGroup",
+      "gpu_ms": 0.982352,
+      "delta_ms": -0.0027519999999999767
+    },
+    {
+      "variant": "cost-cometPixel",
+      "stubbed": "cometPixel",
+      "gpu_ms": 0.95384,
+      "delta_ms": 0.025760000000000005
+    },
+    {
+      "variant": "cost-operaEncounter",
+      "stubbed": "operaEncounter",
+      "gpu_ms": 0.831456,
+      "delta_ms": 0.14814400000000005
+    },
+    {
+      "variant": "cost-stars",
+      "stubbed": "stars",
+      "gpu_ms": 0.881168,
+      "delta_ms": 0.09843200000000007
+    },
+    {
+      "variant": "cost-infrastructure",
+      "stubbed": "infrastructure",
+      "gpu_ms": 0.98,
+      "delta_ms": -0.00039999999999995595
+    }
+  ]
+}
