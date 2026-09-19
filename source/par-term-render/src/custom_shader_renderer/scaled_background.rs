@@ -1,22 +1,36 @@
 //! Background-only downsampling on integrated GPUs. Text stays in the native pane pass.
 use wgpu::*;
 
-pub(super) fn target_size(
-    width: u32,
-    height: u32,
-    integrated: bool,
-    full_content: bool,
-) -> (u32, u32) {
-    // Integer division preserves the authored pixel grid. Do not scale cursor/full-content effects.
-    let divisor = if integrated && !full_content {
-        width.div_ceil(1920).max(height.div_ceil(1080)).max(1)
-    } else {
-        1
-    };
+/// Coarsest background scale the adaptive policy will pick.
+pub(super) const MAX_DIVISOR: u32 = 4;
+
+/// Resolution-derived starting point: enough scaling that a 4K window lands on 1080p.
+pub(super) fn floor_divisor(width: u32, height: u32) -> u32 {
+    width.div_ceil(1920).max(height.div_ceil(1080)).max(1)
+}
+
+/// Integer division preserves the authored pixel grid.
+pub(super) fn target_size(width: u32, height: u32, divisor: u32) -> (u32, u32) {
+    let divisor = divisor.max(1);
     (
         width.div_ceil(divisor).max(1),
         height.div_ceil(divisor).max(1),
     )
+}
+
+/// Picks the divisor from the frame rate the app is actually managing.
+///
+/// Integrated GPUs differ by an order of magnitude and a window size cannot tell a fast one from
+/// a slow one, so a background that cannot keep up gets coarser. It never goes finer again: on a
+/// Radeon iGPU the two-way version hunted between two scales every four seconds (2 -> 3 -> 4 ->
+/// 3 -> 2 ...), which both re-created the render target and made the background visibly change
+/// size. A resized window or a new shader starts from the resolution floor again.
+pub(super) const SLOW_FPS: f32 = 50.0;
+pub(super) const SLOW_SECONDS: u32 = 3;
+
+pub(super) fn coarser(current: u32, floor: u32) -> u32 {
+    let current = current.clamp(floor.clamp(1, MAX_DIVISOR), MAX_DIVISOR);
+    (current + 1).min(MAX_DIVISOR)
 }
 
 pub(super) struct ScaledBackground {
@@ -133,18 +147,33 @@ impl ScaledBackground {
 
 #[cfg(test)]
 mod tests {
-    use super::target_size;
+    use super::{MAX_DIVISOR, coarser, floor_divisor, target_size};
+
     #[test]
-    fn native_text_and_full_content_are_never_downscaled() {
-        assert_eq!(target_size(3840, 2160, true, true), (3840, 2160));
-        assert_eq!(target_size(3840, 2160, false, false), (3840, 2160));
-        assert_eq!(target_size(1920, 1080, true, false), (1920, 1080));
+    fn floor_keeps_small_windows_native_and_scales_4k_to_1080p() {
+        assert_eq!(floor_divisor(1920, 1080), 1);
+        assert_eq!(floor_divisor(2560, 1440), 2);
+        assert_eq!(floor_divisor(3840, 2160), 2);
+        assert_eq!(floor_divisor(2160, 3840), 4);
+        assert_eq!(floor_divisor(3841, 2161), 3);
+        assert_eq!(floor_divisor(0, 0), 1);
     }
+
     #[test]
-    fn integrated_background_handles_portrait_odd_and_zero_sizes() {
-        assert_eq!(target_size(3840, 2160, true, false), (1920, 1080));
-        assert_eq!(target_size(2160, 3840, true, false), (540, 960));
-        assert_eq!(target_size(3841, 2161, true, false), (1281, 721));
-        assert_eq!(target_size(0, 0, true, false), (1, 1));
+    fn target_size_divides_and_never_reaches_zero() {
+        assert_eq!(target_size(3840, 2160, 2), (1920, 1080));
+        assert_eq!(target_size(2160, 3840, 4), (540, 960));
+        assert_eq!(target_size(3841, 2161, 3), (1281, 721));
+        assert_eq!(target_size(0, 0, 1), (1, 1));
+    }
+
+    #[test]
+    fn divisor_gets_coarser_and_stays_there() {
+        assert_eq!(coarser(2, 2), 3);
+        assert_eq!(coarser(3, 2), 4);
+        // Capped, and never finer than the resolution floor.
+        assert_eq!(coarser(4, 2), MAX_DIVISOR);
+        assert_eq!(coarser(1, 2), 3);
+        assert_eq!(coarser(0, 1), 2);
     }
 }

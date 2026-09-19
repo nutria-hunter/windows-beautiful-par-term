@@ -116,6 +116,12 @@ pub struct CustomShaderRenderer {
     /// so the artwork is redrawn a few times a second instead of every frame.
     /// `None` means it has not been drawn into the current target yet.
     last_background_render: Option<Instant>,
+    /// Current background downsampling divisor on integrated GPUs; 0 until the first frame.
+    scale_divisor: u32,
+    /// Window size the divisor was chosen for, so a resize starts the search over.
+    scale_viewport: (u32, u32),
+    /// Consecutive seconds spent below `SLOW_FPS`, which is what steps the divisor up.
+    slow_seconds: u32,
     scaled_background: Option<scaled_background::ScaledBackground>,
     /// The render pipeline for the custom shader. `None` until the background compile lands: the
     /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
@@ -462,6 +468,9 @@ impl CustomShaderRenderer {
         Ok(Self {
             integrated_gpu: device.adapter_info().device_type == DeviceType::IntegratedGpu,
             last_background_render: None,
+            scale_divisor: 0,
+            scale_viewport: (0, 0),
+            slow_seconds: 0,
             scaled_background: None,
             pipeline: None,
             pipeline_rx: Some(pipeline_rx),
@@ -633,20 +642,65 @@ impl CustomShaderRenderer {
         // Update frame rate calculation
         self.frame_time_accumulator += time_delta;
         self.frames_in_second += 1;
+        let mut frame_rate_sampled = false;
         if self.frame_time_accumulator >= 1.0 {
             self.current_frame_rate = self.frames_in_second as f32 / self.frame_time_accumulator;
             self.frame_time_accumulator = 0.0;
             self.frames_in_second = 0;
+            frame_rate_sampled = true;
         }
 
         self.frame_count = self.frame_count.wrapping_add(1);
 
-        // Calculate uniforms
+        // Integrated GPUs differ by an order of magnitude and the window size cannot tell a slow
+        // one from a fast one, so a background that cannot keep up gets coarser. It never goes
+        // finer again (see `scaled_background::coarser`), which is what stops a marginal iGPU from
+        // hunting between two scales. A resized window starts over from the resolution floor, and
+        // full-content shaders plus discrete GPUs keep their native target.
+        let scalable = self.integrated_gpu && !self.full_content_mode;
+        let viewport = (self.texture_width, self.texture_height);
+        if viewport != self.scale_viewport {
+            self.scale_viewport = viewport;
+            self.scale_divisor = 0;
+            self.slow_seconds = 0;
+        }
+        if scalable {
+            let floor = scaled_background::floor_divisor(self.texture_width, self.texture_height);
+            let current = self.scale_divisor.max(floor);
+            if frame_rate_sampled {
+                self.slow_seconds = if self.current_frame_rate < scaled_background::SLOW_FPS {
+                    self.slow_seconds.saturating_add(1)
+                } else {
+                    0
+                };
+            }
+            let next = if self.slow_seconds >= scaled_background::SLOW_SECONDS {
+                self.slow_seconds = 0;
+                scaled_background::coarser(current, floor)
+            } else {
+                current
+            };
+            if next != self.scale_divisor {
+                if self.scale_divisor != 0 {
+                    log::info!(
+                        "Background render scale: divisor {} -> {} ({:.0} fps)",
+                        self.scale_divisor,
+                        next,
+                        self.current_frame_rate
+                    );
+                }
+                self.scale_divisor = next;
+                // A different target size needs a fresh draw.
+                self.last_background_render = None;
+            }
+        } else if self.scale_divisor != 1 {
+            self.scale_divisor = 1;
+            self.last_background_render = None;
+        }
         let size = scaled_background::target_size(
             self.texture_width,
             self.texture_height,
-            self.integrated_gpu,
-            self.full_content_mode,
+            self.scale_divisor,
         );
         let scaled = size != (self.texture_width, self.texture_height);
         if scaled
