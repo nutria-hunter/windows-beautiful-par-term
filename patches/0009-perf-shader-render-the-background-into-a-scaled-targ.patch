@@ -1,0 +1,418 @@
+From 0825d742c70d1b35b5643fd8f6042bf2da0d687b Mon Sep 17 00:00:00 2001
+From: jky72 <jky72@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 11:53:43 +0900
+Subject: [PATCH 09/10] perf(shader): render the background into a scaled
+ target and reuse it
+
+The background shader is a full-screen procedural scene, so integrated GPUs shade every pixel
+of it. It now renders into a texture sized by an integer divisor (4K -> 1920x1080), which keeps
+the authored pixel grid and dither intact and lets the compositor upscale with a plain texel
+fetch while the terminal's own texture stays at native resolution - text is never downscaled.
+The transpiled shader multiplies gl_FragCoord by the upscale factor so its math still believes
+it runs at native size, and readability dimming moved to the native compositor.
+
+On top of that the scaled target is reused: the artwork is redrawn 30 times a second while
+animating and once a second when animation is off, because a cached background costs nothing to
+show. A fresh target forces an immediate redraw, and the un-scaled path (discrete GPUs) still
+draws straight into the output view, so nothing changes there.
+
+Measured on the AMD integrated GPU (open terminal, 2360x1412, low_power, focused window):
+97.0% -> 51.4% 3D engine busy, and 13.5% with animation off. App baseline without any shader is
+6.6%, so the shader's own share fell from ~90% to ~38%. The pixel-count model predicted more; the
+remaining cost clearly does not scale with the render target, so the next step is profiling
+rather than more resolution reduction. See docs/2026-09-19-2d-optimization-techniques.md in the
+deploy repository for the technique survey and the numbers.
+---
+ par-term-render/src/cell_renderer/mod.rs      |   9 ++
+ .../src/custom_shader_renderer/mod.rs         |  91 ++++++++++-
+ .../scaled_background.rs                      | 150 ++++++++++++++++++
+ .../scaled_background.wgsl                    |  21 +++
+ .../transpiler/wgsl_emit.rs                   |   6 +-
+ 5 files changed, 270 insertions(+), 7 deletions(-)
+ create mode 100644 par-term-render/src/custom_shader_renderer/scaled_background.rs
+ create mode 100644 par-term-render/src/custom_shader_renderer/scaled_background.wgsl
+
+diff --git a/par-term-render/src/cell_renderer/mod.rs b/par-term-render/src/cell_renderer/mod.rs
+index da7685c..7e1c061 100644
+--- a/par-term-render/src/cell_renderer/mod.rs
++++ b/par-term-render/src/cell_renderer/mod.rs
+@@ -359,6 +359,15 @@ impl CellRenderer {
+             .await
+             .context("Failed to find wgpu adapter")?;
+ 
++        let info = adapter.get_info();
++        log::info!(
++            "Selected GPU: {} ({:?}, {:?}); preference={:?}",
++            info.name,
++            info.device_type,
++            info.backend,
++            power_preference
++        );
++
+         let (device, queue) = adapter
+             .request_device(&wgpu::DeviceDescriptor {
+                 label: Some("device"),
+diff --git a/par-term-render/src/custom_shader_renderer/mod.rs b/par-term-render/src/custom_shader_renderer/mod.rs
+index fc7a385..3c975d1 100644
+--- a/par-term-render/src/custom_shader_renderer/mod.rs
++++ b/par-term-render/src/custom_shader_renderer/mod.rs
+@@ -27,6 +27,7 @@ mod cubemap;
+ mod cursor;
+ mod hot_reload;
+ pub mod pipeline;
++mod scaled_background;
+ mod state;
+ pub mod textures;
+ pub mod transpiler;
+@@ -110,6 +111,12 @@ fn animation_start_after_enabled_update(
+ 
+ /// Custom shader renderer that applies post-processing effects
+ pub struct CustomShaderRenderer {
++    integrated_gpu: bool,
++    /// When the background renders into its own scaled texture the compositor can reuse it,
++    /// so the artwork is redrawn a few times a second instead of every frame.
++    /// `None` means it has not been drawn into the current target yet.
++    last_background_render: Option<Instant>,
++    scaled_background: Option<scaled_background::ScaledBackground>,
+     /// The render pipeline for the custom shader. `None` until the background compile lands: the
+     /// driver takes seconds on a shader this size, and none of that needs the UI thread, so the
+     /// window paints while the pipeline is still being built.
+@@ -453,6 +460,9 @@ impl CustomShaderRenderer {
+         }
+         let now = Instant::now();
+         Ok(Self {
++            integrated_gpu: device.adapter_info().device_type == DeviceType::IntegratedGpu,
++            last_background_render: None,
++            scaled_background: None,
+             pipeline: None,
+             pipeline_rx: Some(pipeline_rx),
+             bind_group,
+@@ -567,7 +577,9 @@ impl CustomShaderRenderer {
+         };
+         match rx.try_recv() {
+             Ok(Ok(pipeline)) => {
+-                log::info!("[SHADER] custom shader pipeline compiled in background; shader is live");
++                log::info!(
++                    "[SHADER] custom shader pipeline compiled in background; shader is live"
++                );
+                 self.pipeline = Some(pipeline);
+                 self.pipeline_rx = None;
+                 true
+@@ -630,7 +642,41 @@ impl CustomShaderRenderer {
+         self.frame_count = self.frame_count.wrapping_add(1);
+ 
+         // Calculate uniforms
+-        let uniforms = self.build_uniforms(time, time_delta, apply_opacity);
++        let size = scaled_background::target_size(
++            self.texture_width,
++            self.texture_height,
++            self.integrated_gpu,
++            self.full_content_mode,
++        );
++        let scaled = size != (self.texture_width, self.texture_height);
++        if scaled
++            && self
++                .scaled_background
++                .as_ref()
++                .is_none_or(|target| target.size != size)
++        {
++            log::info!(
++                "Background render target: {}x{} -> {}x{} (native text)",
++                self.texture_width,
++                self.texture_height,
++                size.0,
++                size.1
++            );
++            self.scaled_background = Some(scaled_background::ScaledBackground::new(
++                device,
++                self.surface_format,
++                size,
++            ));
++            // A fresh target holds nothing yet, so the next frame must draw into it.
++            self.last_background_render = None;
++        } else if !scaled {
++            self.scaled_background = None;
++        }
++        let mut uniforms = self.build_uniforms(time, time_delta, apply_opacity);
++        if scaled {
++            uniforms.readability[2] = self.texture_width as f32 / size.0 as f32;
++            uniforms.readability[3] = self.texture_height as f32 / size.1 as f32;
++        }
+         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+         let custom_uniforms =
+             crate::custom_shader_renderer::types::CustomShaderControlUniforms::from_controls(
+@@ -643,19 +689,44 @@ impl CustomShaderRenderer {
+             bytemuck::cast_slice(&[custom_uniforms]),
+         );
+ 
++        // Integrated GPUs shade this background on their own: the artwork is a slow nebula, so
++        // redrawing it 30 times a second halves the cost while still reading as motion. A
++        // non-animated shader only needs a redraw when something else changes, so it leans on
++        // the same texture for a second at a time. The scaled path owns its texture, which is
++        // what makes reuse safe; the direct path draws straight into the output view.
++        let interval = if self.animation_enabled {
++            1.0 / 30.0
++        } else {
++            1.0
++        };
++        let background_due = !scaled
++            || self
++                .last_background_render
++                .is_none_or(|last| last.elapsed().as_secs_f32() >= interval);
++        if background_due {
++            self.last_background_render = Some(now);
++        }
++
+         // Create command encoder and render
+         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+             label: Some("Custom Shader Encoder"),
+         });
+ 
+-        {
++        if background_due {
+             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                 label: Some("Custom Shader Render Pass"),
+                 color_attachments: &[Some(RenderPassColorAttachment {
+-                    view: output_view,
++                    view: self
++                        .scaled_background
++                        .as_ref()
++                        .map_or(output_view, |target| &target.view),
+                     resolve_target: None,
+                     ops: Operations {
+-                        load: LoadOp::Clear(clear_color),
++                        load: LoadOp::Clear(if scaled {
++                            Color::TRANSPARENT
++                        } else {
++                            clear_color
++                        }),
+                         store: StoreOp::Store,
+                     },
+                     depth_slice: None,
+@@ -678,6 +749,16 @@ impl CustomShaderRenderer {
+             }
+         }
+ 
++        if let Some(target) = &self.scaled_background {
++            target.composite(
++                device,
++                &mut encoder,
++                output_view,
++                &self.intermediate_texture_view,
++                &self.uniform_buffer,
++                clear_color,
++            );
++        }
+         queue.submit(std::iter::once(encoder.finish()));
+         Ok(())
+     }
+diff --git a/par-term-render/src/custom_shader_renderer/scaled_background.rs b/par-term-render/src/custom_shader_renderer/scaled_background.rs
+new file mode 100644
+index 0000000..3944f3c
+--- /dev/null
++++ b/par-term-render/src/custom_shader_renderer/scaled_background.rs
+@@ -0,0 +1,150 @@
++//! Background-only downsampling on integrated GPUs. Text stays in the native pane pass.
++use wgpu::*;
++
++pub(super) fn target_size(
++    width: u32,
++    height: u32,
++    integrated: bool,
++    full_content: bool,
++) -> (u32, u32) {
++    // Integer division preserves the authored pixel grid. Do not scale cursor/full-content effects.
++    let divisor = if integrated && !full_content {
++        width.div_ceil(1920).max(height.div_ceil(1080)).max(1)
++    } else {
++        1
++    };
++    (
++        width.div_ceil(divisor).max(1),
++        height.div_ceil(divisor).max(1),
++    )
++}
++
++pub(super) struct ScaledBackground {
++    pub size: (u32, u32),
++    pub view: TextureView,
++    pipeline: RenderPipeline,
++    layout: BindGroupLayout,
++}
++
++impl ScaledBackground {
++    pub fn new(device: &Device, format: TextureFormat, size: (u32, u32)) -> Self {
++        let texture = device.create_texture(&TextureDescriptor {
++            label: Some("Scaled background"),
++            size: Extent3d {
++                width: size.0,
++                height: size.1,
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: TextureDimension::D2,
++            format,
++            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
++            view_formats: &[],
++        });
++        let view = texture.create_view(&TextureViewDescriptor::default());
++        let module = device.create_shader_module(ShaderModuleDescriptor {
++            label: Some("Native background composition"),
++            source: ShaderSource::Wgsl(include_str!("scaled_background.wgsl").into()),
++        });
++        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
++            label: Some("Native background composition"),
++            layout: None,
++            vertex: VertexState {
++                module: &module,
++                entry_point: Some("vs_main"),
++                buffers: &[],
++                compilation_options: Default::default(),
++            },
++            fragment: Some(FragmentState {
++                module: &module,
++                entry_point: Some("fs_main"),
++                targets: &[Some(ColorTargetState {
++                    format,
++                    blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
++                    write_mask: ColorWrites::ALL,
++                })],
++                compilation_options: Default::default(),
++            }),
++            primitive: PrimitiveState::default(),
++            depth_stencil: None,
++            multisample: MultisampleState::default(),
++            multiview_mask: None,
++            cache: None,
++        });
++        let layout = pipeline.get_bind_group_layout(0);
++        Self {
++            size,
++            view,
++            pipeline,
++            layout,
++        }
++    }
++
++    pub fn composite(
++        &self,
++        device: &Device,
++        encoder: &mut CommandEncoder,
++        output: &TextureView,
++        terminal: &TextureView,
++        uniforms: &Buffer,
++        clear_color: Color,
++    ) {
++        // Recreate bindings to use the current terminal texture after a resize or pane change.
++        let group = device.create_bind_group(&BindGroupDescriptor {
++            label: Some("Native background composition"),
++            layout: &self.layout,
++            entries: &[
++                BindGroupEntry {
++                    binding: 0,
++                    resource: BindingResource::TextureView(&self.view),
++                },
++                BindGroupEntry {
++                    binding: 1,
++                    resource: BindingResource::TextureView(terminal),
++                },
++                BindGroupEntry {
++                    binding: 2,
++                    resource: uniforms.as_entire_binding(),
++                },
++            ],
++        });
++        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
++            label: Some("Native background composition"),
++            color_attachments: &[Some(RenderPassColorAttachment {
++                view: output,
++                resolve_target: None,
++                depth_slice: None,
++                ops: Operations {
++                    load: LoadOp::Clear(clear_color),
++                    store: StoreOp::Store,
++                },
++            })],
++            depth_stencil_attachment: None,
++            timestamp_writes: None,
++            occlusion_query_set: None,
++            multiview_mask: None,
++        });
++        pass.set_pipeline(&self.pipeline);
++        pass.set_bind_group(0, &group, &[]);
++        pass.draw(0..3, 0..1);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::target_size;
++    #[test]
++    fn native_text_and_full_content_are_never_downscaled() {
++        assert_eq!(target_size(3840, 2160, true, true), (3840, 2160));
++        assert_eq!(target_size(3840, 2160, false, false), (3840, 2160));
++        assert_eq!(target_size(1920, 1080, true, false), (1920, 1080));
++    }
++    #[test]
++    fn integrated_background_handles_portrait_odd_and_zero_sizes() {
++        assert_eq!(target_size(3840, 2160, true, false), (1920, 1080));
++        assert_eq!(target_size(2160, 3840, true, false), (540, 960));
++        assert_eq!(target_size(3841, 2161, true, false), (1281, 721));
++        assert_eq!(target_size(0, 0, true, false), (1, 1));
++    }
++}
+diff --git a/par-term-render/src/custom_shader_renderer/scaled_background.wgsl b/par-term-render/src/custom_shader_renderer/scaled_background.wgsl
+new file mode 100644
+index 0000000..9ed69af
+--- /dev/null
++++ b/par-term-render/src/custom_shader_renderer/scaled_background.wgsl
+@@ -0,0 +1,21 @@
++// Match the existing 384-byte uniform block, without a second CPU upload.
++struct Params { values: array<vec4<f32>, 24>, }
++@group(0) @binding(0) var background: texture_2d<f32>;
++@group(0) @binding(1) var terminal: texture_2d<f32>;
++@group(0) @binding(2) var<uniform> params: Params;
++
++@vertex fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
++    let p = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
++    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
++}
++@fragment fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
++    let size = params.values[0].xy;
++    let cell = min(vec2<i32>(pos.xy / size * vec2<f32>(textureDimensions(background))), vec2<i32>(textureDimensions(background)) - 1);
++    var color = textureLoad(background, cell, 0);
++    let mask = clamp(textureLoad(terminal, vec2<i32>(pos.xy), 0).a, 0.0, 1.0);
++    let readability = params.values[22].xy;
++    // Match the native path: a configured solid background is not readability-dimmed.
++    let solid = step(0.01, params.values[17].w);
++    color = vec4<f32>(color.rgb * mix(1.0, max(0.0, 1.0-readability.y), readability.x*mask*(1.0-solid)), color.a);
++    return color;
++}
+diff --git a/par-term-render/src/custom_shader_renderer/transpiler/wgsl_emit.rs b/par-term-render/src/custom_shader_renderer/transpiler/wgsl_emit.rs
+index d964459..ccf33e6 100644
+--- a/par-term-render/src/custom_shader_renderer/transpiler/wgsl_emit.rs
++++ b/par-term-render/src/custom_shader_renderer/transpiler/wgsl_emit.rs
+@@ -146,7 +146,8 @@ void main() {{
+     iChannelResolution[4] = iChannelResolution4.xyz;
+ 
+     // Flip once here (wgpu y=0 top -> Shadertoy y=0 bottom).
+-    vec2 st_fragCoord = vec2(gl_FragCoord_st.x, iResolution.y - gl_FragCoord_st.y);
++    vec2 nativeCoord = gl_FragCoord_st * max(iReadability.zw, vec2(1.0));
++    vec2 st_fragCoord = vec2(nativeCoord.x, iResolution.y - nativeCoord.y);
+     gl_FragCoord_st = st_fragCoord;
+     vec4 shaderColor;
+     mainImage(shaderColor, st_fragCoord);
+@@ -210,7 +211,8 @@ void main() {{
+         // - Otherwise, use shader output (dimmedShaderRgb) as background
+         float useSolidBg = step(0.01, iBackgroundColor.a);
+         float contentMask = clamp(terminalColor.a, 0.0, 1.0);
+-        float readabilityDim = mix(1.0, max(0.0, 1.0 - iReadability.y), iReadability.x * contentMask);
++        // Scaled backgrounds defer the content mask to the native-resolution compositor.
++        float readabilityDim = iReadability.z > 1.0 ? 1.0 : mix(1.0, max(0.0, 1.0 - iReadability.y), iReadability.x * contentMask);
+         vec3 readableShaderRgb = dimmedShaderRgb * readabilityDim;
+         vec3 bgColor = mix(readableShaderRgb, iBackgroundColor.rgb * iBrightness, useSolidBg);
+ 
+-- 
+2.50.1.windows.1
+
